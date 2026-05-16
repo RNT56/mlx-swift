@@ -1,0 +1,27 @@
+# Regexes matched against `rg -n` output by audit-incomplete-markers.sh.
+# Vendored Cmlx is excluded by the audit script except for direct runtime-loader changes.
+
+# Explicitly unavailable overloads and abstract optimizer hooks.
+^Source/MLX/MLXArray\+Init\.swift:.*unavailable
+^Source/MLX/MLXArray\+Ops\.swift:.*unavailable
+^Source/MLXOptimizers/Optimizers\.swift:.*not implemented
+
+# Programmer-error shape/type/precondition contracts.
+^Source/.*:.*precondition\(
+^Source/.*:.*Unsupported dtype
+^Source/.*:.*Unexpected
+^Source/.*:.*unexpected
+^Source/.*:.*Unable to
+^Source/.*:.*unable to
+^Source/.*:.*must be
+^Source/.*:.*expected
+^Source/.*:.*not a floating point type
+^Source/.*:.*dtype .* not supported
+^Source/.*:.*fatalError\(
+^Source/.*:.*fatalErrors
+^Source/.*:.*fatalError
+^Source/.*:.*fatalErrorHandler
+
+# Controlled generic/type-erasure force casts in array scalar extraction and custom functions.
+^Source/.*:.* as! 
+^Source/MLXNN/Module\.swift:.*try!
