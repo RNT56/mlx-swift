@@ -9,13 +9,14 @@ This repository is the `RNT56/mlx-swift` fork used by Schtack projects. Treat it
 - Do not assume older topic branches are active. Most remote branches are historical experiments or upstream maintenance work.
 - Do not move `RNT56/mlx` `main` to Schtack-only patches. The MLX core patch is consumed by this repo via an explicit submodule pin.
 
-As of 2026-05-16, the expected active commit is:
+As of 2026-05-16, active branches should contain this expected code baseline:
 
 ```text
-mlx-swift main / schtack/turboquant-kv:
 dd13c2b55a743473d458058e9d9fb028233065ec
 Point mlx submodule at Metal fallback fork
 ```
+
+Branch heads may be later docs-only or maintenance commits, but they should not drop this baseline unless the fork stack is intentionally rebuilt.
 
 ## Dependency Stack
 
