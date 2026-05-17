@@ -767,7 +767,7 @@ public func turboQuantReferenceQuality(
 public func turboQuantMetalEncode(
     _ array: MLXArray,
     configuration: TurboQuantConfiguration = TurboQuantConfiguration(backend: .metalPolarQJL),
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> TurboQuantMetalCode {
     try validateMetalConfiguration(array: array, configuration: configuration)
 
@@ -825,7 +825,7 @@ public func turboQuantMetalEncode(
 public func turboQuantMetalDecode(
     _ code: TurboQuantMetalCode,
     dtype: DType = .float32,
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     guard code.valueCount > 0 else {
         throw TurboQuantError.invalidMetalConfiguration("empty arrays are not supported")
@@ -985,7 +985,7 @@ public func turboQuantMetalEncodeAttention(
     logicalLength: Int? = nil,
     ringOffset: Int = 0,
     pinnedPrefixLength: Int = 0,
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> TurboQuantAttentionCode {
     try validateAttentionArray(array, groupSize: configuration.groupSize)
     try requireTurboQuantMetalAttention()
@@ -1062,7 +1062,7 @@ public func turboQuantMetalEncodeAttention(
 public func turboQuantMetalDecodeAttention(
     _ code: TurboQuantAttentionCode,
     outputDType: DType = .float32,
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionLayout(code.layout, role: code.role, groupSize: code.groupSize)
     try requireTurboQuantMetalAttention()
@@ -1106,7 +1106,7 @@ public func turboQuantMetalQK(
     keyCode: TurboQuantAttentionCode,
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionQuery(queries, code: keyCode)
     try requireTurboQuantMetalAttention()
@@ -1158,7 +1158,7 @@ public func turboQuantMetalAV(
     attentionWeights: MLXArray,
     valueCode: TurboQuantAttentionCode,
     outputDType: DType = .float32,
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try requireTurboQuantMetalAttention()
     guard valueCode.role == .value else {
@@ -1226,7 +1226,7 @@ public func turboQuantMetalScaledDotProductAttention(
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
     preferOnlineFused: Bool = true,
     kernelProfile: TurboQuantKernelProfile? = nil,
-    stream: StreamOrDevice = .default
+    stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
     try validateAttentionQuery(queries, code: keyCode)
