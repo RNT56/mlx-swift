@@ -72,6 +72,50 @@ class QuantizationTests: XCTestCase {
         XCTAssertNil(quantized.biases)
     }
 
+    func testTurboQuantPresetsExposeBalancedFourBitVariant() {
+        XCTAssertEqual(TurboQuantPreset.turbo4.defaultValueBits, 4)
+        XCTAssertEqual(TurboQuantPreset.turbo4.effectiveBits, 4)
+        XCTAssertEqual(TurboQuantPreset.turbo4v2.defaultValueBits, 4)
+        XCTAssertEqual(TurboQuantPreset.turbo4v2.targetMagnitudeBits, 4)
+    }
+
+    func testTurboQuantLinearMatchesDecodedFallbackShape() {
+        let values = (0 ..< 192).map { index in
+            let position = Double(index)
+            let signal = 0.2 * sin(position * 0.11) + 0.1 * cos(position * 0.07)
+            return Float(signal)
+        }
+        let weight = MLXArray(values, [3, 64])
+        let bias = MLXArray([Float](repeating: 0.05, count: 3))
+        let layer = TurboQuantLinear(
+            weight: weight,
+            bias: bias,
+            preset: .turbo4v2,
+            groupSize: 64,
+            backend: .mlxPacked,
+            seed: 0x1234
+        )
+        let x = MLXArray.ones([2, 4, 64], dtype: .float32)
+        let output = layer(x)
+        XCTAssertEqual(output.shape, [2, 4, 3])
+        XCTAssertEqual(layer.shape.0, 3)
+        XCTAssertEqual(layer.shape.1, 64)
+        XCTAssertEqual(layer.requestedBackend, TurboQuantBackend.mlxPacked)
+
+        let restored = TurboQuantLinear(
+            packedWeight: layer.weight,
+            bias: layer.bias,
+            scales: layer.scales,
+            biases: layer.biases,
+            preset: layer.preset,
+            groupSize: layer.groupSize,
+            seed: layer.seed,
+            valueBits: layer.valueBits
+        )
+        XCTAssertEqual(restored(x).shape, [2, 4, 3])
+        XCTAssertEqual(restored.activeBackend, TurboQuantBackend.mlxPacked)
+    }
+
     func testTurboQuantPackedRoundTrip() throws {
         try requireMLXRuntime()
 
