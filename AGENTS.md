@@ -9,11 +9,11 @@ This repository is the `RNT56/mlx-swift` fork used by Schtack projects. Treat it
 - Do not assume older topic branches are active. Most remote branches are historical experiments or upstream maintenance work.
 - Do not move `RNT56/mlx` `main` to Schtack-only patches. The MLX core patch is consumed by this repo via an explicit submodule pin.
 
-As of 2026-05-16, active branches should contain this expected code baseline:
+As of 2026-05-18, active branches should contain this expected code baseline:
 
 ```text
-dd13c2b55a743473d458058e9d9fb028233065ec
-Point mlx submodule at Metal fallback fork
+3f0a284c233af66356e741c12a4e7d25c24d2d8a
+Add TurboQuant linear layer support
 ```
 
 Branch heads may be later docs-only or maintenance commits, but they should not drop this baseline unless the fork stack is intentionally rebuilt.
@@ -57,6 +57,9 @@ The active branch must include the TurboQuant and robustness work, including:
 - `4993646` Add TurboQuant runtime capability probe
 - `cf6d72f` Refine TurboQuant sustained profile selection
 - `9c15aa4` Harden TurboQuant Metal runtime validation
+- `1994b28` Implement TurboQuantProd Metal key path
+- `1230c0e` Support split-dimension TurboQuant attention
+- `3f0a284` Add TurboQuant linear layer support
 - `b3cb256` Fix Metal fallback and linalg norm completeness
 - `b269576` Add incomplete-marker audit and compile verification
 - `dd13c2b` Point mlx submodule at Metal fallback fork
