@@ -200,11 +200,8 @@ let cmlx = Target.target(
         "mlx/mlx/distributed/mpi/mpi.cpp",
         "mlx/mlx/distributed/ring/ring.cpp",
         "mlx/mlx/distributed/nccl/nccl.cpp",
-        "mlx/mlx/distributed/nccl/nccl_stub",
         "mlx/mlx/distributed/jaccl/jaccl.cpp",
-        "mlx/mlx/distributed/jaccl/mesh.cpp",
-        "mlx/mlx/distributed/jaccl/ring.cpp",
-        "mlx/mlx/distributed/jaccl/utils.cpp",
+        "mlx/mlx/distributed/jaccl/lib",
     ],
     cSettings: [
         .headerSearchPath("mlx"),
@@ -215,7 +212,7 @@ let cmlx = Target.target(
         .headerSearchPath("mlx-c"),
         .headerSearchPath("json/single_include/nlohmann"),
         .headerSearchPath("fmt/include"),
-        .define("MLX_VERSION", to: "\"0.31.1\""),
+        .define("MLX_VERSION", to: "\"0.31.2\""),
     ],
     linkerSettings: linkerSettings,
     plugins: cmlxPlugins
