@@ -116,6 +116,75 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(restored.activeBackend, TurboQuantBackend.mlxPacked)
     }
 
+    func testTurboQuantConvertedArraysCreatePackedLinearCheckpoint() throws {
+        let weightValues = (0 ..< 128).map { Float($0) / 128 }
+        let arrays = [
+            "model.layers.0.self_attn.q_proj.weight": MLXArray(weightValues, [2, 64]),
+            "model.embed_tokens.weight": MLXArray.ones([4, 64], dtype: .float32),
+            "model.layers.0.self_attn.q_proj.bias": MLXArray.zeros([2], dtype: .float32),
+        ]
+        let options = TurboQuantCheckpointConversionOptions(
+            preset: .turbo4v2,
+            groupSize: 64,
+            seed: 0xCAFE
+        )
+
+        let converted = try turboQuantConvertedArrays(
+            arrays,
+            metadata: ["format": "mlx"],
+            options: options
+        )
+
+        XCTAssertEqual(converted.report.converted.map(\.name), ["model.layers.0.self_attn.q_proj.weight"])
+        XCTAssertNotNil(converted.arrays["model.layers.0.self_attn.q_proj.scales"])
+        XCTAssertNotNil(converted.arrays["model.layers.0.self_attn.q_proj.biases"])
+        XCTAssertEqual(converted.arrays["model.embed_tokens.weight"]?.shape, [4, 64])
+        XCTAssertEqual(converted.metadata["quant_method"], "turboquant")
+        XCTAssertEqual(converted.metadata["linear_class"], "TurboQuantLinear")
+        XCTAssertEqual(converted.metadata["turboquant_preset"], "turbo4v2")
+
+        let layer = TurboQuantLinear(
+            packedWeight: try XCTUnwrap(converted.arrays["model.layers.0.self_attn.q_proj.weight"]),
+            bias: arrays["model.layers.0.self_attn.q_proj.bias"],
+            scales: try XCTUnwrap(converted.arrays["model.layers.0.self_attn.q_proj.scales"]),
+            biases: converted.arrays["model.layers.0.self_attn.q_proj.biases"],
+            preset: .turbo4v2,
+            groupSize: 64,
+            seed: 0xCAFE
+        )
+        XCTAssertEqual(layer(MLXArray.ones([3, 64], dtype: .float32)).shape, [3, 2])
+    }
+
+    func testTurboQuantConvertSafetensorsWritesMetadata() throws {
+        let temporaryPath = FileManager.default.temporaryDirectory.appending(
+            path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: temporaryPath, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryPath) }
+
+        let input = temporaryPath.appending(path: "input.safetensors")
+        let output = temporaryPath.appending(path: "output.safetensors")
+        try save(
+            arrays: [
+                "linear.weight": MLXArray.ones([2, 64], dtype: .float32)
+            ],
+            metadata: ["format": "mlx"],
+            url: input
+        )
+
+        let report = try turboQuantConvertSafetensors(
+            from: input,
+            to: output,
+            options: TurboQuantCheckpointConversionOptions(groupSize: 64)
+        )
+        let (loadedArrays, loadedMetadata) = try loadArraysAndMetadata(url: output)
+
+        XCTAssertEqual(report.convertedCount, 1)
+        XCTAssertNotNil(loadedArrays["linear.scales"])
+        XCTAssertEqual(loadedMetadata["quant_method"], "turboquant")
+        XCTAssertEqual(loadedMetadata["turboquant_format"], "mlx_packed")
+    }
+
     func testTurboQuantPackedRoundTrip() throws {
         try requireMLXRuntime()
 

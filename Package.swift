@@ -317,6 +317,15 @@ let package = Package(
             ]
         ),
 
+        .executableTarget(
+            name: "TurboQuantConverter",
+            dependencies: ["MLX", "MLXNN"],
+            path: "Source/TurboQuantConverter",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+
         // ------
         // Example programs
 
