@@ -13,6 +13,8 @@ import Foundation
 public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
     case turbo2_5
     case turbo3_5
+    case turbo4
+    case turbo4v2
 
     public var displayName: String {
         switch self {
@@ -20,6 +22,10 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
             "TurboQuant 2.5-bit"
         case .turbo3_5:
             "TurboQuant 3.5-bit"
+        case .turbo4:
+            "TurboQuant 4-bit"
+        case .turbo4v2:
+            "TurboQuant 4-bit V2"
         }
     }
 
@@ -33,7 +39,7 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
         switch self {
         case .turbo2_5:
             2
-        case .turbo3_5:
+        case .turbo3_5, .turbo4, .turbo4v2:
             4
         }
     }
@@ -44,6 +50,8 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
             2
         case .turbo3_5:
             3
+        case .turbo4, .turbo4v2:
+            4
         }
     }
 
@@ -52,6 +60,8 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
         case .turbo2_5:
             3
         case .turbo3_5:
+            4
+        case .turbo4, .turbo4v2:
             4
         }
     }
@@ -62,6 +72,8 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
             2.5
         case .turbo3_5:
             3.5
+        case .turbo4, .turbo4v2:
+            4
         }
     }
 
@@ -69,7 +81,7 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
         switch self {
         case .turbo2_5:
             2
-        case .turbo3_5:
+        case .turbo3_5, .turbo4, .turbo4v2:
             4
         }
     }

@@ -390,3 +390,271 @@ open class QuantizedLinear: Linear, Quantized {
         model.update(modules: updates)
     }
 }
+
+/// Applies an affine transformation with TurboQuant-encoded weights.
+///
+/// `TurboQuantLinear` is the layer-level counterpart to the TurboQuant KV-cache
+/// path.  It keeps an MLX-packed representation for universal execution and,
+/// when the verified Metal backend is available, also keeps a PolarQuant/QJL
+/// code and routes matmul through the fused Metal codec.
+open class TurboQuantLinear: Linear, Quantized {
+
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+    public let preset: TurboQuantPreset
+    public let requestedBackend: TurboQuantBackend
+    public let activeBackend: TurboQuantBackend
+    public let seed: UInt64
+    public let valueBits: Int
+    public let scales: MLXArray
+    public let biases: MLXArray?
+    public let metalCode: TurboQuantMetalCode?
+    public let backendFallbackReason: String?
+
+    open override var shape: (Int, Int) {
+        if let metalCode {
+            return (metalCode.shape[0], metalCode.shape[1])
+        }
+        let shape = weight.shape2
+        return (shape.0, shape.1 * 32 / bits)
+    }
+
+    public convenience init(
+        _ inputDimensions: Int,
+        _ outputDimensions: Int,
+        bias: Bool = true,
+        preset: TurboQuantPreset = .turbo4v2,
+        groupSize: Int = 64,
+        mode: QuantizationMode = .affine,
+        backend: TurboQuantBackend = .metalPolarQJL,
+        seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+        valueBits: Int? = nil
+    ) {
+        let scale = sqrt(1 / Float(inputDimensions))
+        let weight = MLXRandom.uniform(
+            low: -scale, high: scale, [outputDimensions, inputDimensions])
+        let bias = bias ? MLXArray.zeros([outputDimensions]) : nil
+        self.init(
+            weight: weight,
+            bias: bias,
+            preset: preset,
+            groupSize: groupSize,
+            mode: mode,
+            backend: backend,
+            seed: seed,
+            valueBits: valueBits
+        )
+    }
+
+    public convenience init(
+        _ other: Linear,
+        preset: TurboQuantPreset = .turbo4v2,
+        groupSize: Int = 64,
+        mode: QuantizationMode = .affine,
+        backend: TurboQuantBackend = .metalPolarQJL,
+        seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+        valueBits: Int? = nil
+    ) {
+        self.init(
+            weight: other.weight,
+            bias: other.bias,
+            preset: preset,
+            groupSize: groupSize,
+            mode: mode,
+            backend: backend,
+            seed: seed,
+            valueBits: valueBits
+        )
+    }
+
+    public init(
+        weight: MLXArray,
+        bias: MLXArray?,
+        preset: TurboQuantPreset = .turbo4v2,
+        groupSize: Int = 64,
+        mode: QuantizationMode = .affine,
+        backend: TurboQuantBackend = .metalPolarQJL,
+        seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+        valueBits: Int? = nil
+    ) {
+        self.groupSize = groupSize
+        self.bits = preset.effectiveBits
+        self.mode = mode
+        self.preset = preset
+        self.requestedBackend = backend
+        self.seed = seed
+        self.valueBits = valueBits ?? preset.defaultValueBits
+
+        let availability = TurboQuantKernelAvailability.current
+        self.activeBackend = availability.runtimeBackend(for: backend)
+        self.backendFallbackReason = availability.fallbackReason(for: backend)
+
+        let configuration = TurboQuantConfiguration(
+            preset: preset,
+            role: .vector,
+            groupSize: groupSize,
+            mode: mode,
+            backend: self.activeBackend,
+            seed: seed,
+            valueBits: self.valueBits
+        )
+        let packed = turboQuantized(weight, configuration: configuration)
+        self.scales = packed.scales
+        self.biases = packed.biases
+
+        if self.activeBackend == .metalPolarQJL {
+            self.metalCode = try? turboQuantMetalEncode(weight, configuration: configuration)
+        } else {
+            self.metalCode = nil
+        }
+
+        super.init(weight: packed.weight, bias: bias)
+        self.freeze()
+    }
+
+    /// Initialize from a pre-packed TurboQuant/MLX-compatible checkpoint.
+    ///
+    /// This initializer is used by converted `.safetensors` checkpoints that
+    /// store `weight`, `scales`, and optional `biases` arrays.  It intentionally
+    /// starts on the MLX-packed fallback path because the original full-precision
+    /// weights are no longer present to construct a Metal code stream.
+    public init(
+        packedWeight: MLXArray,
+        bias: MLXArray?,
+        scales: MLXArray,
+        biases: MLXArray?,
+        preset: TurboQuantPreset = .turbo4v2,
+        groupSize: Int = 64,
+        mode: QuantizationMode = .affine,
+        seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+        valueBits: Int? = nil
+    ) {
+        self.groupSize = groupSize
+        self.bits = preset.effectiveBits
+        self.mode = mode
+        self.preset = preset
+        self.requestedBackend = .mlxPacked
+        self.activeBackend = .mlxPacked
+        self.seed = seed
+        self.valueBits = valueBits ?? preset.defaultValueBits
+        self.scales = scales
+        self.biases = biases
+        self.metalCode = nil
+        self.backendFallbackReason = "Loaded from packed TurboQuant checkpoint weights."
+
+        super.init(weight: packedWeight, bias: bias)
+        self.freeze()
+    }
+
+    public override func unfreeze(
+        recursive: Bool = true, keys: [String]? = nil, strict: Bool = false
+    ) throws {
+        try super.unfreeze(recursive: recursive, keys: keys, strict: strict)
+        self.freeze(recursive: false)
+    }
+
+    open override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let outputDimensions = shape.0
+        let inputDimensions = shape.1
+        let originalShape = x.shape
+        let flatInput = originalShape.count == 2 ? x : x.reshaped([-1, inputDimensions])
+
+        var result: MLXArray
+        if let metalCode,
+            let metalResult = try? turboQuantizedMM(
+                flatInput,
+                metalCode,
+                transpose: true,
+                outputDType: x.dtype
+            )
+        {
+            result = metalResult
+        } else {
+            result = turboQuantizedMM(
+                flatInput,
+                (weight, scales, biases),
+                transpose: true,
+                configuration: TurboQuantConfiguration(
+                    preset: preset,
+                    role: .vector,
+                    groupSize: groupSize,
+                    mode: mode,
+                    backend: .mlxPacked,
+                    seed: seed,
+                    valueBits: valueBits
+                )
+            )
+        }
+
+        if let bias {
+            result = result + bias
+        }
+        if originalShape.count == 2 {
+            return result
+        }
+        return result.reshaped(Array(originalShape.dropLast()) + [outputDimensions])
+    }
+}
+
+/// Quantize a single layer to ``TurboQuantLinear`` when possible.
+public func turboQuantizeSingle(
+    layer: Module,
+    preset: TurboQuantPreset = .turbo4v2,
+    groupSize: Int = 64,
+    mode: QuantizationMode = .affine,
+    backend: TurboQuantBackend = .metalPolarQJL,
+    seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+    valueBits: Int? = nil
+) -> TurboQuantLinear? {
+    if layer is Quantized {
+        return nil
+    }
+    guard let linear = layer as? Linear else {
+        return nil
+    }
+    return TurboQuantLinear(
+        linear,
+        preset: preset,
+        groupSize: groupSize,
+        mode: mode,
+        backend: backend,
+        seed: seed,
+        valueBits: valueBits
+    )
+}
+
+/// Replace ``Linear`` leaves with ``TurboQuantLinear`` layers.
+public func turboQuantize(
+    model: Module,
+    preset: TurboQuantPreset = .turbo4v2,
+    groupSize: Int = 64,
+    mode: QuantizationMode = .affine,
+    backend: TurboQuantBackend = .metalPolarQJL,
+    seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
+    valueBits: Int? = nil,
+    filter: (String, Module) -> Bool = { _, _ in true }
+) {
+    let updates =
+        model
+        .leafModules()
+        .flattened()
+        .compactMap { path, module -> (String, Module)? in
+            guard filter(path, module),
+                let quantized = turboQuantizeSingle(
+                    layer: module,
+                    preset: preset,
+                    groupSize: groupSize,
+                    mode: mode,
+                    backend: backend,
+                    seed: seed,
+                    valueBits: valueBits
+                )
+            else {
+                return nil
+            }
+            return (path, quantized)
+        }
+
+    model.update(modules: ModuleChildren.unflattened(updates))
+}
