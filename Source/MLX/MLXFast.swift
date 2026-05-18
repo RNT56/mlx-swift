@@ -259,6 +259,70 @@ public enum MLXFast {
         return MLXArray(result)
     }
 
+    /// Snapshot of cumulative SSD streaming throughput stats.
+    ///
+    /// Safe to call from any thread. Counters are process-local and are not reset by reading them.
+    public struct SSDMetricsSnapshot: Sendable {
+        /// Rolling average throughput over the latest 10-second window, in MB/s.
+        public let throughputMBperS: Double
+        /// Lifetime bytes loaded from SSD since process start.
+        public let totalBytesRead: UInt64
+        /// Lifetime expert chunks loaded from SSD since process start.
+        public let totalChunks: UInt64
+        /// Lifetime average latency per expert chunk, in milliseconds.
+        public let avgChunkLatencyMS: Double
+    }
+
+    /// Read the current SSD streaming metrics without resetting any counters.
+    public static func ssdMetricsSnapshot() -> SSDMetricsSnapshot {
+        var raw = MlxSSDMetricsSnapshot()
+        mlx_ssd_metrics_snapshot(&raw)
+        return SSDMetricsSnapshot(
+            throughputMBperS: raw.throughput_mb_per_s,
+            totalBytesRead: raw.total_bytes_read,
+            totalChunks: raw.total_chunks,
+            avgChunkLatencyMS: raw.avg_chunk_latency_ms)
+    }
+
+    /// Explicitly page-faults an evaluated array's underlying memory buffer on the CPU thread.
+    public static func prefault(_ x: MLXArray) {
+        mlx_fast_prefault(x.ctx)
+    }
+
+    /// Overwrites an already-evaluated MLX array's buffer by reading one expert slab
+    /// directly from a safetensors file.
+    @discardableResult
+    public static func preadInto(
+        _ dst: MLXArray,
+        safetensorsPath: String,
+        tensorName: String,
+        expertIndex: UInt32
+    ) -> Int32 {
+        safetensorsPath.withCString { pathPtr in
+            tensorName.withCString { namePtr in
+                mlx_fast_pread_into(dst.ctx, pathPtr, namePtr, expertIndex)
+            }
+        }
+    }
+
+    /// Like ``preadInto(_:safetensorsPath:tensorName:expertIndex:)``, but writes the
+    /// expert slab into `dst` starting at byte offset `dstOffset`.
+    @discardableResult
+    public static func preadIntoOffset(
+        _ dst: MLXArray,
+        safetensorsPath: String,
+        tensorName: String,
+        expertIndex: UInt32,
+        dstOffset: Int
+    ) -> Int32 {
+        precondition(dstOffset >= 0, "dstOffset must be non-negative")
+        return safetensorsPath.withCString { pathPtr in
+            tensorName.withCString { namePtr in
+                mlx_fast_pread_into_offset(dst.ctx, pathPtr, namePtr, expertIndex, dstOffset)
+            }
+        }
+    }
+
 }
 
 /// Optimized implementation of `NN.RoPE`.
