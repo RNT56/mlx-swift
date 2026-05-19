@@ -1,4 +1,4 @@
-// Copyright © 2026 Schtack.
+// Copyright © 2026 RNT56.
 
 import Cmlx
 import Foundation

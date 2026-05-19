@@ -1,13 +1,13 @@
-# Agent Notes for the Schtack MLX Swift Fork
+# Agent Notes for the RNT56 MLX Swift Fork
 
-This repository is the `RNT56/mlx-swift` fork used by Schtack projects. Treat it as an integrated fork, not a disposable experiment branch.
+This repository is the `RNT56/mlx-swift` fork used by downstream projects. Treat it as an integrated fork, not a disposable experiment branch.
 
 ## Branch Model
 
 - `main` is the current integrated fork state for downstream consumers.
-- `schtack/turboquant-kv` intentionally points at the same commit as `main`. Keep this branch as a named integration branch for Schtack work.
+- Historical integration branches may point at the same commit as `main`. Treat those as compatibility refs, not as the canonical branch names for new work.
 - Do not assume older topic branches are active. Most remote branches are historical experiments or upstream maintenance work.
-- Do not move `RNT56/mlx` `main` to Schtack-only patches. The MLX core patch is consumed by this repo via an explicit submodule pin.
+- Do not move `RNT56/mlx` `main` to downstream-only patches. The MLX core patch is consumed by this repo via an explicit submodule pin.
 
 As of 2026-05-18, active branches should contain this expected code baseline:
 
@@ -44,9 +44,9 @@ The expected `.gitmodules` entry for MLX is:
 url = https://github.com/RNT56/mlx
 ```
 
-Do not change it back to `https://github.com/ml-explore/mlx` when preserving Schtack runtime behavior.
+Do not change it back to `https://github.com/ml-explore/mlx` when preserving downstream runtime behavior.
 
-## Important Schtack Changes
+## Important Downstream Changes
 
 The active branch must include the TurboQuant and robustness work, including:
 
