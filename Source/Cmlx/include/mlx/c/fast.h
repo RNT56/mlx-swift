@@ -15,6 +15,7 @@
 #include "mlx/c/distributed_group.h"
 #include "mlx/c/io_types.h"
 #include "mlx/c/map.h"
+#include "mlx/c/optional.h"
 #include "mlx/c/stream.h"
 #include "mlx/c/string.h"
 #include "mlx/c/vector.h"
@@ -203,6 +204,23 @@ int mlx_fast_scaled_dot_product_attention(
     const char* mask_mode,
     const mlx_array mask_arr /* may be null */,
     const mlx_array sinks /* may be null */,
+    const mlx_stream s);
+int mlx_fast_quantized_scaled_dot_product_attention(
+    mlx_array* res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array key_scales,
+    const mlx_array key_biases /* may be null */,
+    const mlx_array values,
+    const mlx_array value_scales,
+    const mlx_array value_biases /* may be null */,
+    float scale,
+    const mlx_array mask /* may be null */,
+    const mlx_array sinks /* may be null */,
+    mlx_optional_int group_size,
+    mlx_optional_int bits,
+    const char* mode,
+    bool causal,
     const mlx_stream s);
 
 int mlx_fast_prefault(mlx_array x);

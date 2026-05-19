@@ -158,6 +158,13 @@ public enum MLXFast {
             case .causal: "causal"
             }
         }
+
+        public var isCausal: Bool {
+            switch self {
+            case .causal: return true
+            default: return false
+            }
+        }
     }
 
     /// A fast implementation of multi-head attention: `O = softmax(Q @ K.T, dim=-1) @ V`
@@ -213,6 +220,52 @@ public enum MLXFast {
             queries.ctx, keys.ctx, values.ctx, scale,
             mask.mode, mask.mask?.ctx ?? MLXArray.mlxNone.ctx,
             (sinks ?? .mlxNone).ctx,
+            stream.ctx)
+        return MLXArray(result)
+    }
+
+    /// A fast implementation of multi-head attention with quantized key and value tensors.
+    ///
+    /// The quantized keys and values should come from ``quantized(_:groupSize:bits:mode:globalScale:stream:)``.
+    /// For `.affine`, pass the corresponding `keyBiases` and `valueBiases`. For floating point
+    /// quantization modes such as `.mxfp4` and `.mxfp8`, biases must be nil.
+    public static func quantizedScaledDotProductAttention(
+        queries: MLXArray,
+        keys: MLXArray,
+        keyScales: MLXArray,
+        values: MLXArray,
+        valueScales: MLXArray,
+        scale: Float,
+        keyBiases: MLXArray? = nil,
+        valueBiases: MLXArray? = nil,
+        mask: ScaledDotProductAttentionMaskMode = .none,
+        sinks: MLXArray? = nil,
+        groupSize: Int? = nil,
+        bits: Int? = nil,
+        mode: QuantizationMode = .mxfp4,
+        stream: StreamOrDevice = .default
+    ) -> MLXArray {
+        var result = mlx_array_new()
+        let cGroupSize = mlx_optional_int(
+            value: Int32(groupSize ?? 0), has_value: groupSize != nil)
+        let cBits = mlx_optional_int(value: Int32(bits ?? 0), has_value: bits != nil)
+
+        mlx_fast_quantized_scaled_dot_product_attention(
+            &result,
+            queries.ctx,
+            keys.ctx,
+            keyScales.ctx,
+            (keyBiases ?? .mlxNone).ctx,
+            values.ctx,
+            valueScales.ctx,
+            (valueBiases ?? .mlxNone).ctx,
+            scale,
+            mask.mask?.ctx ?? MLXArray.mlxNone.ctx,
+            (sinks ?? .mlxNone).ctx,
+            cGroupSize,
+            cBits,
+            mode.rawValue,
+            mask.isCausal,
             stream.ctx)
         return MLXArray(result)
     }

@@ -134,6 +134,71 @@ class MLXFastKernelTests: XCTestCase {
         XCTAssertEqual(result.sum().item(Float.self), 1281.9253, accuracy: 0.01)
     }
 
+    func testQuantizedScaledDotProductAttentionMxfp4Output() throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Quantized fast attention is only available on GPU")
+        }
+
+        MLXRandom.seed(0)
+        let queries = (MLXRandom.normal([1, 8, 9, 128]) * 0.1).asType(.float16)
+        let keys = (MLXRandom.normal([1, 1, 128, 128]) * 0.1).asType(.float16)
+        let values = (MLXRandom.normal([1, 1, 128, 128]) * 0.1).asType(.float16)
+
+        let (quantizedKeys, keyScales, keyBiases) = quantized(keys, mode: .mxfp4)
+        let (quantizedValues, valueScales, valueBiases) = quantized(values, mode: .mxfp4)
+        XCTAssertNil(keyBiases)
+        XCTAssertNil(valueBiases)
+
+        let reference = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: 1.0, mask: .none)
+        let output = MLXFast.quantizedScaledDotProductAttention(
+            queries: queries,
+            keys: quantizedKeys,
+            keyScales: keyScales,
+            values: quantizedValues,
+            valueScales: valueScales,
+            scale: 1.0,
+            bits: 4,
+            mode: .mxfp4)
+
+        XCTAssertEqual(output.shape, reference.shape)
+        XCTAssertLessThan((output - reference).abs().max().item(Float.self), 0.08)
+    }
+
+    func testQuantizedScaledDotProductAttentionAffineOutput() throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Quantized fast attention is only available on GPU")
+        }
+
+        MLXRandom.seed(1)
+        let queries = (MLXRandom.normal([1, 2, 4, 128]) * 0.1).asType(.float16)
+        let keys = (MLXRandom.normal([1, 1, 128, 128]) * 0.1).asType(.float16)
+        let values = (MLXRandom.normal([1, 1, 128, 128]) * 0.1).asType(.float16)
+
+        let (quantizedKeys, keyScales, keyBiases) = quantized(
+            keys, groupSize: 32, bits: 4, mode: .affine)
+        let (quantizedValues, valueScales, valueBiases) = quantized(
+            values, groupSize: 32, bits: 4, mode: .affine)
+
+        let reference = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: 1.0, mask: .none)
+        let output = MLXFast.quantizedScaledDotProductAttention(
+            queries: queries,
+            keys: quantizedKeys,
+            keyScales: keyScales,
+            values: quantizedValues,
+            valueScales: valueScales,
+            scale: 1.0,
+            keyBiases: keyBiases,
+            valueBiases: valueBiases,
+            groupSize: 32,
+            bits: 4,
+            mode: .affine)
+
+        XCTAssertEqual(output.shape, reference.shape)
+        XCTAssertLessThan((output - reference).abs().max().item(Float.self), 0.08)
+    }
+
     func testRoPEOutput() {
         // https://github.com/ml-explore/mlx-swift/issues/315
         MLXRandom.seed(0)
