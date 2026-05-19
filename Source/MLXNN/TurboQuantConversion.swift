@@ -135,16 +135,21 @@ public func turboQuantConvertedArrays(
             continue
         }
         guard array.ndim == 2 else {
-            skipped.append(.init(name: name, reason: "expected rank-2 linear weight, found \(array.shape)"))
+            skipped.append(
+                .init(name: name, reason: "expected rank-2 linear weight, found \(array.shape)"))
             continue
         }
         guard array.dtype.isFloatingPoint, !array.dtype.isComplex else {
-            skipped.append(.init(name: name, reason: "expected floating-point weight, found \(array.dtype)"))
+            skipped.append(
+                .init(name: name, reason: "expected floating-point weight, found \(array.dtype)"))
             continue
         }
         let shape = array.shape
         guard shape.count == 2, shape[1] > 0, shape[1] % options.groupSize == 0 else {
-            skipped.append(.init(name: name, reason: "input dimension must be divisible by group size \(options.groupSize)"))
+            skipped.append(
+                .init(
+                    name: name,
+                    reason: "input dimension must be divisible by group size \(options.groupSize)"))
             continue
         }
 
@@ -198,7 +203,8 @@ public func turboQuantConvertSafetensors(
     guard fileManager.fileExists(atPath: input.path(percentEncoded: false)) else {
         throw TurboQuantCheckpointConversionError.inputNotFound(input)
     }
-    guard options.overwrite || !fileManager.fileExists(atPath: output.path(percentEncoded: false)) else {
+    guard options.overwrite || !fileManager.fileExists(atPath: output.path(percentEncoded: false))
+    else {
         throw TurboQuantCheckpointConversionError.outputExists(output)
     }
     try fileManager.createDirectory(
@@ -233,7 +239,8 @@ public func turboQuantConvertCheckpoint(
         return [try turboQuantConvertSafetensors(from: input, to: output, options: options)]
     }
 
-    guard options.overwrite || !fileManager.fileExists(atPath: output.path(percentEncoded: false)) else {
+    guard options.overwrite || !fileManager.fileExists(atPath: output.path(percentEncoded: false))
+    else {
         throw TurboQuantCheckpointConversionError.outputExists(output)
     }
     try fileManager.createDirectory(at: output, withIntermediateDirectories: true)
@@ -254,18 +261,23 @@ public func turboQuantConvertCheckpoint(
     var reports = [TurboQuantCheckpointConversionReport]()
     for source in safetensorFiles {
         let destination = output.appendingPathComponent(source.lastPathComponent)
-        reports.append(try turboQuantConvertSafetensors(from: source, to: destination, options: options))
+        reports.append(
+            try turboQuantConvertSafetensors(from: source, to: destination, options: options))
     }
     try updateTurboQuantConfigJSON(in: output, options: options)
     return reports
 }
 
-private func validateTurboQuantConversionOptions(_ options: TurboQuantCheckpointConversionOptions) throws {
+private func validateTurboQuantConversionOptions(_ options: TurboQuantCheckpointConversionOptions)
+    throws
+{
     guard options.groupSize > 0 else {
-        throw TurboQuantCheckpointConversionError.invalidConfiguration("group size must be positive")
+        throw TurboQuantCheckpointConversionError.invalidConfiguration(
+            "group size must be positive")
     }
     guard options.valueBits == nil || (options.valueBits! >= 1 && options.valueBits! <= 8) else {
-        throw TurboQuantCheckpointConversionError.invalidConfiguration("value bits must be between 1 and 8")
+        throw TurboQuantCheckpointConversionError.invalidConfiguration(
+            "value bits must be between 1 and 8")
     }
 }
 
@@ -343,6 +355,7 @@ private func updateTurboQuantConfigJSON(
         "seed": String(options.seed),
         "value_bits": options.valueBits ?? options.preset.defaultValueBits,
     ]
-    let encoded = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
+    let encoded = try JSONSerialization.data(
+        withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
     try encoded.write(to: configURL)
 }

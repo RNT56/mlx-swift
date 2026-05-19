@@ -1004,7 +1004,8 @@ public func turboQuantMetalMM(
         )
     }
     guard x.dtype.isFloatingPoint else {
-        throw TurboQuantError.invalidMetalConfiguration("mixed-bit matmul input must be floating point")
+        throw TurboQuantError.invalidMetalConfiguration(
+            "mixed-bit matmul input must be floating point")
     }
     guard (outputDType ?? x.dtype).isFloatingPoint else {
         throw TurboQuantError.invalidMetalConfiguration(
@@ -2494,12 +2495,13 @@ private func applyDeterministicGivensRotation(
         let offset = pass % 2
         var index = offset
         while index + 1 < result.count {
-            let angle = deterministicRotationAngle(
-                seed: seed,
-                groupIndex: groupIndex,
-                pass: pass,
-                pairIndex: index / 2
-            ) * (inverse ? -1 : 1)
+            let angle =
+                deterministicRotationAngle(
+                    seed: seed,
+                    groupIndex: groupIndex,
+                    pass: pass,
+                    pairIndex: index / 2
+                ) * (inverse ? -1 : 1)
             let c = cos(angle)
             let s = sin(angle)
             let lhs = result[index]
@@ -2933,11 +2935,12 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
             let referenceEnergy = referenceValues.reduce(Float(0)) { partial, value in
                 partial + value * value
             }
-            let fusedReferenceRelativeMSE = zip(fusedValues, referenceValues).reduce(Float(0)) {
-                current, pair in
-                let delta = pair.0 - pair.1
-                return current + delta * delta
-            } / Swift.max(referenceEnergy, Float.leastNonzeroMagnitude)
+            let fusedReferenceRelativeMSE =
+                zip(fusedValues, referenceValues).reduce(Float(0)) {
+                    current, pair in
+                    let delta = pair.0 - pair.1
+                    return current + delta * delta
+                } / Swift.max(referenceEnergy, Float.leastNonzeroMagnitude)
             let avPassed = av.shape == [1, 4, 2, 64]
             let fusedPassed =
                 av.shape == fused.shape && maxDelta < 1e-3

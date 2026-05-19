@@ -76,7 +76,8 @@ private func parseArguments(_ raw: [String]) throws -> ConverterArguments {
         case "--preset":
             let rawPreset = try value(after: arg, raw, &index)
             guard let preset = TurboQuantPreset(rawValue: rawPreset) else {
-                throw TurboQuantCheckpointConversionError.invalidConfiguration("unknown preset \(rawPreset)")
+                throw TurboQuantCheckpointConversionError.invalidConfiguration(
+                    "unknown preset \(rawPreset)")
             }
             result.preset = preset
         case "--group-size":
@@ -84,7 +85,8 @@ private func parseArguments(_ raw: [String]) throws -> ConverterArguments {
         case "--mode":
             let rawMode = try value(after: arg, raw, &index)
             guard let mode = QuantizationMode(rawValue: rawMode) else {
-                throw TurboQuantCheckpointConversionError.invalidConfiguration("unknown mode \(rawMode)")
+                throw TurboQuantCheckpointConversionError.invalidConfiguration(
+                    "unknown mode \(rawMode)")
             }
             result.mode = mode
         case "--seed":
@@ -107,7 +109,8 @@ private func parseArguments(_ raw: [String]) throws -> ConverterArguments {
             } else if result.output == nil {
                 result.output = URL(fileURLWithPath: arg)
             } else {
-                throw TurboQuantCheckpointConversionError.invalidConfiguration("unexpected argument \(arg)")
+                throw TurboQuantCheckpointConversionError.invalidConfiguration(
+                    "unexpected argument \(arg)")
             }
         }
         index += 1
@@ -128,7 +131,8 @@ private func value(after flag: String, _ raw: [String], _ index: inout Int) thro
 private func intValue(after flag: String, _ raw: [String], _ index: inout Int) throws -> Int {
     let rawValue = try value(after: flag, raw, &index)
     guard let value = Int(rawValue) else {
-        throw TurboQuantCheckpointConversionError.invalidConfiguration("invalid integer for \(flag): \(rawValue)")
+        throw TurboQuantCheckpointConversionError.invalidConfiguration(
+            "invalid integer for \(flag): \(rawValue)")
     }
     return value
 }
@@ -140,7 +144,8 @@ private func uint64Value(after flag: String, _ raw: [String], _ index: inout Int
         return value
     }
     guard let value = UInt64(trimmed) else {
-        throw TurboQuantCheckpointConversionError.invalidConfiguration("invalid UInt64 for \(flag): \(rawValue)")
+        throw TurboQuantCheckpointConversionError.invalidConfiguration(
+            "invalid UInt64 for \(flag): \(rawValue)")
     }
     return value
 }
@@ -151,7 +156,9 @@ private func dryRun(
 ) throws -> [TurboQuantCheckpointConversionReport] {
     let fileManager = FileManager.default
     var isDirectory: ObjCBool = false
-    guard fileManager.fileExists(atPath: input.path(percentEncoded: false), isDirectory: &isDirectory) else {
+    guard
+        fileManager.fileExists(atPath: input.path(percentEncoded: false), isDirectory: &isDirectory)
+    else {
         throw TurboQuantCheckpointConversionError.inputNotFound(input)
     }
 

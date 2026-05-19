@@ -135,7 +135,8 @@ class QuantizationTests: XCTestCase {
             options: options
         )
 
-        XCTAssertEqual(converted.report.converted.map(\.name), ["model.layers.0.self_attn.q_proj.weight"])
+        XCTAssertEqual(
+            converted.report.converted.map(\.name), ["model.layers.0.self_attn.q_proj.weight"])
         XCTAssertNotNil(converted.arrays["model.layers.0.self_attn.q_proj.scales"])
         XCTAssertNotNil(converted.arrays["model.layers.0.self_attn.q_proj.biases"])
         XCTAssertEqual(converted.arrays["model.embed_tokens.weight"]?.shape, [4, 64])
