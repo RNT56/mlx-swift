@@ -550,6 +550,38 @@ class QuantizationTests: XCTestCase {
             allClose(columnOutput, columnReference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
     }
 
+    func testTurboQuantMetalMatmulSupportsBFloat16OutputWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
+            throw XCTSkip("Metal runtime unavailable")
+        }
+
+        let xValues = (0 ..< 128).map { index in
+            let position = Double(index)
+            return Float(0.2 * sin(position * 0.07) + 0.1 * cos(position * 0.13))
+        }
+        let wValues = (0 ..< 192).map { index in
+            let position = Double(index)
+            return Float(0.25 * cos(position * 0.05) - 0.08 * sin(position * 0.17))
+        }
+        let x = MLXArray(xValues, [2, 64]).asType(.bfloat16)
+        let w = MLXArray(wValues, [3, 64])
+        let configuration = TurboQuantConfiguration(
+            preset: .turbo4v2,
+            role: .vector,
+            groupSize: 64,
+            backend: .metalPolarQJL,
+            seed: 0xBEEF_0000_0000_0042
+        )
+
+        let code = try turboQuantMetalEncode(w, configuration: configuration)
+        let output = try turboQuantizedMM(x, code, transpose: true, outputDType: x.dtype)
+        eval(output)
+
+        XCTAssertEqual(output.dtype, DType.bfloat16)
+        XCTAssertEqual(output.shape, [2, 3])
+        XCTAssertTrue(output.asArray(Float.self).allSatisfy { $0.isFinite })
+    }
+
     func testTurboQuantAttentionLayoutIsRowWise() throws {
         let layout = try turboQuantAttentionLayout(shape: [1, 2, 3, 80], groupSize: 64)
 
@@ -855,6 +887,79 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(twoStage.shape, [1, 4, 2, 80])
         XCTAssertEqual(fusedPreferred.shape, [1, 4, 2, 80])
         XCTAssertTrue(allClose(fusedPreferred, twoStage, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+    }
+
+    func testTurboQuantCompressedAttentionSupportsBFloat16OutputsWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let qValues: [Float] = (0 ..< 512).map { index in
+            let position = Double(index)
+            return Float(0.28 * sin(position * 0.023) + 0.11 * cos(position * 0.079))
+        }
+        let kValues: [Float] = (0 ..< 640).map { index in
+            let position = Double(index)
+            return Float(0.19 * cos(position * 0.043) - 0.07 * sin(position * 0.097))
+        }
+        let vValues: [Float] = (0 ..< 640).map { index in
+            let position = Double(index)
+            return Float(0.23 * sin(position * 0.037) + 0.12 * cos(position * 0.071))
+        }
+        let queries = MLXArray(qValues, [1, 4, 2, 64]).asType(.bfloat16)
+        let keys = MLXArray(kValues, [1, 2, 5, 64]).asType(.bfloat16)
+        let values = MLXArray(vValues, [1, 2, 5, 64]).asType(.bfloat16)
+        let keyCode = try turboQuantMetalEncodeAttention(
+            keys,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 61
+            )
+        )
+        let valueCode = try turboQuantMetalEncodeAttention(
+            values,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .value,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 67
+            )
+        )
+
+        let decodedValues = try turboQuantMetalDecodeAttention(valueCode, outputDType: queries.dtype)
+        let scores = try turboQuantMetalQK(
+            queries: queries,
+            keyCode: keyCode,
+            scale: 1 / sqrt(Float(64)),
+            mask: .causal
+        )
+        let twoStage = try turboQuantMetalAV(
+            attentionWeights: softmax(scores.asType(.float32), axis: -1),
+            valueCode: valueCode,
+            outputDType: queries.dtype
+        )
+        let fusedPreferred = try turboQuantMetalScaledDotProductAttention(
+            queries: queries,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: 1 / sqrt(Float(64)),
+            mask: .causal,
+            preferOnlineFused: true
+        )
+        eval(decodedValues, twoStage, fusedPreferred)
+
+        XCTAssertEqual(decodedValues.dtype, DType.bfloat16)
+        XCTAssertEqual(decodedValues.shape, [1, 2, 5, 64])
+        XCTAssertEqual(twoStage.dtype, DType.bfloat16)
+        XCTAssertEqual(twoStage.shape, [1, 4, 2, 64])
+        XCTAssertEqual(fusedPreferred.dtype, DType.bfloat16)
+        XCTAssertEqual(fusedPreferred.shape, [1, 4, 2, 64])
+        XCTAssertTrue(twoStage.asArray(Float.self).allSatisfy { $0.isFinite })
+        XCTAssertTrue(fusedPreferred.asArray(Float.self).allSatisfy { $0.isFinite })
     }
 
     func testTurboQuantAttentionDecodeHonorsRotatingLayoutWhenAvailable() throws {

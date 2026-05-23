@@ -159,11 +159,27 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
     public var qkPassed: Bool
     public var avPassed: Bool
     public var tiledFusedPassed: Bool
+    public var bfloatOutputPassed: Bool
     public var selectedKernelProfile: TurboQuantKernelProfile
     public var failureReason: String?
     public var encodeDecodeLatencySeconds: Double?
     public var twoStageLatencySeconds: Double?
     public var tiledFusedLatencySeconds: Double?
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case metalRuntimeAvailable
+        case encodeDecodePassed
+        case qkPassed
+        case avPassed
+        case tiledFusedPassed
+        case bfloatOutputPassed
+        case selectedKernelProfile
+        case failureReason
+        case encodeDecodeLatencySeconds
+        case twoStageLatencySeconds
+        case tiledFusedLatencySeconds
+    }
 
     public init(
         status: TurboQuantRuntimeSelfTestStatus = .notRun,
@@ -172,6 +188,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         qkPassed: Bool = false,
         avPassed: Bool = false,
         tiledFusedPassed: Bool = false,
+        bfloatOutputPassed: Bool = false,
         selectedKernelProfile: TurboQuantKernelProfile = .mlxPackedFallback,
         failureReason: String? = nil,
         encodeDecodeLatencySeconds: Double? = nil,
@@ -184,11 +201,51 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         self.qkPassed = qkPassed
         self.avPassed = avPassed
         self.tiledFusedPassed = tiledFusedPassed
+        self.bfloatOutputPassed = bfloatOutputPassed
         self.selectedKernelProfile = selectedKernelProfile
         self.failureReason = failureReason
         self.encodeDecodeLatencySeconds = encodeDecodeLatencySeconds
         self.twoStageLatencySeconds = twoStageLatencySeconds
         self.tiledFusedLatencySeconds = tiledFusedLatencySeconds
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(TurboQuantRuntimeSelfTestStatus.self, forKey: .status)
+        metalRuntimeAvailable = try container.decode(Bool.self, forKey: .metalRuntimeAvailable)
+        encodeDecodePassed = try container.decode(Bool.self, forKey: .encodeDecodePassed)
+        qkPassed = try container.decode(Bool.self, forKey: .qkPassed)
+        avPassed = try container.decode(Bool.self, forKey: .avPassed)
+        tiledFusedPassed = try container.decode(Bool.self, forKey: .tiledFusedPassed)
+        bfloatOutputPassed =
+            try container.decodeIfPresent(Bool.self, forKey: .bfloatOutputPassed) ?? false
+        selectedKernelProfile =
+            try container.decode(TurboQuantKernelProfile.self, forKey: .selectedKernelProfile)
+        failureReason = try container.decodeIfPresent(String.self, forKey: .failureReason)
+        encodeDecodeLatencySeconds =
+            try container.decodeIfPresent(Double.self, forKey: .encodeDecodeLatencySeconds)
+        twoStageLatencySeconds =
+            try container.decodeIfPresent(Double.self, forKey: .twoStageLatencySeconds)
+        tiledFusedLatencySeconds =
+            try container.decodeIfPresent(Double.self, forKey: .tiledFusedLatencySeconds)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(status, forKey: .status)
+        try container.encode(metalRuntimeAvailable, forKey: .metalRuntimeAvailable)
+        try container.encode(encodeDecodePassed, forKey: .encodeDecodePassed)
+        try container.encode(qkPassed, forKey: .qkPassed)
+        try container.encode(avPassed, forKey: .avPassed)
+        try container.encode(tiledFusedPassed, forKey: .tiledFusedPassed)
+        try container.encode(bfloatOutputPassed, forKey: .bfloatOutputPassed)
+        try container.encode(selectedKernelProfile, forKey: .selectedKernelProfile)
+        try container.encodeIfPresent(failureReason, forKey: .failureReason)
+        try container.encodeIfPresent(
+            encodeDecodeLatencySeconds, forKey: .encodeDecodeLatencySeconds)
+        try container.encodeIfPresent(twoStageLatencySeconds, forKey: .twoStageLatencySeconds)
+        try container.encodeIfPresent(
+            tiledFusedLatencySeconds, forKey: .tiledFusedLatencySeconds)
     }
 
     public var passed: Bool {
@@ -198,6 +255,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
             && qkPassed
             && avPassed
             && tiledFusedPassed
+            && bfloatOutputPassed
     }
 }
 
@@ -973,7 +1031,8 @@ public func turboQuantMetalDecode(
             valueCount: code.valueCount,
             groupCount: code.groupCount,
             magnitudeWordsPerGroup: code.magnitudeWordsPerGroup,
-            bitsetWordsPerGroup: code.bitsetWordsPerGroup
+            bitsetWordsPerGroup: code.bitsetWordsPerGroup,
+            outputDType: dtype
         ),
         grid: (code.valueCount, 1, 1),
         threadGroup: (threadGroupSize, 1, 1),
@@ -1057,7 +1116,8 @@ public func turboQuantMetalMM(
             valueCount: code.valueCount,
             groupCount: code.groupCount,
             magnitudeWordsPerGroup: code.magnitudeWordsPerGroup,
-            bitsetWordsPerGroup: code.bitsetWordsPerGroup
+            bitsetWordsPerGroup: code.bitsetWordsPerGroup,
+            outputDType: outputDType ?? x.dtype
         ) + [
             ("X_ROWS", xRows),
             ("X_COLUMNS", xColumns),
@@ -2945,7 +3005,32 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
             let fusedPassed =
                 av.shape == fused.shape && maxDelta < 1e-3
                 && fusedReferenceRelativeMSE < 0.5
-            let passed = encodeDecodePassed && qkPassed && avPassed && fusedPassed
+            let bfloatDecode = try turboQuantMetalDecodeAttention(valueCode, outputDType: .bfloat16)
+            let bfloatQueries = queries.asType(.bfloat16)
+            let bfloatAV = try turboQuantMetalAV(
+                attentionWeights: weights,
+                valueCode: valueCode,
+                outputDType: bfloatQueries.dtype
+            )
+            let bfloatFused = try turboQuantMetalScaledDotProductAttention(
+                queries: bfloatQueries,
+                keyCode: keyCode,
+                valueCode: valueCode,
+                scale: scale,
+                mask: .causal,
+                preferOnlineFused: true,
+                kernelProfile: selectedProfile
+            )
+            eval(bfloatDecode, bfloatAV, bfloatFused)
+            let bfloatOutputPassed =
+                bfloatDecode.dtype == .bfloat16
+                && bfloatDecode.shape == values.shape
+                && bfloatAV.dtype == .bfloat16
+                && bfloatAV.shape == av.shape
+                && bfloatFused.dtype == .bfloat16
+                && bfloatFused.shape == fused.shape
+                && bfloatFused.asArray(Float.self).allSatisfy(\.isFinite)
+            let passed = encodeDecodePassed && qkPassed && avPassed && fusedPassed && bfloatOutputPassed
 
             return TurboQuantRuntimeProbeResult(
                 status: passed ? .passed : .failed,
@@ -2954,6 +3039,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                 qkPassed: qkPassed,
                 avPassed: avPassed,
                 tiledFusedPassed: fusedPassed,
+                bfloatOutputPassed: bfloatOutputPassed,
                 selectedKernelProfile: passed ? selectedProfile : .mlxPackedFallback,
                 failureReason: passed ? nil : "TurboQuant Metal tiny-shape self-test failed.",
                 encodeDecodeLatencySeconds: encodeDecodeLatency,
@@ -3028,7 +3114,8 @@ private func metalTemplate(
     valueCount: Int,
     groupCount: Int,
     magnitudeWordsPerGroup: Int,
-    bitsetWordsPerGroup: Int
+    bitsetWordsPerGroup: Int,
+    outputDType: DType = .float32
 ) -> [(String, any KernelTemplateArg)] {
     [
         ("GROUP_SIZE", configuration.groupSize),
@@ -3053,6 +3140,7 @@ private func metalTemplate(
         ("ROLE", metalRoleValue(configuration.role)),
         ("SEED_HI", metalTemplateUInt32High(configuration.seed)),
         ("SEED_LO", metalTemplateUInt32Low(configuration.seed)),
+        ("OUTPUT_DTYPE", outputDType),
     ]
 }
 
@@ -3598,8 +3686,9 @@ private enum TurboQuantMetalKernels {
             }
         }
 
+        template <typename UIntPtr>
         inline bool tq_flat_high_precision(
-            device const uint* high_mask,
+            UIntPtr high_mask,
             uint group_id,
             uint local,
             uint bitset_words_per_group
@@ -3610,9 +3699,10 @@ private enum TurboQuantMetalKernels {
             return (high_mask[bitset_base + word_index] & (1u << word_bit)) != 0u;
         }
 
+        template <typename PackedPtr, typename HighMaskPtr>
         inline uint tq_read_flat_code(
-            device const uint* packed,
-            device const uint* high_mask,
+            PackedPtr packed,
+            HighMaskPtr high_mask,
             uint group_id,
             uint local,
             uint mag_words_per_group,
@@ -3643,12 +3733,19 @@ private enum TurboQuantMetalKernels {
             return quantized;
         }
 
+        template <
+            typename PackedPtr,
+            typename SignsPtr,
+            typename HighMaskPtr,
+            typename ResidualSignsPtr,
+            typename ScalesPtr
+        >
         inline float tq_decode_flat_value(
-            device const uint* packed,
-            device const uint* signs,
-            device const uint* high_mask,
-            device const uint* residual_signs,
-            device const float* scales,
+            PackedPtr packed,
+            SignsPtr signs,
+            HighMaskPtr high_mask,
+            ResidualSignsPtr residual_signs,
+            ScalesPtr scales,
             uint index,
             ulong seed,
             uint role,
@@ -3839,7 +3936,8 @@ private enum TurboQuantMetalKernels {
                 }
             }
             uint scale_base = group_id * uint(SCALES_PER_GROUP);
-            out[index] = scales[scale_base + 1] + float(quantized) * scales[scale_base];
+            out[index] = static_cast<OUTPUT_DTYPE>(
+                scales[scale_base + 1] + float(quantized) * scales[scale_base]);
             return;
         }
 
@@ -3871,7 +3969,8 @@ private enum TurboQuantMetalKernels {
             rotated[decode_local] = tq_codebook_level(bits, code, count);
         }
         tq_apply_product_rotation(rotated, count, seed, group_id, true);
-        out[index] = rotated[local] * scales[group_id * uint(SCALES_PER_GROUP)];
+        out[index] = static_cast<OUTPUT_DTYPE>(
+            rotated[local] * scales[group_id * uint(SCALES_PER_GROUP)]);
         """
 
     private static let matmulSource = """
@@ -3901,7 +4000,7 @@ private enum TurboQuantMetalKernels {
                 uint(VALUE_BITS), uint(SCALES_PER_GROUP), uint(VALUE_COUNT));
             sum += float(x[x_index]) * weight;
         }
-        out[index] = sum;
+        out[index] = static_cast<OUTPUT_DTYPE>(sum);
         """
 
     private static let attentionHeader = """
@@ -4573,14 +4672,14 @@ private enum TurboQuantMetalKernels {
         uint physical_token = tq_physical_token(
             logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
         thread float decode_scratch[GROUP_SIZE];
-        out[index] = tq_decode_attention_value(
+        out[index] = static_cast<OUTPUT_DTYPE>(tq_decode_attention_value(
             packed, signs, high_mask, residual_signs, scales,
             batch, head, physical_token, dimension,
             (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO)), uint(ROLE),
             uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
             uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
             uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
-            decode_scratch);
+            decode_scratch));
         """
 
     private static let avSource = """
@@ -4615,7 +4714,7 @@ private enum TurboQuantMetalKernels {
                 decode_scratch);
             sum += float(weights[weight_index]) * value;
         }
-        out[index] = sum;
+        out[index] = static_cast<OUTPUT_DTYPE>(sum);
         """
 
     private static let fusedAttentionSource = """
@@ -4630,6 +4729,7 @@ private enum TurboQuantMetalKernels {
         threadgroup float partial[256];
         threadgroup float tile_weights[256];
         threadgroup uint tile_physical_tokens[256];
+        threadgroup float output_accum[HEAD_DIM];
 
         float attention_scale = as_type<float>(uint(ATTENTION_SCALE_BITS));
         uint q_token = row % uint(QUERY_LENGTH);
@@ -4719,10 +4819,7 @@ private enum TurboQuantMetalKernels {
 
         float inv_sum = 1.0f / max(row_sum, 1.17549435e-38f);
         if (lane < uint(HEAD_DIM)) {
-            uint out_index =
-                (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
-                    * uint(HEAD_DIM)) + lane;
-            out[out_index] = 0.0f;
+            output_accum[lane] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4783,13 +4880,16 @@ private enum TurboQuantMetalKernels {
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
                 if (lane == 0u) {
-                    uint out_index =
-                        (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
-                            * uint(HEAD_DIM)) + dimension;
-                    out[out_index] = float(out[out_index]) + partial[0];
+                    output_accum[dimension] += partial[0];
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
+        }
+        if (lane < uint(HEAD_DIM)) {
+            uint out_index =
+                (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
+                    * uint(HEAD_DIM)) + lane;
+            out[out_index] = static_cast<OUTPUT_DTYPE>(output_accum[lane]);
         }
         """
 }
