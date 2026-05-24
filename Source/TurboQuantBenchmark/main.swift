@@ -1,20 +1,37 @@
 import Foundation
 import MLX
 
+struct QualityMetrics: Codable {
+    var relativeMSE: Float
+    var maxAbsoluteError: Float
+    var cosineSimilarity: Float
+}
+
 struct BenchmarkResult: Codable {
     var name: String
     var status: String
+    var selectedPath: String?
+    var dtype: String?
     var shape: [Int]
+    var queryShape: [Int]?
+    var keyShape: [Int]?
+    var valueShape: [Int]?
+    var preset: TurboQuantPreset?
+    var valueBits: Int?
+    var actualBitsPerValue: Double?
+    var memoryBytes: Int?
     var latencySeconds: Double?
-    var relativeMSE: Float?
+    var quality: QualityMetrics?
     var error: String?
 }
 
 struct BenchmarkReport: Codable {
-    var generatedAt: String
+    var schemaVersion: Int
+    var generatedAt: String?
     var iterations: Int
     var availability: TurboQuantKernelAvailability
     var capabilities: TurboQuantKernelCapabilities
+    var attentionCapabilities: TurboQuantAttentionCapabilities
     var device: TurboQuantDeviceCapabilities
     var results: [BenchmarkResult]
 }
@@ -37,14 +54,28 @@ func values(count: Int, scale: Double, phase: Double = 0) -> [Float] {
 }
 
 func relativeMSE(_ lhs: MLXArray, _ rhs: MLXArray) -> Float {
+    qualityMetrics(lhs, rhs).relativeMSE
+}
+
+func qualityMetrics(_ lhs: MLXArray, _ rhs: MLXArray) -> QualityMetrics {
     let left = lhs.asArray(Float.self)
     let right = rhs.asArray(Float.self)
     let error = zip(left, right).reduce(Float(0)) { partial, pair in
         let delta = pair.0 - pair.1
         return partial + delta * delta
     }
+    let maxAbsoluteError = zip(left, right).reduce(Float(0)) { partial, pair in
+        max(partial, abs(pair.0 - pair.1))
+    }
     let signal = left.reduce(Float(0)) { $0 + $1 * $1 }
-    return error / max(signal, Float.leastNonzeroMagnitude)
+    let dot = zip(left, right).reduce(Float(0)) { $0 + $1.0 * $1.1 }
+    let leftNorm = sqrt(left.reduce(Float(0)) { $0 + $1 * $1 })
+    let rightNorm = sqrt(right.reduce(Float(0)) { $0 + $1 * $1 })
+    return QualityMetrics(
+        relativeMSE: error / max(signal, Float.leastNonzeroMagnitude),
+        maxAbsoluteError: maxAbsoluteError,
+        cosineSimilarity: dot / max(leftNorm * rightNorm, Float.leastNonzeroMagnitude)
+    )
 }
 
 func timed(iterations: Int, _ body: () throws -> MLXArray) throws -> (Double, MLXArray) {
@@ -65,6 +96,7 @@ func skipped(_ name: String, reason: String) -> BenchmarkResult {
 }
 
 let iterations = argumentValue("--iterations", default: 10)
+let includeTimestamp = CommandLine.arguments.contains("--include-timestamp")
 let availability = TurboQuantKernelAvailability.current
 var results: [BenchmarkResult] = []
 
@@ -86,9 +118,15 @@ if availability.supportsMetalPolarQJLCodec {
             BenchmarkResult(
                 name: "flat.decode",
                 status: "ok",
+                selectedPath: "decodeCompressed",
+                dtype: "\(decoded.dtype)",
                 shape: decoded.shape,
+                preset: configuration.preset,
+                valueBits: configuration.resolvedValueBits,
+                actualBitsPerValue: code.approximateBitsPerValue,
+                memoryBytes: code.storageByteCount,
                 latencySeconds: latency,
-                relativeMSE: relativeMSE(input, decoded)
+                quality: qualityMetrics(input, decoded)
             ))
     } catch {
         results.append(
@@ -113,7 +151,13 @@ if availability.supportsMetalPolarQJLCodec {
             BenchmarkResult(
                 name: "flat.matmul.product_estimator",
                 status: availability.kernelCapabilities.linearMatmul ? "production" : "experimental",
+                selectedPath: "linearMatmul",
+                dtype: "\(output.dtype)",
                 shape: output.shape,
+                preset: configuration.preset,
+                valueBits: configuration.resolvedValueBits,
+                actualBitsPerValue: code.approximateBitsPerValue,
+                memoryBytes: code.storageByteCount,
                 latencySeconds: latency
             ))
     } catch {
@@ -150,6 +194,13 @@ if availability.supportsMetalPolarQJLAttention {
                 valueBits: 4
             ))
         let scale = 1 / sqrt(Float(q.dim(-1)))
+        let codeMemoryBytes = keyCode.storageByteCount + valueCode.storageByteCount
+        let codeValueCount =
+            keyCode.layout.batchSize * keyCode.layout.kvHeadCount
+            * max(keyCode.layout.logicalLength, 1) * keyCode.layout.headDimension
+            + valueCode.layout.batchSize * valueCode.layout.kvHeadCount
+            * max(valueCode.layout.logicalLength, 1) * valueCode.layout.headDimension
+        let actualBitsPerValue = Double(codeMemoryBytes * 8) / Double(codeValueCount)
         let (twoStageLatency, twoStage) = try timed(iterations: iterations) {
             try turboQuantMetalScaledDotProductAttention(
                 queries: q,
@@ -174,16 +225,34 @@ if availability.supportsMetalPolarQJLAttention {
             BenchmarkResult(
                 name: "attention.two_stage",
                 status: "ok",
+                selectedPath: TurboQuantAttentionPath.twoStageCompressed.rawValue,
+                dtype: "\(twoStage.dtype)",
                 shape: twoStage.shape,
+                queryShape: q.shape,
+                keyShape: k.shape,
+                valueShape: v.shape,
+                preset: keyCode.preset,
+                valueBits: valueCode.valueBits,
+                actualBitsPerValue: actualBitsPerValue,
+                memoryBytes: codeMemoryBytes,
                 latencySeconds: twoStageLatency
             ))
         results.append(
             BenchmarkResult(
                 name: "attention.fused",
                 status: "ok",
+                selectedPath: TurboQuantAttentionPath.onlineFused.rawValue,
+                dtype: "\(fused.dtype)",
                 shape: fused.shape,
+                queryShape: q.shape,
+                keyShape: k.shape,
+                valueShape: v.shape,
+                preset: keyCode.preset,
+                valueBits: valueCode.valueBits,
+                actualBitsPerValue: actualBitsPerValue,
+                memoryBytes: codeMemoryBytes,
                 latencySeconds: fusedLatency,
-                relativeMSE: relativeMSE(twoStage, fused)
+                quality: qualityMetrics(twoStage, fused)
             ))
     } catch {
         results.append(
@@ -194,10 +263,12 @@ if availability.supportsMetalPolarQJLAttention {
 }
 
 let report = BenchmarkReport(
-    generatedAt: ISO8601DateFormatter().string(from: Date()),
+    schemaVersion: 2,
+    generatedAt: includeTimestamp ? ISO8601DateFormatter().string(from: Date()) : nil,
     iterations: iterations,
     availability: availability,
     capabilities: availability.kernelCapabilities,
+    attentionCapabilities: availability.attentionCapabilities,
     device: TurboQuantDeviceCapabilities.current,
     results: results
 )
