@@ -243,6 +243,7 @@ private func new_mlx_io_vtable_dataIO() -> mlx_io_vtable {
 
     } write: { ptr, data, n in
         let state = Unmanaged<IOState>.fromOpaque(ptr!).takeUnretainedValue()
+        guard let data = data else { return }
 
         let writeEnd = state.offset + n
         if state.offset > state.data.count {
