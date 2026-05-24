@@ -15,6 +15,20 @@ extern "C" {
 typedef void (*mlx_error_handler_func)(const char* msg, void* data);
 
 /**
+ * Status returned by MLX C APIs that report explicit error classes.
+ */
+typedef enum mlx_status_ {
+  MLX_STATUS_SUCCESS = 0,
+  MLX_STATUS_ERROR = 1,
+  MLX_STATUS_UNSUPPORTED = 2,
+} mlx_status;
+
+/**
+ * Convert an MLX C status code to a stable string.
+ */
+const char* mlx_status_string(mlx_status status);
+
+/**
  * Set the error handler.
  */
 void mlx_set_error_handler(
