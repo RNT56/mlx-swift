@@ -16,6 +16,12 @@ The executable launch order is owned by the Pines packet:
 /Users/mt/Programming/Schtack/pines/docs/turboquant-implementation/14-worker-launch-schedule.md
 ```
 
+The PR and merge train is owned by:
+
+```text
+/Users/mt/Programming/Schtack/pines/docs/turboquant-implementation/15-pr-merge-plan.md
+```
+
 For this repo, the launch order is:
 
 1. Wave 0: W1 core contracts.
@@ -24,6 +30,14 @@ For this repo, the launch order is:
 4. Wave 5: W13 Layout V5 and kernels.
 
 W1 can run immediately in parallel with LM W4 and Pines W7/W24. W13 must not product-activate before benchmark, quality, and memory-calibration gates exist.
+
+Worker PRs in this repo target:
+
+```text
+codex/turboquant-core-completion
+```
+
+Final merge to the repo default branch waits for the cross-repo compatibility pair and Pines production pin gate.
 
 ## Core responsibilities
 

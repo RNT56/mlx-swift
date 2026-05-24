@@ -13,6 +13,14 @@ Use the Pines [Worker Launch Schedule](/Users/mt/Programming/Schtack/pines/docs/
 
 W1 and W2 are correctness/control-plane enablers. W13 is optimization and must remain gated until measurement proves improvement.
 
+PR target for worker branches:
+
+```text
+codex/turboquant-core-completion
+```
+
+PR sequencing and final default-branch merge gates are defined in the Pines [PR and Merge Plan](/Users/mt/Programming/Schtack/pines/docs/turboquant-implementation/15-pr-merge-plan.md).
+
 ## Wave 0 - W1 core public contracts
 
 Branch: `tq/core-contracts`
