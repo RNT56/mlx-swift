@@ -150,7 +150,8 @@ if availability.supportsMetalPolarQJLCodec {
         results.append(
             BenchmarkResult(
                 name: "flat.matmul.product_estimator",
-                status: availability.kernelCapabilities.linearMatmul ? "production" : "experimental",
+                status: availability.kernelCapabilities.linearMatmul
+                    ? "production" : "experimental",
                 selectedPath: "linearMatmul",
                 dtype: "\(output.dtype)",
                 shape: output.shape,
@@ -162,7 +163,9 @@ if availability.supportsMetalPolarQJLCodec {
             ))
     } catch {
         results.append(
-            BenchmarkResult(name: "flat.matmul.product_estimator", status: "failed", shape: [], error: "\(error)"))
+            BenchmarkResult(
+                name: "flat.matmul.product_estimator", status: "failed", shape: [],
+                error: "\(error)"))
     }
 } else {
     results.append(skipped("flat.decode", reason: "Metal codec unavailable"))
@@ -172,8 +175,10 @@ if availability.supportsMetalPolarQJLCodec {
 if availability.supportsMetalPolarQJLAttention {
     do {
         let q = MLXArray(values(count: 1 * 4 * 2 * 128, scale: 0.019), [1, 4, 2, 128])
-        let k = MLXArray(values(count: 1 * 2 * 256 * 128, scale: 0.007, phase: 0.1), [1, 2, 256, 128])
-        let v = MLXArray(values(count: 1 * 2 * 256 * 128, scale: 0.009, phase: 0.2), [1, 2, 256, 128])
+        let k = MLXArray(
+            values(count: 1 * 2 * 256 * 128, scale: 0.007, phase: 0.1), [1, 2, 256, 128])
+        let v = MLXArray(
+            values(count: 1 * 2 * 256 * 128, scale: 0.009, phase: 0.2), [1, 2, 256, 128])
         let keyCode = try turboQuantMetalEncodeAttention(
             k,
             configuration: TurboQuantConfiguration(

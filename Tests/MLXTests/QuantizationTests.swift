@@ -453,7 +453,8 @@ class QuantizationTests: XCTestCase {
             availability.selectedKernelProfile, capabilities.runtimeProbe.selectedKernelProfile)
         XCTAssertEqual(
             availability.supportsMetalPolarQJLCodec,
-            capabilities.runtimeProbe.metalRuntimeAvailable && capabilities.runtimeProbe.flatCodecPassed
+            capabilities.runtimeProbe.metalRuntimeAvailable
+                && capabilities.runtimeProbe.flatCodecPassed
         )
 
         if availability.supportsMetalPolarQJLAttention {
@@ -481,7 +482,8 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(capabilities.bfloatOutput, probeCapabilities.bfloatOutput)
         XCTAssertEqual(
             capabilities.linearMatmul,
-            ProcessInfo.processInfo.environment["TURBOQUANT_ENABLE_EXPERIMENTAL_LINEAR_METAL"] == "1"
+            ProcessInfo.processInfo.environment["TURBOQUANT_ENABLE_EXPERIMENTAL_LINEAR_METAL"]
+                == "1"
                 && availability.supportsMetalPolarQJLCodec
         )
     }
@@ -812,7 +814,8 @@ class QuantizationTests: XCTestCase {
                 logicalLength: 0
             )
         ) { error in
-            XCTAssertTrue(String(describing: error).contains("exceeds compressed attention capacity"))
+            XCTAssertTrue(
+                String(describing: error).contains("exceeds compressed attention capacity"))
         }
     }
 
@@ -1113,9 +1116,10 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(valueCode.signs.shape, [1])
         XCTAssertEqual(valueCode.highPrecisionMask.shape, [1])
         XCTAssertEqual(valueCode.residualSigns.shape, [1])
-        XCTAssertTrue(uniformPrecisionKeyCode.highPrecisionMask.asArray(UInt32.self).allSatisfy {
-            $0 == 0
-        })
+        XCTAssertTrue(
+            uniformPrecisionKeyCode.highPrecisionMask.asArray(UInt32.self).allSatisfy {
+                $0 == 0
+            })
         XCTAssertEqual(try turboQuantMetalDecode(keyCode).shape, x.shape)
         XCTAssertEqual(try turboQuantMetalDecode(valueCode).shape, x.shape)
     }
@@ -1731,7 +1735,8 @@ class QuantizationTests: XCTestCase {
             )
         )
 
-        let decodedValues = try turboQuantMetalDecodeAttention(valueCode, outputDType: queries.dtype)
+        let decodedValues = try turboQuantMetalDecodeAttention(
+            valueCode, outputDType: queries.dtype)
         let scores = try turboQuantMetalQK(
             queries: queries,
             keyCode: keyCode,
@@ -1800,7 +1805,9 @@ class QuantizationTests: XCTestCase {
     }
 
     func testTurboQuantOnlineFusedSupportContract() throws {
-        for headDimension in TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions {
+        for headDimension in TurboQuantRuntimeProbeResult
+            .throughputOptimizedOnlineFusedHeadDimensions
+        {
             let keyLayout = try turboQuantAttentionLayout(
                 shape: [1, 2, 8, headDimension],
                 groupSize: 64
