@@ -34,6 +34,9 @@ jobs:
           LATEST_TAG=$(curl -s https://api.github.com/repos/swiftlang/swift-format/releases/latest | \
             grep '"tag_name":' | \
             sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG=602.0.0
+          fi
           echo "swift-format $LATEST_TAG"
           echo "SWIFT_FORMAT_VERSION=$LATEST_TAG" >> $GITHUB_OUTPUT
 
@@ -49,7 +52,7 @@ jobs:
         shell: sh
         run: |
           cd /tmp
-          git clone --branch ${{ steps.swift-format.outputs.SWIFT_FORMAT_VERSION }} --depth 1 https://github.com/swiftlang/swift-format.git
+          git clone --branch "${{ steps.swift-format.outputs.SWIFT_FORMAT_VERSION }}" --depth 1 https://github.com/swiftlang/swift-format.git
           cd swift-format
           swift build -c release
 
