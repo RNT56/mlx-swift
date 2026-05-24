@@ -197,7 +197,8 @@ class MLXArrayTests: XCTestCase {
             (0 ..< arrayData.shape[1]).map { column in
                 let elementOffset = row * arrayData.strides[0] + column * arrayData.strides[1]
                 return arrayData.data.withUnsafeBytes {
-                    $0.load(fromByteOffset: elementOffset * MemoryLayout<Int32>.stride, as: Int32.self)
+                    $0.load(
+                        fromByteOffset: elementOffset * MemoryLayout<Int32>.stride, as: Int32.self)
                 }
             }
         }

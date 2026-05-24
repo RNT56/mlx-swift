@@ -623,7 +623,8 @@ final class WiredMemoryTests: XCTestCase {
             let waitEvents = try await Self.collectEvents(stream: waitStream) { event in
                 event.kind == .admissionWait && event.ticketID == blockedID
             }
-            XCTAssertTrue(waitEvents.contains { $0.kind == .admissionWait && $0.ticketID == blockedID })
+            XCTAssertTrue(
+                waitEvents.contains { $0.kind == .admissionWait && $0.ticketID == blockedID })
 
             blockedTask.cancel()
             _ = await blockedTask.value
@@ -631,8 +632,11 @@ final class WiredMemoryTests: XCTestCase {
             let cancelEvents = try await Self.collectEvents(stream: cancelStream) { event in
                 event.kind == .admissionCancelled && event.ticketID == blockedID
             }
-            XCTAssertTrue(cancelEvents.contains { $0.kind == .admissionCancelled && $0.ticketID == blockedID })
-            XCTAssertFalse(cancelEvents.contains { $0.kind == .ticketStarted && $0.ticketID == blockedID })
+            XCTAssertTrue(
+                cancelEvents.contains { $0.kind == .admissionCancelled && $0.ticketID == blockedID }
+            )
+            XCTAssertFalse(
+                cancelEvents.contains { $0.kind == .ticketStarted && $0.ticketID == blockedID })
 
             _ = await active.end()
 

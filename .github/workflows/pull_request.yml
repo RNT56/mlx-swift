@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   lint:
-    if: github.repository == 'ml-explore/mlx-swift'
+    if: github.repository == 'ml-explore/mlx-swift' || github.repository == 'RNT56/mlx-swift'
     runs-on: ubuntu-latest
     container:
       image: swift:6.2-rhel-ubi9
@@ -34,6 +34,9 @@ jobs:
           LATEST_TAG=$(curl -s https://api.github.com/repos/swiftlang/swift-format/releases/latest | \
             grep '"tag_name":' | \
             sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG=602.0.0
+          fi
           echo "swift-format $LATEST_TAG"
           echo "SWIFT_FORMAT_VERSION=$LATEST_TAG" >> $GITHUB_OUTPUT
 
@@ -49,7 +52,7 @@ jobs:
         shell: sh
         run: |
           cd /tmp
-          git clone --branch ${{ steps.swift-format.outputs.SWIFT_FORMAT_VERSION }} --depth 1 https://github.com/swiftlang/swift-format.git
+          git clone --branch "${{ steps.swift-format.outputs.SWIFT_FORMAT_VERSION }}" --depth 1 https://github.com/swiftlang/swift-format.git
           cd swift-format
           swift build -c release
 
@@ -71,7 +74,7 @@ jobs:
 
   docs:
     needs: lint
-    if: github.repository == 'ml-explore/mlx-swift'
+    if: github.repository == 'ml-explore/mlx-swift' || github.repository == 'RNT56/mlx-swift'
     runs-on: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v6
@@ -83,7 +86,7 @@ jobs:
 
   mac_build_and_test:
     needs: lint
-    if: github.repository == 'ml-explore/mlx-swift'
+    if: github.repository == 'ml-explore/mlx-swift' || github.repository == 'RNT56/mlx-swift'
     runs-on: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v6
@@ -176,6 +179,33 @@ jobs:
       - name: Linux Container CMake Swift Build - No Release
         run: |
           bash .github/scripts/setup+build-linux-container-cmake.sh
+
+  turboquant_benchmark_smoke:
+    name: TurboQuant Benchmark Smoke
+    needs: lint
+    if: github.repository == 'ml-explore/mlx-swift' || github.repository == 'RNT56/mlx-swift'
+    runs-on: [self-hosted, macos]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build TurboQuant benchmark
+        run: swift build --product TurboQuantBenchmark
+
+      - name: Emit benchmark JSON smoke artifact
+        run: |
+          mkdir -p benchmark-artifacts
+          swift run TurboQuantBenchmark --iterations 1 > benchmark-artifacts/turboquant-core-smoke.json
+          python3 -m json.tool benchmark-artifacts/turboquant-core-smoke.json >/dev/null
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turboquant-core-benchmark-smoke
+          path: benchmark-artifacts/turboquant-core-smoke.json
+          retention-days: 14
 
   linux_build_cmake_cuda:
     name: Linux CUDA CMake Swift Build (cuda-12.9, swift-6.2.3-RELEASE, ubuntu-24.04, x86_64)

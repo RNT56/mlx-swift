@@ -143,6 +143,12 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(converted.metadata["quant_method"], "turboquant")
         XCTAssertEqual(converted.metadata["linear_class"], "TurboQuantLinear")
         XCTAssertEqual(converted.metadata["turboquant_preset"], "turbo4v2")
+        XCTAssertEqual(converted.metadata["turboquant_schema_version"], "2")
+        XCTAssertEqual(
+            converted.metadata["turboquant_attention_layout_version"],
+            "\(TurboQuantAttentionLayout.currentVersion)"
+        )
+        XCTAssertEqual(converted.metadata["turboquant_linear_format"], "mlx_packed")
 
         let layer = TurboQuantLinear(
             packedWeight: try XCTUnwrap(converted.arrays["model.layers.0.self_attn.q_proj.weight"]),
@@ -184,6 +190,8 @@ class QuantizationTests: XCTestCase {
         XCTAssertNotNil(loadedArrays["linear.scales"])
         XCTAssertEqual(loadedMetadata["quant_method"], "turboquant")
         XCTAssertEqual(loadedMetadata["turboquant_format"], "mlx_packed")
+        XCTAssertEqual(loadedMetadata["turboquant_schema_version"], "2")
+        XCTAssertEqual(loadedMetadata["turboquant_seed_policy"], "fixed")
     }
 
     func testTurboQuantPackedRoundTrip() throws {
@@ -445,7 +453,8 @@ class QuantizationTests: XCTestCase {
             availability.selectedKernelProfile, capabilities.runtimeProbe.selectedKernelProfile)
         XCTAssertEqual(
             availability.supportsMetalPolarQJLCodec,
-            capabilities.runtimeProbe.metalRuntimeAvailable && capabilities.runtimeProbe.flatCodecPassed
+            capabilities.runtimeProbe.metalRuntimeAvailable
+                && capabilities.runtimeProbe.flatCodecPassed
         )
 
         if availability.supportsMetalPolarQJLAttention {
@@ -473,7 +482,8 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(capabilities.bfloatOutput, probeCapabilities.bfloatOutput)
         XCTAssertEqual(
             capabilities.linearMatmul,
-            ProcessInfo.processInfo.environment["TURBOQUANT_ENABLE_EXPERIMENTAL_LINEAR_METAL"] == "1"
+            ProcessInfo.processInfo.environment["TURBOQUANT_ENABLE_EXPERIMENTAL_LINEAR_METAL"]
+                == "1"
                 && availability.supportsMetalPolarQJLCodec
         )
     }
@@ -660,6 +670,89 @@ class QuantizationTests: XCTestCase {
         )
     }
 
+    func testTurboQuantAttentionDecisionSelectsTiledFusedForShortDecodeWindows() throws {
+        let keyLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .key,
+            groupSize: 64
+        )
+        let valueLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .value,
+            groupSize: 64
+        )
+
+        let decision = try turboQuantAttentionDecision(
+            request: TurboQuantAttentionRequest(
+                queryShape: [1, 4, 4, 64],
+                keyLayout: keyLayout,
+                valueLayout: valueLayout,
+                queryDType: .float16,
+                outputDType: .float16,
+                maskKind: .causal
+            ),
+            capabilities: TurboQuantAttentionCapabilities(
+                encode: true,
+                decode: true,
+                qk: true,
+                av: true,
+                onlineFused: true,
+                tiledOnlineFused: true,
+                maxOnlineFusedQueryLength: 1,
+                maxTiledOnlineFusedQueryLength: 8
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .tiledOnlineFused)
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .onlineFused })
+    }
+
+    func testTurboQuantAttentionDecisionHonorsDTypeMaskAndDeviceCapabilitySets() throws {
+        let keyLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .key,
+            groupSize: 64
+        )
+        let valueLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .value,
+            groupSize: 64
+        )
+
+        XCTAssertThrowsError(
+            try turboQuantAttentionDecision(
+                request: TurboQuantAttentionRequest(
+                    queryShape: [1, 4, 1, 64],
+                    keyLayout: keyLayout,
+                    valueLayout: valueLayout,
+                    queryDType: .float16,
+                    outputDType: .float16,
+                    maskKind: .causal,
+                    deviceFamily: "apple7"
+                ),
+                capabilities: TurboQuantAttentionCapabilities(
+                    encode: true,
+                    decode: true,
+                    qk: false,
+                    av: false,
+                    onlineFused: true,
+                    supportedDTypes: [.float32],
+                    supportedMasks: [.none],
+                    supportedDeviceFamilies: ["apple9"]
+                )
+            )
+        ) { error in
+            let description = String(describing: error)
+            XCTAssertTrue(description.contains("dtype"))
+            XCTAssertTrue(description.contains("mask"))
+            XCTAssertTrue(description.contains("device family"))
+        }
+    }
+
     func testTurboQuantLinearKeepsMetalMatmulBehindProductionGate() {
         let weight = MLXArray.ones([2, 64], dtype: .float32)
         let layer = TurboQuantLinear(
@@ -721,7 +814,8 @@ class QuantizationTests: XCTestCase {
                 logicalLength: 0
             )
         ) { error in
-            XCTAssertTrue(String(describing: error).contains("exceeds compressed attention capacity"))
+            XCTAssertTrue(
+                String(describing: error).contains("exceeds compressed attention capacity"))
         }
     }
 
@@ -1022,9 +1116,10 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(valueCode.signs.shape, [1])
         XCTAssertEqual(valueCode.highPrecisionMask.shape, [1])
         XCTAssertEqual(valueCode.residualSigns.shape, [1])
-        XCTAssertTrue(uniformPrecisionKeyCode.highPrecisionMask.asArray(UInt32.self).allSatisfy {
-            $0 == 0
-        })
+        XCTAssertTrue(
+            uniformPrecisionKeyCode.highPrecisionMask.asArray(UInt32.self).allSatisfy {
+                $0 == 0
+            })
         XCTAssertEqual(try turboQuantMetalDecode(keyCode).shape, x.shape)
         XCTAssertEqual(try turboQuantMetalDecode(valueCode).shape, x.shape)
     }
@@ -1640,7 +1735,8 @@ class QuantizationTests: XCTestCase {
             )
         )
 
-        let decodedValues = try turboQuantMetalDecodeAttention(valueCode, outputDType: queries.dtype)
+        let decodedValues = try turboQuantMetalDecodeAttention(
+            valueCode, outputDType: queries.dtype)
         let scores = try turboQuantMetalQK(
             queries: queries,
             keyCode: keyCode,
@@ -1709,7 +1805,9 @@ class QuantizationTests: XCTestCase {
     }
 
     func testTurboQuantOnlineFusedSupportContract() throws {
-        for headDimension in TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions {
+        for headDimension in TurboQuantRuntimeProbeResult
+            .throughputOptimizedOnlineFusedHeadDimensions
+        {
             let keyLayout = try turboQuantAttentionLayout(
                 shape: [1, 2, 8, headDimension],
                 groupSize: 64
