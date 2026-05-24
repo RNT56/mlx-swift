@@ -488,7 +488,6 @@ open class TurboQuantLinear: Linear, Quantized {
 
         let availability = TurboQuantKernelAvailability.current
         self.activeBackend = availability.runtimeBackend(for: backend)
-        self.backendFallbackReason = availability.fallbackReason(for: backend)
 
         let configuration = TurboQuantConfiguration(
             preset: preset,
@@ -503,11 +502,23 @@ open class TurboQuantLinear: Linear, Quantized {
         self.scales = packed.scales
         self.biases = packed.biases
 
+        var metalCode: TurboQuantMetalCode?
+        var fallbackReason = availability.fallbackReason(for: backend)
         if self.activeBackend == .metalPolarQJL {
-            self.metalCode = try? turboQuantMetalEncode(weight, configuration: configuration)
-        } else {
-            self.metalCode = nil
+            if availability.kernelCapabilities.linearMatmul {
+                do {
+                    metalCode = try turboQuantMetalEncode(weight, configuration: configuration)
+                } catch {
+                    fallbackReason =
+                        "TurboQuant Metal linear matmul setup failed: \(error); using MLX packed TurboQuant lanes."
+                }
+            } else {
+                fallbackReason =
+                    "TurboQuant Metal linear matmul has not passed production quality and speed gates; using MLX packed TurboQuant lanes."
+            }
         }
+        self.metalCode = metalCode
+        self.backendFallbackReason = fallbackReason
 
         super.init(weight: packed.weight, bias: bias)
         self.freeze()

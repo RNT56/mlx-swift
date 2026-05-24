@@ -587,6 +587,61 @@ final class WiredMemoryTests: XCTestCase {
         }
     }
 
+    /// Cancelling a task while it waits for policy admission must remove the
+    /// stored continuation so later manager configuration does not see a waiter.
+    func testAdmissionWaitCancellationRemovesWaiter() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let manager = WiredMemoryManager.makeForTesting(
+                configuration: .init(
+                    policyOnlyWhenUnsupported: true,
+                    baselineOverride: 1024,
+                    useRecommendedWorkingSetWhenUnsupported: false
+                )
+            )
+            let policy = CappedSumPolicy(capDelta: 100 * mib)
+            let active = WiredMemoryTicket(
+                size: 100 * mib,
+                policy: policy,
+                manager: manager,
+                kind: .active
+            )
+            let blockedID = UUID()
+            let blocked = WiredMemoryTicket(
+                id: blockedID,
+                size: 1,
+                policy: policy,
+                manager: manager,
+                kind: .active
+            )
+
+            let waitStream = await manager.events()
+            let cancelStream = await manager.events()
+
+            _ = await active.start()
+            let blockedTask = Task { await blocked.start() }
+
+            let waitEvents = try await Self.collectEvents(stream: waitStream) { event in
+                event.kind == .admissionWait && event.ticketID == blockedID
+            }
+            XCTAssertTrue(waitEvents.contains { $0.kind == .admissionWait && $0.ticketID == blockedID })
+
+            blockedTask.cancel()
+            _ = await blockedTask.value
+
+            let cancelEvents = try await Self.collectEvents(stream: cancelStream) { event in
+                event.kind == .admissionCancelled && event.ticketID == blockedID
+            }
+            XCTAssertTrue(cancelEvents.contains { $0.kind == .admissionCancelled && $0.ticketID == blockedID })
+            XCTAssertFalse(cancelEvents.contains { $0.kind == .ticketStarted && $0.ticketID == blockedID })
+
+            _ = await active.end()
+
+            await manager.updateConfiguration {
+                $0.baselineOverride = 2048
+            }
+        }
+    }
+
     /// Collects events from a stream until a predicate matches or a timeout fires.
     private static func collectEvents(
         stream: AsyncStream<WiredMemoryEvent>,

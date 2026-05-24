@@ -160,6 +160,11 @@ class MLXArrayTests: XCTestCase {
             XCTAssertEqual(result.shape, [4, 2])
             XCTAssertEqual(result.strides, [4, 2])
             XCTAssertEqual(result.dType, .int32)
+            XCTAssertEqual(result.data.count, 16 * MemoryLayout<Int32>.stride)
+            XCTAssertEqual(
+                stridedInt32Values(result),
+                [0, 2, 4, 6, 8, 10, 12, 14]
+            )
         }
         do {
             // it isn't contiguous so we will get a contiguous copy
@@ -167,6 +172,34 @@ class MLXArrayTests: XCTestCase {
             XCTAssertEqual(result.shape, [4, 2])
             XCTAssertEqual(result.strides, [2, 1])
             XCTAssertEqual(result.dType, .int32)
+        }
+    }
+
+    func testAsDataNegativeStrideNoCopyFallsBackToCopy() {
+        let a = MLXArray(0 ..< 16, [4, 4])
+        let s = asStrided(a, [4, 4], strides: [-4, -1], offset: 15)
+
+        let result = s.asData(access: .noCopy)
+        XCTAssertEqual(result.shape, [4, 4])
+        XCTAssertEqual(result.strides, [4, 1])
+        XCTAssertEqual(result.dType, .int32)
+        XCTAssertEqual(result.data.count, 16 * MemoryLayout<Int32>.stride)
+        XCTAssertEqual(
+            stridedInt32Values(result),
+            Array((0 ..< 16).reversed()).map(Int32.init)
+        )
+    }
+
+    private func stridedInt32Values(_ arrayData: MLXArray.MLXArrayData) -> [Int32] {
+        precondition(arrayData.shape.count == 2)
+        precondition(arrayData.strides.count == 2)
+        return (0 ..< arrayData.shape[0]).flatMap { row in
+            (0 ..< arrayData.shape[1]).map { column in
+                let elementOffset = row * arrayData.strides[0] + column * arrayData.strides[1]
+                return arrayData.data.withUnsafeBytes {
+                    $0.load(fromByteOffset: elementOffset * MemoryLayout<Int32>.stride, as: Int32.self)
+                }
+            }
         }
     }
 

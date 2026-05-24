@@ -237,6 +237,7 @@ let package = Package(
         .library(name: "MLXFFT", targets: ["MLXFFT"]),
         .library(name: "MLXLinalg", targets: ["MLXLinalg"]),
         .library(name: "MLXFast", targets: ["MLXFast"]),
+        .executable(name: "TurboQuantBenchmark", targets: ["TurboQuantBenchmark"]),
     ],
     dependencies: [
         // for Complex type
@@ -318,6 +319,14 @@ let package = Package(
             name: "TurboQuantConverter",
             dependencies: ["MLX", "MLXNN"],
             path: "Source/TurboQuantConverter",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+        .executableTarget(
+            name: "TurboQuantBenchmark",
+            dependencies: ["MLX"],
+            path: "Source/TurboQuantBenchmark",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
