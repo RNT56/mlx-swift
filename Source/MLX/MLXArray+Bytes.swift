@@ -234,9 +234,13 @@ extension MLXArray {
             }
 
         case .noCopy:
+            if self.internalStrides.contains(where: { $0 < 0 }) {
+                return asDataCopy()
+            }
+
             let source = UnsafeMutableRawPointer(mutating: mlx_array_data_uint8(self.ctx))!
             let data = Data(
-                bytesNoCopy: source, count: nbytes,
+                bytesNoCopy: source, count: physicalSize * itemSize,
                 deallocator: .none)
 
             let strides: [Int]

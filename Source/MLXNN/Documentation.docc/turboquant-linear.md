@@ -2,8 +2,9 @@
 
 Use ``TurboQuantLinear`` when a model needs TurboQuant-packed linear weights in
 addition to TurboQuant KV-cache compression. The layer keeps an MLX-packed
-fallback representation for portable execution and uses the verified
-PolarQuant/QJL Metal path when the runtime supports it.
+fallback representation for portable execution. The PolarQuant/QJL Metal linear
+matmul path is kept behind an independent production gate until the runtime
+probe and benchmark data prove both quality and speed for the target device.
 
 Convert an in-memory model:
 
@@ -30,3 +31,14 @@ size, mode, seed, and value-bit settings so loaders can select
 
 `--dry-run` reports the tensors that would be converted and the effective linear
 weight compression ratio without writing files.
+
+Benchmark the current device before promoting Metal linear kernels:
+
+```sh
+swift run TurboQuantBenchmark --iterations 25
+```
+
+The benchmark emits JSON with independent capability flags, latency, and quality
+fields for flat decode, experimental flat matmul, and compressed attention. Treat
+`linearMatmul=false` as the production default; the layer will continue to use
+the MLX-packed matmul fallback while retaining TurboQuant metadata.
