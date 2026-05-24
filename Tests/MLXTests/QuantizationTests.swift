@@ -143,6 +143,12 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(converted.metadata["quant_method"], "turboquant")
         XCTAssertEqual(converted.metadata["linear_class"], "TurboQuantLinear")
         XCTAssertEqual(converted.metadata["turboquant_preset"], "turbo4v2")
+        XCTAssertEqual(converted.metadata["turboquant_schema_version"], "2")
+        XCTAssertEqual(
+            converted.metadata["turboquant_attention_layout_version"],
+            "\(TurboQuantAttentionLayout.currentVersion)"
+        )
+        XCTAssertEqual(converted.metadata["turboquant_linear_format"], "mlx_packed")
 
         let layer = TurboQuantLinear(
             packedWeight: try XCTUnwrap(converted.arrays["model.layers.0.self_attn.q_proj.weight"]),
@@ -184,6 +190,8 @@ class QuantizationTests: XCTestCase {
         XCTAssertNotNil(loadedArrays["linear.scales"])
         XCTAssertEqual(loadedMetadata["quant_method"], "turboquant")
         XCTAssertEqual(loadedMetadata["turboquant_format"], "mlx_packed")
+        XCTAssertEqual(loadedMetadata["turboquant_schema_version"], "2")
+        XCTAssertEqual(loadedMetadata["turboquant_seed_policy"], "fixed")
     }
 
     func testTurboQuantPackedRoundTrip() throws {
@@ -658,6 +666,89 @@ class QuantizationTests: XCTestCase {
             ).selectedPath,
             .baseline
         )
+    }
+
+    func testTurboQuantAttentionDecisionSelectsTiledFusedForShortDecodeWindows() throws {
+        let keyLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .key,
+            groupSize: 64
+        )
+        let valueLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .value,
+            groupSize: 64
+        )
+
+        let decision = try turboQuantAttentionDecision(
+            request: TurboQuantAttentionRequest(
+                queryShape: [1, 4, 4, 64],
+                keyLayout: keyLayout,
+                valueLayout: valueLayout,
+                queryDType: .float16,
+                outputDType: .float16,
+                maskKind: .causal
+            ),
+            capabilities: TurboQuantAttentionCapabilities(
+                encode: true,
+                decode: true,
+                qk: true,
+                av: true,
+                onlineFused: true,
+                tiledOnlineFused: true,
+                maxOnlineFusedQueryLength: 1,
+                maxTiledOnlineFusedQueryLength: 8
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .tiledOnlineFused)
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .onlineFused })
+    }
+
+    func testTurboQuantAttentionDecisionHonorsDTypeMaskAndDeviceCapabilitySets() throws {
+        let keyLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .key,
+            groupSize: 64
+        )
+        let valueLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 16, 64],
+            preset: .turbo3_5,
+            role: .value,
+            groupSize: 64
+        )
+
+        XCTAssertThrowsError(
+            try turboQuantAttentionDecision(
+                request: TurboQuantAttentionRequest(
+                    queryShape: [1, 4, 1, 64],
+                    keyLayout: keyLayout,
+                    valueLayout: valueLayout,
+                    queryDType: .float16,
+                    outputDType: .float16,
+                    maskKind: .causal,
+                    deviceFamily: "apple7"
+                ),
+                capabilities: TurboQuantAttentionCapabilities(
+                    encode: true,
+                    decode: true,
+                    qk: false,
+                    av: false,
+                    onlineFused: true,
+                    supportedDTypes: [.float32],
+                    supportedMasks: [.none],
+                    supportedDeviceFamilies: ["apple9"]
+                )
+            )
+        ) { error in
+            let description = String(describing: error)
+            XCTAssertTrue(description.contains("dtype"))
+            XCTAssertTrue(description.contains("mask"))
+            XCTAssertTrue(description.contains("device family"))
+        }
     }
 
     func testTurboQuantLinearKeepsMetalMatmulBehindProductionGate() {

@@ -305,6 +305,22 @@ private func turboQuantConversionMetadata(
     result["turboquant_seed"] = "\(options.seed)"
     result["turboquant_value_bits"] = "\(options.valueBits ?? options.preset.defaultValueBits)"
     result["turboquant_converted_tensors"] = "\(convertedCount)"
+    result["turboquant_schema_version"] = "2"
+    result["turboquant_layout_version"] = "\(TurboQuantAttentionLayout.currentVersion)"
+    result["turboquant_attention_layout_version"] = "\(TurboQuantAttentionLayout.currentVersion)"
+    result["turboquant_seed_policy"] = "fixed"
+    result["turboquant_key_format"] = "polar_qjl_mixed_bits_v4"
+    result["turboquant_value_format"] = "packed_value_bits_v4"
+    result["turboquant_linear_format"] = "mlx_packed"
+    result["turboquant_codebook_version"] = "1"
+    result["turboquant_rotation_version"] = "1"
+    result["mlx_swift_commit"] =
+        ProcessInfo.processInfo.environment["MLX_SWIFT_COMMIT"] ?? "unknown"
+    result["converter_version"] = "2"
+    result["conversion_device"] = Host.current().localizedName ?? "unknown"
+    result["conversion_date"] = ISO8601DateFormatter().string(from: Date())
+    result["converted_tensor_names_hash"] =
+        result["converted_tensor_names_hash"] ?? "count:\(convertedCount)"
     return result
 }
 
@@ -348,6 +364,19 @@ private func updateTurboQuantConfigJSON(
         "quant_method": "turboquant",
         "linear_class": "TurboQuantLinear",
         "turboquant_format": "mlx_packed",
+        "turboquant_schema_version": 2,
+        "turboquant_layout_version": TurboQuantAttentionLayout.currentVersion,
+        "turboquant_attention_layout_version": TurboQuantAttentionLayout.currentVersion,
+        "turboquant_seed_policy": "fixed",
+        "turboquant_key_format": "polar_qjl_mixed_bits_v4",
+        "turboquant_value_format": "packed_value_bits_v4",
+        "turboquant_linear_format": "mlx_packed",
+        "turboquant_codebook_version": 1,
+        "turboquant_rotation_version": 1,
+        "mlx_swift_commit": ProcessInfo.processInfo.environment["MLX_SWIFT_COMMIT"] ?? "unknown",
+        "converter_version": 2,
+        "conversion_device": Host.current().localizedName ?? "unknown",
+        "conversion_date": ISO8601DateFormatter().string(from: Date()),
         "preset": options.preset.rawValue,
         "group_size": options.groupSize,
         "bits": options.preset.effectiveBits,
