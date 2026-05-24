@@ -2,6 +2,8 @@
 
 W1 owns the public TurboQuant contracts consumed by `mlx-swift-lm` and Pines. These contracts must be additive, stable, Codable where exported, Sendable where crossing concurrency boundaries, and usable without Metal for simulator/no-GPU tests.
 
+Launch wave: Wave 0. This can start immediately and should run in parallel with LM W4 and Pines W7/W24.
+
 ## Worker
 
 | Worker | Branch | Phase | Priority |

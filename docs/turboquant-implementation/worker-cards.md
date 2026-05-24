@@ -2,7 +2,18 @@
 
 This file preserves the `mlx-swift` worker scope from the cross-repo plan.
 
-## W1 - Core public contracts
+Use the Pines [Worker Launch Schedule](/Users/mt/Programming/Schtack/pines/docs/turboquant-implementation/14-worker-launch-schedule.md) for execution order. For `mlx-swift`, the executable order is:
+
+| Wave | Worker | Can run when |
+| --- | --- | --- |
+| Wave 0 | W1 core public contracts | immediately |
+| Wave 1 | W2 validation/router | W1 contracts compile |
+| Wave 3 | W3 benchmark JSON | W1/W2 stable enough for reports |
+| Wave 5 | W13 Layout V5/kernels | benchmark JSON, quality gates, memory calibration exist |
+
+W1 and W2 are correctness/control-plane enablers. W13 is optimization and must remain gated until measurement proves improvement.
+
+## Wave 0 - W1 core public contracts
 
 Branch: `tq/core-contracts`
 
@@ -32,7 +43,7 @@ Acceptance:
 - fused failure does not disable two-stage;
 - storage estimate can be computed before allocation.
 
-## W2 - Validation and router
+## Wave 1 - W2 validation and router
 
 Branch: `tq/core-validation-router`
 
@@ -61,7 +72,7 @@ Acceptance:
 - every rejected path has a reason;
 - unsupported shape never dispatches kernel.
 
-## W3 - Core benchmark JSON
+## Wave 3 - W3 core benchmark JSON
 
 Branch: `tq/core-benchmark-json`
 
@@ -89,7 +100,7 @@ Acceptance:
 - Pines can import schema;
 - hidden-copy risk is recorded.
 
-## W13 - Layout V5 and kernels
+## Wave 5 - W13 Layout V5 and kernels
 
 Branch: `tq/layout-v5-kernels`
 

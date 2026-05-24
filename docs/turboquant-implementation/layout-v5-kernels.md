@@ -2,6 +2,8 @@
 
 W13 is the optimization lane. It must not activate before benchmark JSON, quality gates, and evidence import exist. Implementation may land behind a disabled flag, but product activation waits for measurement.
 
+Launch wave: Wave 5. Implementation may exist behind a disabled flag earlier only if it does not disturb W1-W3 contracts or benchmark comparability.
+
 ## Worker
 
 | Worker | Branch | Phase | Priority |

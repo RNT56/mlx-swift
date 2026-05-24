@@ -2,6 +2,8 @@
 
 W3 owns stable core benchmark output and the hidden-copy audit. This work feeds Pines evidence import and prevents long-context cache duplication from hiding inside Metal launch preparation.
 
+Launch wave: Wave 3. Start after W1/W2 are stable enough to report capabilities, storage estimates, and path decisions.
+
 ## Worker
 
 | Worker | Branch | Phase | Priority |

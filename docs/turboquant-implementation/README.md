@@ -10,6 +10,21 @@ Cross-repo release-train docs live in:
 
 This repo-local packet defines what core workers must implement and expose.
 
+The executable launch order is owned by the Pines packet:
+
+```text
+/Users/mt/Programming/Schtack/pines/docs/turboquant-implementation/14-worker-launch-schedule.md
+```
+
+For this repo, the launch order is:
+
+1. Wave 0: W1 core contracts.
+2. Wave 1: W2 validation/router.
+3. Wave 3: W3 benchmark JSON and hidden-copy audit.
+4. Wave 5: W13 Layout V5 and kernels.
+
+W1 can run immediately in parallel with LM W4 and Pines W7/W24. W13 must not product-activate before benchmark, quality, and memory-calibration gates exist.
+
 ## Core responsibilities
 
 `mlx-swift` owns:
@@ -30,11 +45,11 @@ This repo-local packet defines what core workers must implement and expose.
 
 ## Required reading
 
-1. [Core Contracts](core-contracts.md)
-2. [Validation and Attention Router](validation-router.md)
-3. [Benchmark JSON and Hidden-Copy Audit](benchmark-json-hidden-copy.md)
-4. [Layout V5 and Kernels](layout-v5-kernels.md)
-5. [Core Worker Cards](worker-cards.md)
+1. [Core Worker Cards](worker-cards.md)
+2. [Core Contracts](core-contracts.md)
+3. [Validation and Attention Router](validation-router.md)
+4. [Benchmark JSON and Hidden-Copy Audit](benchmark-json-hidden-copy.md)
+5. [Layout V5 and Kernels](layout-v5-kernels.md)
 
 ## Non-negotiables
 

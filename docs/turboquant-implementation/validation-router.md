@@ -2,6 +2,8 @@
 
 W2 owns canonical validation and path selection. The goal is to fail invalid compressed state before Metal dispatch and to make path selection explainable.
 
+Launch wave: Wave 1. Start after W1 contracts compile.
+
 ## Worker
 
 | Worker | Branch | Phase | Priority |
