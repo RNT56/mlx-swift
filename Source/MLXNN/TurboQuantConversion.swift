@@ -317,7 +317,7 @@ private func turboQuantConversionMetadata(
     result["mlx_swift_commit"] =
         ProcessInfo.processInfo.environment["MLX_SWIFT_COMMIT"] ?? "unknown"
     result["converter_version"] = "2"
-    result["conversion_device"] = Host.current().localizedName ?? "unknown"
+    result["conversion_device"] = turboQuantConversionDeviceName()
     result["conversion_date"] = ISO8601DateFormatter().string(from: Date())
     result["converted_tensor_names_hash"] =
         result["converted_tensor_names_hash"] ?? "count:\(convertedCount)"
@@ -375,7 +375,7 @@ private func updateTurboQuantConfigJSON(
         "turboquant_rotation_version": 1,
         "mlx_swift_commit": ProcessInfo.processInfo.environment["MLX_SWIFT_COMMIT"] ?? "unknown",
         "converter_version": 2,
-        "conversion_device": Host.current().localizedName ?? "unknown",
+        "conversion_device": turboQuantConversionDeviceName(),
         "conversion_date": ISO8601DateFormatter().string(from: Date()),
         "preset": options.preset.rawValue,
         "group_size": options.groupSize,
@@ -387,4 +387,13 @@ private func updateTurboQuantConfigJSON(
     let encoded = try JSONSerialization.data(
         withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
     try encoded.write(to: configURL)
+}
+
+private func turboQuantConversionDeviceName() -> String {
+    #if os(macOS)
+        if let localizedName = Host.current().localizedName {
+            return localizedName
+        }
+    #endif
+    return ProcessInfo.processInfo.hostName
 }
