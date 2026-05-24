@@ -153,6 +153,8 @@ public enum TurboQuantRuntimeSelfTestStatus: String, Codable, Sendable, CaseIter
 }
 
 public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
+    public static let throughputOptimizedOnlineFusedHeadDimensions = [64, 80, 96, 128]
+
     public var status: TurboQuantRuntimeSelfTestStatus
     public var metalRuntimeAvailable: Bool
     public var encodeDecodePassed: Bool
@@ -165,6 +167,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
     public var encodeDecodeLatencySeconds: Double?
     public var twoStageLatencySeconds: Double?
     public var tiledFusedLatencySeconds: Double?
+    public var onlineFusedHeadDimensions: [Int]
 
     private enum CodingKeys: String, CodingKey {
         case status
@@ -179,6 +182,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         case encodeDecodeLatencySeconds
         case twoStageLatencySeconds
         case tiledFusedLatencySeconds
+        case onlineFusedHeadDimensions
     }
 
     public init(
@@ -193,7 +197,8 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         failureReason: String? = nil,
         encodeDecodeLatencySeconds: Double? = nil,
         twoStageLatencySeconds: Double? = nil,
-        tiledFusedLatencySeconds: Double? = nil
+        tiledFusedLatencySeconds: Double? = nil,
+        onlineFusedHeadDimensions: [Int] = TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
     ) {
         self.status = status
         self.metalRuntimeAvailable = metalRuntimeAvailable
@@ -207,6 +212,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         self.encodeDecodeLatencySeconds = encodeDecodeLatencySeconds
         self.twoStageLatencySeconds = twoStageLatencySeconds
         self.tiledFusedLatencySeconds = tiledFusedLatencySeconds
+        self.onlineFusedHeadDimensions = onlineFusedHeadDimensions
     }
 
     public init(from decoder: Decoder) throws {
@@ -228,6 +234,9 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
             try container.decodeIfPresent(Double.self, forKey: .twoStageLatencySeconds)
         tiledFusedLatencySeconds =
             try container.decodeIfPresent(Double.self, forKey: .tiledFusedLatencySeconds)
+        onlineFusedHeadDimensions =
+            try container.decodeIfPresent([Int].self, forKey: .onlineFusedHeadDimensions)
+            ?? Self.throughputOptimizedOnlineFusedHeadDimensions
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -246,6 +255,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         try container.encodeIfPresent(twoStageLatencySeconds, forKey: .twoStageLatencySeconds)
         try container.encodeIfPresent(
             tiledFusedLatencySeconds, forKey: .tiledFusedLatencySeconds)
+        try container.encode(onlineFusedHeadDimensions, forKey: .onlineFusedHeadDimensions)
     }
 
     public var passed: Bool {
@@ -309,6 +319,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public var selectedKernelProfile: TurboQuantKernelProfile
     public var selfTestStatus: TurboQuantRuntimeSelfTestStatus
     public var selfTestFailureReason: String?
+    public var onlineFusedHeadDimensions: [Int]
 
     public init(
         supportsMLXPacked: Bool = true,
@@ -318,7 +329,8 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         supportsMetalPolarQJL: Bool = false,
         selectedKernelProfile: TurboQuantKernelProfile = .mlxPackedFallback,
         selfTestStatus: TurboQuantRuntimeSelfTestStatus = .notRun,
-        selfTestFailureReason: String? = nil
+        selfTestFailureReason: String? = nil,
+        onlineFusedHeadDimensions: [Int] = TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
     ) {
         self.supportsMLXPacked = supportsMLXPacked
         self.supportsPolarQJLReference = supportsPolarQJLReference
@@ -328,6 +340,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         self.selectedKernelProfile = selectedKernelProfile
         self.selfTestStatus = selfTestStatus
         self.selfTestFailureReason = selfTestFailureReason
+        self.onlineFusedHeadDimensions = onlineFusedHeadDimensions
     }
 
     public static var current: TurboQuantKernelAvailability {
@@ -340,7 +353,8 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
             supportsMetalPolarQJL: attentionAvailable,
             selectedKernelProfile: probe.selectedKernelProfile,
             selfTestStatus: probe.status,
-            selfTestFailureReason: probe.failureReason
+            selfTestFailureReason: probe.failureReason,
+            onlineFusedHeadDimensions: probe.onlineFusedHeadDimensions
         )
     }
 
@@ -1585,7 +1599,9 @@ public func turboQuantMetalSupportsOnlineFusedAttention(
 ) -> Bool {
     guard queryShape.count == 4 else { return false }
     guard queryShape[0] == keyLayout.batchSize, queryShape[2] <= 8 else { return false }
-    guard [64, 80, 96, 128, 192, 256].contains(queryShape[3]) else { return false }
+    guard TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
+        .contains(queryShape[3])
+    else { return false }
     guard queryShape[3] == keyLayout.headDimension else { return false }
     switch mask {
     case .none, .causal:
@@ -2901,21 +2917,22 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
         }
 
         do {
-            let queryValues: [Float] = (0 ..< 512).map { index in
+            let selfTestHeadDimension = 128
+            let queryValues: [Float] = (0 ..< (1 * 4 * 2 * selfTestHeadDimension)).map { index in
                 let position = Double(index)
                 return Float(sin(position * 0.07) + 0.25 * cos(position * 0.013))
             }
-            let keyValues: [Float] = (0 ..< 640).map { index in
+            let keyValues: [Float] = (0 ..< (1 * 2 * 5 * selfTestHeadDimension)).map { index in
                 let position = Double(index)
                 return Float(0.5 * cos(position * 0.05) + 0.1 * sin(position * 0.19))
             }
-            let valueValues: [Float] = (0 ..< 640).map { index in
+            let valueValues: [Float] = (0 ..< (1 * 2 * 5 * selfTestHeadDimension)).map { index in
                 let position = Double(index)
                 return Float(0.35 * sin(position * 0.09) - 0.15 * cos(position * 0.17))
             }
-            let queries = MLXArray(queryValues, [1, 4, 2, 64])
-            let keys = MLXArray(keyValues, [1, 2, 5, 64])
-            let values = MLXArray(valueValues, [1, 2, 5, 64])
+            let queries = MLXArray(queryValues, [1, 4, 2, selfTestHeadDimension])
+            let keys = MLXArray(keyValues, [1, 2, 5, selfTestHeadDimension])
+            let values = MLXArray(valueValues, [1, 2, 5, selfTestHeadDimension])
             let encodeStart = Date.timeIntervalSinceReferenceDate
             let keyCode = try turboQuantMetalEncodeAttention(
                 keys,
@@ -2945,7 +2962,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                 decodedKeys.shape == keys.shape
                 && decodedValues.shape == values.shape
 
-            let scale = 1 / sqrt(Float(64))
+            let scale = 1 / sqrt(Float(selfTestHeadDimension))
             let reference = MLXFast.scaledDotProductAttention(
                 queries: queries,
                 keys: keys,
@@ -3001,7 +3018,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                     let delta = pair.0 - pair.1
                     return current + delta * delta
                 } / Swift.max(referenceEnergy, Float.leastNonzeroMagnitude)
-            let avPassed = av.shape == [1, 4, 2, 64]
+            let avPassed = av.shape == [1, 4, 2, selfTestHeadDimension]
             let fusedPassed =
                 av.shape == fused.shape && maxDelta < 1e-3
                 && fusedReferenceRelativeMSE < 0.5
@@ -3044,7 +3061,8 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                 failureReason: passed ? nil : "TurboQuant Metal tiny-shape self-test failed.",
                 encodeDecodeLatencySeconds: encodeDecodeLatency,
                 twoStageLatencySeconds: twoStageLatency,
-                tiledFusedLatencySeconds: fusedLatency
+                tiledFusedLatencySeconds: fusedLatency,
+                onlineFusedHeadDimensions: TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
             )
         } catch {
             return TurboQuantRuntimeProbeResult(
