@@ -89,6 +89,31 @@ public enum TurboQuantPreset: String, Codable, Sendable, CaseIterable {
     }
 }
 
+public enum TurboQuantUserMode: String, Codable, Sendable {
+    case fastest
+    case balanced
+    case maxContext
+    case batterySaver
+}
+
+public enum TurboQuantFallbackPolicy: Sendable, Codable {
+    case exactRequired
+    case packedAllowed
+    case compressedDecodeAllowed
+    case fatalOnFailure
+}
+
+public enum TurboQuantCacheLifecycle: Sendable, Codable {
+    case empty
+    case rawPrefillChunkOpen
+    case compressingChunk(start: Int, count: Int)
+    case compressedCommitted(logicalLength: Int, capacity: Int)
+    case decodeCompressed
+    case degradedPackedFallback(reason: String)
+    case degradedDecodedFallback(reason: String)
+    case failed(reason: String)
+}
+
 public enum TurboQuantTensorRole: String, Codable, Sendable, CaseIterable {
     case key
     case value
@@ -280,20 +305,22 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
             && encodeDecodePassed
             && qkPassed
             && avPassed
-            && tiledFusedPassed
-            && bfloatOutputPassed
     }
 
     public var kernelCapabilities: TurboQuantKernelCapabilities {
-        TurboQuantKernelCapabilities(
+        let attentionCodecPassed = metalRuntimeAvailable && encodeDecodePassed
+        let qkAvailable = attentionCodecPassed && qkPassed
+        let avAvailable = attentionCodecPassed && avPassed
+        return TurboQuantKernelCapabilities(
             flatEncodeDecode: metalRuntimeAvailable && flatCodecPassed,
-            linearMatmul: false,
-            attentionEncode: passed,
-            attentionDecode: passed,
-            attentionQK: passed && qkPassed,
-            attentionAV: passed && avPassed,
-            attentionFusedDecode: passed && tiledFusedPassed,
-            bfloatOutput: passed && bfloatOutputPassed
+            linearMatmul: turboQuantExperimentalLinearMetalEnabled()
+                && metalRuntimeAvailable && flatCodecPassed,
+            attentionEncode: attentionCodecPassed,
+            attentionDecode: attentionCodecPassed,
+            attentionQK: qkAvailable,
+            attentionAV: avAvailable,
+            attentionFusedDecode: qkAvailable && avAvailable && tiledFusedPassed,
+            bfloatOutput: attentionCodecPassed && bfloatOutputPassed
         )
     }
 }
@@ -326,6 +353,19 @@ public struct TurboQuantKernelCapabilities: Equatable, Codable, Sendable {
         self.attentionAV = attentionAV
         self.attentionFusedDecode = attentionFusedDecode
         self.bfloatOutput = bfloatOutput
+    }
+
+    public var attentionCapabilities: TurboQuantAttentionCapabilities {
+        TurboQuantAttentionCapabilities(
+            encode: attentionEncode,
+            decode: attentionDecode,
+            qk: attentionQK,
+            av: attentionAV,
+            onlineFused: attentionFusedDecode,
+            bfloatOutput: bfloatOutput,
+            supportedOnlineFusedHeadDimensions:
+                TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
+        )
     }
 }
 
@@ -382,16 +422,26 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public var onlineFusedHeadDimensions: [Int]
 
     public var kernelCapabilities: TurboQuantKernelCapabilities {
-        TurboQuantKernelCapabilities(
-            flatEncodeDecode: supportsMetalPolarQJLCodec,
-            linearMatmul: false,
-            attentionEncode: supportsMetalPolarQJLAttention,
-            attentionDecode: supportsMetalPolarQJLAttention,
-            attentionQK: supportsMetalPolarQJLAttention,
-            attentionAV: supportsMetalPolarQJLAttention,
-            attentionFusedDecode: supportsMetalPolarQJLAttention,
-            bfloatOutput: supportsMetalPolarQJLAttention
+        let probeCapabilities = TurboQuantRuntimeProbe.shared.result().kernelCapabilities
+        return TurboQuantKernelCapabilities(
+            flatEncodeDecode: supportsMetalPolarQJLCodec && probeCapabilities.flatEncodeDecode,
+            linearMatmul: supportsMetalPolarQJLCodec
+                && probeCapabilities.linearMatmul
+                && turboQuantExperimentalLinearMetalEnabled(),
+            attentionEncode: supportsMetalPolarQJLAttention && probeCapabilities.attentionEncode,
+            attentionDecode: supportsMetalPolarQJLAttention && probeCapabilities.attentionDecode,
+            attentionQK: supportsMetalPolarQJLAttention && probeCapabilities.attentionQK,
+            attentionAV: supportsMetalPolarQJLAttention && probeCapabilities.attentionAV,
+            attentionFusedDecode: supportsMetalPolarQJLAttention
+                && probeCapabilities.attentionFusedDecode,
+            bfloatOutput: supportsMetalPolarQJLAttention && probeCapabilities.bfloatOutput
         )
+    }
+
+    public var attentionCapabilities: TurboQuantAttentionCapabilities {
+        var capabilities = kernelCapabilities.attentionCapabilities
+        capabilities.supportedOnlineFusedHeadDimensions = onlineFusedHeadDimensions
+        return capabilities
     }
 
     public init(
@@ -419,12 +469,14 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public static var current: TurboQuantKernelAvailability {
         let metalAvailable = metalRuntimeAvailable()
         let probe = TurboQuantRuntimeProbe.shared.result()
-        let codecAvailable = metalAvailable && probe.flatCodecPassed
-        let attentionAvailable = metalAvailable && probe.passed
+        let probeCapabilities = probe.kernelCapabilities
+        let codecAvailable = metalAvailable && probeCapabilities.flatEncodeDecode
+        let attentionAvailable =
+            metalAvailable && probeCapabilities.attentionQK && probeCapabilities.attentionAV
         return TurboQuantKernelAvailability(
             supportsMetalPolarQJLCodec: codecAvailable,
             supportsMetalPolarQJLAttention: attentionAvailable,
-            supportsMetalPolarQJL: attentionAvailable,
+            supportsMetalPolarQJL: codecAvailable || attentionAvailable,
             selectedKernelProfile: probe.selectedKernelProfile,
             selfTestStatus: probe.status,
             selfTestFailureReason: probe.failureReason,
@@ -747,6 +799,270 @@ public enum TurboQuantAttentionPath: String, Codable, Sendable, CaseIterable {
     case baseline
 }
 
+public struct RejectedPath: Equatable, Codable, Sendable {
+    public var path: TurboQuantAttentionPath
+    public var reason: String
+
+    public init(path: TurboQuantAttentionPath, reason: String) {
+        self.path = path
+        self.reason = reason
+    }
+}
+
+public struct TurboQuantFallbackResult: Equatable, Codable, Sendable {
+    public var requestedPath: TurboQuantAttentionPath
+    public var selectedPath: TurboQuantAttentionPath
+    public var reason: String
+
+    public init(
+        requestedPath: TurboQuantAttentionPath,
+        selectedPath: TurboQuantAttentionPath,
+        reason: String
+    ) {
+        self.requestedPath = requestedPath
+        self.selectedPath = selectedPath
+        self.reason = reason
+    }
+}
+
+public struct TurboQuantLayerCacheFootprint: Equatable, Codable, Sendable {
+    public var layerIndex: Int
+    public var keyBytes: Int
+    public var valueBytes: Int
+    public var rawShadowBytes: Int
+    public var packedFallbackBytes: Int
+    public var decodedTransientBytes: Int
+
+    public init(
+        layerIndex: Int,
+        keyBytes: Int,
+        valueBytes: Int,
+        rawShadowBytes: Int = 0,
+        packedFallbackBytes: Int = 0,
+        decodedTransientBytes: Int = 0
+    ) {
+        self.layerIndex = layerIndex
+        self.keyBytes = keyBytes
+        self.valueBytes = valueBytes
+        self.rawShadowBytes = rawShadowBytes
+        self.packedFallbackBytes = packedFallbackBytes
+        self.decodedTransientBytes = decodedTransientBytes
+    }
+
+    public var totalBytes: Int {
+        keyBytes + valueBytes + rawShadowBytes + packedFallbackBytes + decodedTransientBytes
+    }
+}
+
+public struct TurboQuantRuntimeMemoryZones: Equatable, Codable, Sendable {
+    public var modelResidentBytes: Int
+    public var compressedKVBytes: Int
+    public var fallbackReserveBytes: Int
+    public var metalScratchBytes: Int
+    public var promptAndTokenizerBytes: Int
+    public var uiReserveBytes: Int
+    public var safetyReserveBytes: Int
+
+    public init(
+        modelResidentBytes: Int = 0,
+        compressedKVBytes: Int = 0,
+        fallbackReserveBytes: Int = 0,
+        metalScratchBytes: Int = 0,
+        promptAndTokenizerBytes: Int = 0,
+        uiReserveBytes: Int = 0,
+        safetyReserveBytes: Int = 0
+    ) {
+        self.modelResidentBytes = modelResidentBytes
+        self.compressedKVBytes = compressedKVBytes
+        self.fallbackReserveBytes = fallbackReserveBytes
+        self.metalScratchBytes = metalScratchBytes
+        self.promptAndTokenizerBytes = promptAndTokenizerBytes
+        self.uiReserveBytes = uiReserveBytes
+        self.safetyReserveBytes = safetyReserveBytes
+    }
+
+    public var totalRuntimeBytes: Int {
+        modelResidentBytes + compressedKVBytes + fallbackReserveBytes + metalScratchBytes
+            + promptAndTokenizerBytes + uiReserveBytes + safetyReserveBytes
+    }
+}
+
+public struct TurboQuantMemoryPlan: Equatable, Codable, Sendable {
+    public var requestedContextLength: Int
+    public var admittedContextLength: Int
+    public var runtimeBudgetBytes: Int
+    public var zones: TurboQuantRuntimeMemoryZones
+    public var downgradeReason: String?
+
+    public init(
+        requestedContextLength: Int,
+        admittedContextLength: Int,
+        runtimeBudgetBytes: Int,
+        zones: TurboQuantRuntimeMemoryZones,
+        downgradeReason: String? = nil
+    ) {
+        self.requestedContextLength = requestedContextLength
+        self.admittedContextLength = admittedContextLength
+        self.runtimeBudgetBytes = runtimeBudgetBytes
+        self.zones = zones
+        self.downgradeReason = downgradeReason
+    }
+}
+
+public struct TurboQuantAdmission: Equatable, Codable, Sendable {
+    public var admitted: Bool
+    public var mode: TurboQuantUserMode
+    public var memoryPlan: TurboQuantMemoryPlan
+    public var userMessage: String
+    public var machineReason: String?
+
+    public init(
+        admitted: Bool,
+        mode: TurboQuantUserMode,
+        memoryPlan: TurboQuantMemoryPlan,
+        userMessage: String,
+        machineReason: String? = nil
+    ) {
+        self.admitted = admitted
+        self.mode = mode
+        self.memoryPlan = memoryPlan
+        self.userMessage = userMessage
+        self.machineReason = machineReason
+    }
+}
+
+public struct TurboQuantDiagnosticEvent: Equatable, Codable, Sendable {
+    public var name: String
+    public var message: String
+    public var fields: [String: String]
+
+    public init(name: String, message: String, fields: [String: String] = [:]) {
+        self.name = name
+        self.message = message
+        self.fields = fields
+    }
+}
+
+public enum TurboQuantAttentionMaskKind: String, Codable, Sendable {
+    case none
+    case causal
+    case materializedArray
+    case unsupportedMaterializedArrays
+}
+
+public struct TurboQuantAttentionFallbackState: Equatable, Codable, Sendable {
+    public var packedFallbackAvailable: Bool
+    public var decodedFallbackAvailable: Bool
+    public var baselineAvailable: Bool
+
+    public init(
+        packedFallbackAvailable: Bool = false,
+        decodedFallbackAvailable: Bool = false,
+        baselineAvailable: Bool = false
+    ) {
+        self.packedFallbackAvailable = packedFallbackAvailable
+        self.decodedFallbackAvailable = decodedFallbackAvailable
+        self.baselineAvailable = baselineAvailable
+    }
+
+    public static let none = TurboQuantAttentionFallbackState()
+}
+
+public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
+    public var encode: Bool
+    public var decode: Bool
+    public var qk: Bool
+    public var av: Bool
+    public var onlineFused: Bool
+    public var bfloatOutput: Bool
+    public var supportedOnlineFusedHeadDimensions: [Int]
+    public var maxOnlineFusedQueryLength: Int
+    public var materializedMaskTwoStage: Bool
+
+    public init(
+        encode: Bool = false,
+        decode: Bool = false,
+        qk: Bool = false,
+        av: Bool = false,
+        onlineFused: Bool = false,
+        bfloatOutput: Bool = false,
+        supportedOnlineFusedHeadDimensions: [Int] =
+            TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions,
+        maxOnlineFusedQueryLength: Int = 8,
+        materializedMaskTwoStage: Bool = true
+    ) {
+        self.encode = encode
+        self.decode = decode
+        self.qk = qk
+        self.av = av
+        self.onlineFused = onlineFused
+        self.bfloatOutput = bfloatOutput
+        self.supportedOnlineFusedHeadDimensions = supportedOnlineFusedHeadDimensions
+        self.maxOnlineFusedQueryLength = maxOnlineFusedQueryLength
+        self.materializedMaskTwoStage = materializedMaskTwoStage
+    }
+
+    public var twoStageCompressed: Bool {
+        qk && av
+    }
+}
+
+public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
+    public var queryShape: [Int]
+    public var keyLayout: TurboQuantAttentionLayout
+    public var valueLayout: TurboQuantAttentionLayout
+    public var queryDType: DType
+    public var outputDType: DType
+    public var maskKind: TurboQuantAttentionMaskKind
+    public var hasSinks: Bool
+    public var preferOnlineFused: Bool
+    public var memoryBudgetBytes: Int?
+    public var fallbackState: TurboQuantAttentionFallbackState
+
+    public init(
+        queryShape: [Int],
+        keyLayout: TurboQuantAttentionLayout,
+        valueLayout: TurboQuantAttentionLayout,
+        queryDType: DType,
+        outputDType: DType,
+        maskKind: TurboQuantAttentionMaskKind = .none,
+        hasSinks: Bool = false,
+        preferOnlineFused: Bool = true,
+        memoryBudgetBytes: Int? = nil,
+        fallbackState: TurboQuantAttentionFallbackState = .none
+    ) {
+        self.queryShape = queryShape
+        self.keyLayout = keyLayout
+        self.valueLayout = valueLayout
+        self.queryDType = queryDType
+        self.outputDType = outputDType
+        self.maskKind = maskKind
+        self.hasSinks = hasSinks
+        self.preferOnlineFused = preferOnlineFused
+        self.memoryBudgetBytes = memoryBudgetBytes
+        self.fallbackState = fallbackState
+    }
+}
+
+public struct TurboQuantAttentionDecision: Equatable, Codable, Sendable {
+    public var selectedPath: TurboQuantAttentionPath
+    public var outputDType: DType
+    public var estimatedScratchBytes: Int
+    public var rejectedPaths: [RejectedPath]
+
+    public init(
+        selectedPath: TurboQuantAttentionPath,
+        outputDType: DType,
+        estimatedScratchBytes: Int = 0,
+        rejectedPaths: [RejectedPath] = []
+    ) {
+        self.selectedPath = selectedPath
+        self.outputDType = outputDType
+        self.estimatedScratchBytes = estimatedScratchBytes
+        self.rejectedPaths = rejectedPaths
+    }
+}
+
 public struct TurboQuantAttentionLayout: Hashable, Codable, Sendable {
     public static let currentVersion = 4
 
@@ -856,6 +1172,112 @@ public struct TurboQuantAttentionCode {
             * Swift.max(layout.logicalLength, 1) * layout.headDimension
         return Double(storageByteCount * 8) / Double(values)
     }
+}
+
+public func turboQuantAttentionDecision(
+    request: TurboQuantAttentionRequest,
+    capabilities: TurboQuantAttentionCapabilities =
+        TurboQuantKernelAvailability.current.attentionCapabilities
+) throws -> TurboQuantAttentionDecision {
+    try validateAttentionDecisionRequest(request)
+
+    var rejected: [RejectedPath] = []
+    let requiresBFloatOutput = request.outputDType == .bfloat16
+
+    func reject(_ path: TurboQuantAttentionPath, _ reason: String) {
+        rejected.append(RejectedPath(path: path, reason: reason))
+    }
+
+    if request.preferOnlineFused {
+        if !capabilities.onlineFused {
+            reject(.onlineFused, "online fused compressed attention capability is unavailable")
+        } else if requiresBFloatOutput && !capabilities.bfloatOutput {
+            reject(.onlineFused, "bfloat16 compressed attention output is unavailable")
+        } else if request.hasSinks {
+            reject(.onlineFused, "online fused compressed attention does not support sinks")
+        } else if request.keyLayout.headDimension != request.valueLayout.headDimension
+            || request.keyLayout.groupsPerVector != request.valueLayout.groupsPerVector
+        {
+            reject(.onlineFused, "online fused compressed attention requires matching K/V dimensions")
+        } else if !capabilities.supportedOnlineFusedHeadDimensions.contains(request.queryShape[3]) {
+            reject(
+                .onlineFused,
+                "head dimension \(request.queryShape[3]) is not certified for online fused attention"
+            )
+        } else if request.queryShape[2] > capabilities.maxOnlineFusedQueryLength {
+            reject(
+                .onlineFused,
+                "query length \(request.queryShape[2]) exceeds online fused limit \(capabilities.maxOnlineFusedQueryLength)"
+            )
+        } else if request.queryShape[3] != request.keyLayout.headDimension {
+            reject(.onlineFused, "query and key head dimensions differ")
+        } else if request.maskKind == .materializedArray
+            || request.maskKind == .unsupportedMaterializedArrays
+        {
+            reject(.onlineFused, "online fused compressed attention supports only none/causal masks")
+        } else {
+            return TurboQuantAttentionDecision(
+                selectedPath: .onlineFused,
+                outputDType: request.outputDType,
+                estimatedScratchBytes: 0,
+                rejectedPaths: rejected
+            )
+        }
+    } else {
+        reject(.onlineFused, "caller disabled online fused compressed attention")
+    }
+
+    let scoreScratchBytes = turboQuantTwoStageAttentionScratchBytes(
+        queryShape: request.queryShape,
+        keyLength: request.keyLayout.logicalLength
+    )
+    if !capabilities.twoStageCompressed {
+        reject(.twoStageCompressed, "two-stage compressed QK/AV capability is unavailable")
+    } else if requiresBFloatOutput && !capabilities.bfloatOutput {
+        reject(.twoStageCompressed, "bfloat16 compressed attention output is unavailable")
+    } else if request.maskKind == .unsupportedMaterializedArrays {
+        reject(.twoStageCompressed, "multiple materialized masks are not supported")
+    } else if request.maskKind == .materializedArray && !capabilities.materializedMaskTwoStage {
+        reject(.twoStageCompressed, "materialized masks are disabled for two-stage attention")
+    } else if let memoryBudgetBytes = request.memoryBudgetBytes,
+        scoreScratchBytes > memoryBudgetBytes
+    {
+        reject(
+            .twoStageCompressed,
+            "estimated score scratch \(scoreScratchBytes) bytes exceeds budget \(memoryBudgetBytes)"
+        )
+    } else {
+        return TurboQuantAttentionDecision(
+            selectedPath: .twoStageCompressed,
+            outputDType: request.outputDType,
+            estimatedScratchBytes: scoreScratchBytes,
+            rejectedPaths: rejected
+        )
+    }
+
+    if request.fallbackState.packedFallbackAvailable {
+        return TurboQuantAttentionDecision(
+            selectedPath: .mlxPackedFallback,
+            outputDType: request.outputDType,
+            estimatedScratchBytes: 0,
+            rejectedPaths: rejected
+        )
+    }
+    if request.fallbackState.decodedFallbackAvailable || request.fallbackState.baselineAvailable {
+        return TurboQuantAttentionDecision(
+            selectedPath: .baseline,
+            outputDType: request.outputDType,
+            estimatedScratchBytes: 0,
+            rejectedPaths: rejected
+        )
+    }
+
+    let reasons = rejected.map { "\($0.path.rawValue): \($0.reason)" }.joined(separator: "; ")
+    throw TurboQuantError.unsupportedBackend(
+        .metalPolarQJL,
+        "No semantically correct compressed attention path is available"
+            + (reasons.isEmpty ? "." : ": \(reasons).")
+    )
 }
 
 public struct TurboQuantQualityThresholds: Hashable, Codable, Sendable {
@@ -1438,6 +1860,7 @@ public func turboQuantMetalDecodeAttention(
 ) throws -> MLXArray {
     try validateAttentionLayout(code.layout, role: code.role, groupSize: code.groupSize)
     try validateAttentionCodeStorage(code)
+    try requireTurboQuantMetalAttentionOutputDType(outputDType)
     try requireTurboQuantMetalAttention()
 
     let outputShape = code.layout.logicalShape
@@ -1483,13 +1906,13 @@ public func turboQuantMetalQK(
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionQuery(queries, code: keyCode)
-    try validateAttentionCodeStorage(keyCode)
     try validateAttentionMask(
         mask,
         scoreShape: [
             queries.dim(0), queries.dim(1), queries.dim(2), keyCode.layout.logicalLength,
         ]
     )
+    try validateAttentionCodeStorage(keyCode)
     try requireTurboQuantMetalAttention()
     guard keyCode.role == .key else {
         throw TurboQuantError.invalidMetalConfiguration("QK requires a key code")
@@ -1543,6 +1966,7 @@ public func turboQuantMetalAV(
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionCodeStorage(valueCode)
+    try requireTurboQuantMetalAttentionOutputDType(outputDType)
     try requireTurboQuantMetalAttention()
     guard valueCode.role == .value else {
         throw TurboQuantError.invalidMetalConfiguration("AV requires a value code")
@@ -1610,6 +2034,8 @@ public func turboQuantMetalScaledDotProductAttention(
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
     sinks: MLXArray? = nil,
     preferOnlineFused: Bool = true,
+    memoryBudgetBytes: Int? = nil,
+    fallbackState: TurboQuantAttentionFallbackState = .none,
     kernelProfile: TurboQuantKernelProfile? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
@@ -1626,12 +2052,34 @@ public func turboQuantMetalScaledDotProductAttention(
     try validateAttentionSinks(sinks, queryHeadCount: queries.dim(1))
     try requireTurboQuantMetalAttention()
 
-    if sinks == nil,
-        preferOnlineFused,
-        keyCode.layout.headDimension == valueCode.layout.headDimension,
-        keyCode.layout.groupsPerVector == valueCode.layout.groupsPerVector,
-        turboQuantMetalSupportsOnlineFusedAttention(queries: queries, keyCode: keyCode, mask: mask)
-    {
+    let attentionCapabilities =
+        TurboQuantRuntimeProbe.shared.isRunningSelfTest()
+        ? TurboQuantAttentionCapabilities(
+            encode: true,
+            decode: true,
+            qk: true,
+            av: true,
+            onlineFused: true,
+            bfloatOutput: true
+        )
+        : TurboQuantKernelAvailability.current.attentionCapabilities
+    let decision = try turboQuantAttentionDecision(
+        request: TurboQuantAttentionRequest(
+            queryShape: queries.shape,
+            keyLayout: keyCode.layout,
+            valueLayout: valueCode.layout,
+            queryDType: queries.dtype,
+            outputDType: queries.dtype,
+            maskKind: turboQuantAttentionMaskKind(mask),
+            hasSinks: sinks != nil,
+            preferOnlineFused: preferOnlineFused,
+            memoryBudgetBytes: memoryBudgetBytes,
+            fallbackState: fallbackState
+        ),
+        capabilities: attentionCapabilities
+    )
+
+    if decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused {
         return try turboQuantMetalOnlineFusedAttention(
             queries: queries,
             keyCode: keyCode,
@@ -1640,8 +2088,15 @@ public func turboQuantMetalScaledDotProductAttention(
             mask: mask,
             kernelProfile: kernelProfile
                 ?? TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe(),
-            outputDType: queries.dtype,
+            outputDType: decision.outputDType,
             stream: stream
+        )
+    }
+
+    guard decision.selectedPath == .twoStageCompressed else {
+        throw TurboQuantError.unsupportedBackend(
+            .metalPolarQJL,
+            "Selected TurboQuant attention path \(decision.selectedPath.rawValue) requires a higher-level fallback."
         )
     }
 
@@ -1714,6 +2169,65 @@ public func turboQuantMetalSupportsOnlineFusedAttention(
     }
 }
 
+public func turboQuantWarmAttentionKernelVariants(
+    headDimensions: [Int] = TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions,
+    preset: TurboQuantPreset = .turbo4v2,
+    groupSize: Int = 64,
+    kernelProfile: TurboQuantKernelProfile? = nil,
+    stream: StreamOrDevice = .gpu
+) throws {
+    if !TurboQuantRuntimeProbe.shared.isRunningSelfTest() {
+        try requireTurboQuantMetalAttention()
+    }
+
+    let profile = kernelProfile
+        ?? TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe()
+    for headDimension in headDimensions {
+        guard TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
+            .contains(headDimension)
+        else {
+            continue
+        }
+
+        let query = MLXArray.zeros([1, 1, 1, headDimension], dtype: .float32)
+        let keys = MLXArray.zeros([1, 1, 1, headDimension], dtype: .float32)
+        let values = MLXArray.zeros([1, 1, 1, headDimension], dtype: .float32)
+        let keyCode = try turboQuantMetalEncodeAttention(
+            keys,
+            configuration: TurboQuantConfiguration(
+                preset: preset,
+                role: .key,
+                groupSize: groupSize,
+                backend: .metalPolarQJL,
+                seed: UInt64(headDimension) ^ 0xA77E_0000_0000_0001
+            ),
+            stream: stream
+        )
+        let valueCode = try turboQuantMetalEncodeAttention(
+            values,
+            configuration: TurboQuantConfiguration(
+                preset: preset,
+                role: .value,
+                groupSize: groupSize,
+                backend: .metalPolarQJL,
+                seed: UInt64(headDimension) ^ 0xA77E_0000_0000_0002
+            ),
+            stream: stream
+        )
+        let output = try turboQuantMetalOnlineFusedAttention(
+            queries: query,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: 1 / sqrt(Float(headDimension)),
+            mask: .causal,
+            kernelProfile: profile,
+            outputDType: .float32,
+            stream: stream
+        )
+        eval(output)
+    }
+}
+
 private func turboQuantMetalOnlineFusedAttention(
     queries: MLXArray,
     keyCode: TurboQuantAttentionCode,
@@ -1776,13 +2290,11 @@ private func turboQuantMetalOnlineFusedAttention(
             outputDType: outputDType,
             causal: causal
         ) + [
-            ("VALUE_SEED_HI", metalTemplateUInt32High(valueCode.seed)),
-            ("VALUE_SEED_LO", metalTemplateUInt32Low(valueCode.seed)),
             ("VALUE_MAG_WORDS_PER_GROUP", valueCode.layout.magnitudeWordsPerGroup),
             ("VALUE_SCALES_PER_GROUP", valueCode.scalesPerGroup),
             ("ATTENTION_SCALE_BITS", scale.bitPattern),
             ("THREADS_PER_ROW", threadgroupWidth),
-        ],
+        ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed),
         grid: (rowCount * threadgroupWidth, 1, 1),
         threadGroup: (threadgroupWidth, 1, 1),
         outputShapes: [outputShape],
@@ -1810,10 +2322,27 @@ public func requireTurboQuantMetalAttention() throws {
     }
     guard !TurboQuantRuntimeProbe.shared.isRunningSelfTest() else { return }
     let probe = TurboQuantRuntimeProbe.shared.result()
-    guard probe.passed else {
+    let capabilities = probe.kernelCapabilities
+    guard capabilities.attentionQK && capabilities.attentionAV else {
         throw TurboQuantError.unsupportedBackend(
             .metalPolarQJL,
-            probe.failureReason ?? "PolarQuant/QJL compressed attention self-test has not passed."
+            probe.failureReason
+                ?? "PolarQuant/QJL compressed two-stage attention self-test has not passed."
+        )
+    }
+}
+
+private func requireTurboQuantMetalAttentionOutputDType(_ dtype: DType) throws {
+    guard dtype.isFloatingPoint else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "compressed attention output dtype must be floating point")
+    }
+    guard dtype != .bfloat16 || TurboQuantRuntimeProbe.shared.isRunningSelfTest()
+        || TurboQuantRuntimeProbe.shared.result().kernelCapabilities.bfloatOutput
+    else {
+        throw TurboQuantError.unsupportedBackend(
+            .metalPolarQJL,
+            "bfloat16 compressed attention output has not passed runtime certification."
         )
     }
 }
@@ -2808,12 +3337,16 @@ private func randomSign(index: Int, seed: UInt64) -> Bool {
     return (state & 1) == 1
 }
 
-private func metalTemplateUInt32High(_ value: UInt64) -> UInt32 {
-    UInt32((value >> 32) & 0xFFFF_FFFF)
-}
-
-private func metalTemplateUInt32Low(_ value: UInt64) -> UInt32 {
-    UInt32(value & 0xFFFF_FFFF)
+private func metalTemplateSeedWords(
+    prefix: String,
+    value: UInt64
+) -> [(String, any KernelTemplateArg)] {
+    [
+        ("\(prefix)_3", Int((value >> 48) & 0xFFFF)),
+        ("\(prefix)_2", Int((value >> 32) & 0xFFFF)),
+        ("\(prefix)_1", Int((value >> 16) & 0xFFFF)),
+        ("\(prefix)_0", Int(value & 0xFFFF)),
+    ]
 }
 
 private func metalRuntimeAvailable() -> Bool {
@@ -2969,6 +3502,10 @@ private func selectTurboQuantKernelProfile(
     return .portableA16A17
 }
 
+private func turboQuantExperimentalLinearMetalEnabled() -> Bool {
+    ProcessInfo.processInfo.environment["TURBOQUANT_ENABLE_EXPERIMENTAL_LINEAR_METAL"] == "1"
+}
+
 private func turboQuantRelativeMSE(_ expected: [Float], _ actual: [Float]) -> Float {
     guard expected.count == actual.count, !expected.isEmpty else {
         return .infinity
@@ -2981,6 +3518,62 @@ private func turboQuantRelativeMSE(_ expected: [Float], _ actual: [Float]) -> Fl
         return partial + delta * delta
     }
     return mse / Swift.max(energy, Float.leastNonzeroMagnitude)
+}
+
+private func validateAttentionDecisionRequest(_ request: TurboQuantAttentionRequest) throws {
+    guard request.queryShape.count == 4 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "attention query shape must have rank 4"
+        )
+    }
+    guard request.queryDType.isFloatingPoint, request.outputDType.isFloatingPoint else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "compressed attention query and output dtypes must be floating point"
+        )
+    }
+    guard attentionLayoutsShareSequence(request.keyLayout, request.valueLayout) else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "key and value compressed sequence layouts differ"
+        )
+    }
+    guard request.queryShape[0] == request.keyLayout.batchSize,
+        request.queryShape[3] == request.keyLayout.headDimension,
+        request.queryShape[1] % request.keyLayout.kvHeadCount == 0
+    else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "query shape \(request.queryShape) is incompatible with compressed attention layout"
+        )
+    }
+    if request.maskKind == .causal {
+        guard request.queryShape[2] <= request.keyLayout.logicalLength else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "causal compressed attention requires query length \(request.queryShape[2]) <= key length \(request.keyLayout.logicalLength)"
+            )
+        }
+    }
+}
+
+private func turboQuantTwoStageAttentionScratchBytes(
+    queryShape: [Int],
+    keyLength: Int
+) -> Int {
+    guard queryShape.count == 4 else { return Int.max }
+    return queryShape[0] * queryShape[1] * queryShape[2] * keyLength * DType.float32.size
+}
+
+private func turboQuantAttentionMaskKind(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> TurboQuantAttentionMaskKind {
+    switch mask {
+    case .none:
+        return .none
+    case .causal:
+        return .causal
+    case .array:
+        return .materializedArray
+    case .arrays(let arrays):
+        return arrays.count <= 1 ? .materializedArray : .unsupportedMaterializedArrays
+    }
 }
 
 private let turboQuantCompactUnusedBitsetShape = [1]
@@ -3221,34 +3814,42 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                 av.shape == fused.shape && maxDelta < 1e-3
                 && fusedReferenceRelativeMSE < 0.5
                 && fusedValues.allSatisfy(\.isFinite)
-            let bfloatDecode = try turboQuantMetalDecodeAttention(valueCode, outputDType: .bfloat16)
-            let bfloatQueries = queries.asType(.bfloat16)
-            let bfloatAV = try turboQuantMetalAV(
-                attentionWeights: weights,
-                valueCode: valueCode,
-                outputDType: bfloatQueries.dtype
-            )
-            let bfloatFused = try turboQuantMetalScaledDotProductAttention(
-                queries: bfloatQueries,
-                keyCode: keyCode,
-                valueCode: valueCode,
-                scale: scale,
-                mask: .causal,
-                preferOnlineFused: true,
-                kernelProfile: selectedProfile
-            )
-            eval(bfloatDecode, bfloatAV, bfloatFused)
-            let bfloatOutputPassed =
-                bfloatDecode.dtype == .bfloat16
-                && bfloatDecode.shape == values.shape
-                && bfloatAV.dtype == .bfloat16
-                && bfloatAV.shape == av.shape
-                && bfloatFused.dtype == .bfloat16
-                && bfloatFused.shape == fused.shape
-                && bfloatFused.asArray(Float.self).allSatisfy(\.isFinite)
+            let bfloatOutputPassed: Bool
+            do {
+                let bfloatDecode = try turboQuantMetalDecodeAttention(
+                    valueCode,
+                    outputDType: .bfloat16
+                )
+                let bfloatQueries = queries.asType(.bfloat16)
+                let bfloatAV = try turboQuantMetalAV(
+                    attentionWeights: weights,
+                    valueCode: valueCode,
+                    outputDType: bfloatQueries.dtype
+                )
+                let bfloatFused = try turboQuantMetalScaledDotProductAttention(
+                    queries: bfloatQueries,
+                    keyCode: keyCode,
+                    valueCode: valueCode,
+                    scale: scale,
+                    mask: .causal,
+                    preferOnlineFused: true,
+                    kernelProfile: selectedProfile
+                )
+                eval(bfloatDecode, bfloatAV, bfloatFused)
+                bfloatOutputPassed =
+                    bfloatDecode.dtype == .bfloat16
+                    && bfloatDecode.shape == values.shape
+                    && bfloatAV.dtype == .bfloat16
+                    && bfloatAV.shape == av.shape
+                    && bfloatFused.dtype == .bfloat16
+                    && bfloatFused.shape == fused.shape
+                    && bfloatFused.asArray(Float.self).allSatisfy(\.isFinite)
+            } catch {
+                bfloatOutputPassed = false
+            }
+            try turboQuantWarmAttentionKernelVariants(kernelProfile: selectedProfile)
             let passed =
-                flatCodecPassed && encodeDecodePassed && qkPassed && avPassed && fusedPassed
-                && bfloatOutputPassed
+                flatCodecPassed && encodeDecodePassed && qkPassed && avPassed
             let failureReason =
                 passed
                 ? nil
@@ -3360,19 +3961,19 @@ private func validateMetalCodeStorage(_ code: TurboQuantMetalCode) throws {
     try validateStorageArray(
         code.signs,
         name: "flat signs",
-        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape, bitsetShape] : [bitsetShape],
+        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape] : [bitsetShape],
         expectedDType: .uint32
     )
     try validateStorageArray(
         code.highPrecisionMask,
         name: "flat high precision mask",
-        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape, bitsetShape] : [bitsetShape],
+        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape] : [bitsetShape],
         expectedDType: .uint32
     )
     try validateStorageArray(
         code.residualSigns,
         name: "flat residual signs",
-        expectedShapes: [turboQuantCompactUnusedBitsetShape, bitsetShape],
+        expectedShapes: [turboQuantCompactUnusedBitsetShape],
         expectedDType: .uint32
     )
     try validateStorageArray(
@@ -3411,6 +4012,18 @@ private func validateStorageArray(
     guard array.dtype == expectedDType else {
         throw TurboQuantError.invalidMetalConfiguration(
             "\(name) has dtype \(array.dtype), expected \(expectedDType)"
+        )
+    }
+    let expectedByteCount = array.shape.reduce(1, *) * expectedDType.size
+    guard array.nbytes == expectedByteCount else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "\(name) uses \(array.nbytes) storage bytes, expected \(expectedByteCount)"
+        )
+    }
+    array.eval()
+    guard array.contiguousToDimension() == 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "\(name) must be canonical row-contiguous storage"
         )
     }
 }
@@ -3473,10 +4086,8 @@ private func metalTemplate(
         ("VALUE_BITS", configuration.resolvedValueBits),
         ("SCALES_PER_GROUP", metalScalesPerGroup(role: configuration.role)),
         ("ROLE", metalRoleValue(configuration.role)),
-        ("SEED_HI", metalTemplateUInt32High(configuration.seed)),
-        ("SEED_LO", metalTemplateUInt32Low(configuration.seed)),
         ("OUTPUT_DTYPE", outputDType),
-    ]
+    ] + metalTemplateSeedWords(prefix: "SEED", value: configuration.seed)
 }
 
 private func metalRoleValue(_ role: TurboQuantTensorRole) -> Int {
@@ -3549,6 +4160,11 @@ private func validateAttentionLayout(
     guard layout.pinnedPrefixLength >= 0, layout.pinnedPrefixLength <= layout.capacity else {
         throw TurboQuantError.invalidMetalConfiguration("pinned prefix is outside cache capacity")
     }
+    guard layout.pinnedPrefixLength <= layout.logicalLength else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "pinned prefix cannot exceed logical length"
+        )
+    }
     let ringCapacity = layout.capacity - layout.pinnedPrefixLength
     if ringCapacity == 0 {
         guard layout.ringOffset == 0 else {
@@ -3563,6 +4179,11 @@ private func validateAttentionLayout(
     }
     guard layout.groupsPerVector == (layout.headDimension + groupSize - 1) / groupSize else {
         throw TurboQuantError.invalidMetalConfiguration("groups per vector does not match layout")
+    }
+    guard layout.magnitudeWordsPerGroup > 0, layout.bitsetWordsPerGroup > 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "packed-word and bitset axes must be positive"
+        )
     }
 }
 
@@ -3616,19 +4237,19 @@ private func validateAttentionCodeStorage(_ code: TurboQuantAttentionCode) throw
     try validateStorageArray(
         code.signs,
         name: "compressed attention signs",
-        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape, bitsetShape] : [bitsetShape],
+        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape] : [bitsetShape],
         expectedDType: .uint32
     )
     try validateStorageArray(
         code.highPrecisionMask,
         name: "compressed attention high precision mask",
-        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape, bitsetShape] : [bitsetShape],
+        expectedShapes: code.role == .value ? [turboQuantCompactUnusedBitsetShape] : [bitsetShape],
         expectedDType: .uint32
     )
     try validateStorageArray(
         code.residualSigns,
         name: "compressed attention residual signs",
-        expectedShapes: [turboQuantCompactUnusedBitsetShape, bitsetShape],
+        expectedShapes: [turboQuantCompactUnusedBitsetShape],
         expectedDType: .uint32
     )
     try validateStorageArray(
@@ -3872,11 +4493,9 @@ private func attentionTemplate(
         ("VALUE_BITS", configuration.resolvedValueBits),
         ("SCALES_PER_GROUP", metalScalesPerGroup(role: configuration.role)),
         ("ROLE", metalRoleValue(configuration.role)),
-        ("SEED_HI", metalTemplateUInt32High(configuration.seed)),
-        ("SEED_LO", metalTemplateUInt32Low(configuration.seed)),
         ("OUTPUT_DTYPE", outputDType),
         ("DO_CAUSAL", causal),
-    ]
+    ] + metalTemplateSeedWords(prefix: "SEED", value: configuration.seed)
 }
 
 private enum TurboQuantMetalKernels {
@@ -3963,6 +4582,13 @@ private enum TurboQuantMetalKernels {
 
         inline bool tq_vector_random_sign(ulong seed, ulong index) {
             return (tq_vector_mix_index(seed, index) & 1ul) != 0ul;
+        }
+
+        inline ulong tq_make_seed(uint word3, uint word2, uint word1, uint word0) {
+            return (ulong(word3) << 48)
+                | (ulong(word2) << 32)
+                | (ulong(word1) << 16)
+                | ulong(word0);
         }
 
         inline ulong tq_product_channel_rank(ulong seed, uint group_index, uint local_index) {
@@ -4346,7 +4972,7 @@ private enum TurboQuantMetalKernels {
         }
 
         thread float values[GROUP_SIZE];
-        ulong seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
+        ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
 
         if (ROLE == 1) {
             float minimum = INFINITY;
@@ -4457,7 +5083,7 @@ private enum TurboQuantMetalKernels {
             return;
         }
 
-        ulong seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
+        ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
         uint group_id = index / uint(GROUP_SIZE);
         uint local = index - group_id * uint(GROUP_SIZE);
         uint packed_base = group_id * uint(MAG_WORDS_PER_GROUP);
@@ -4508,7 +5134,7 @@ private enum TurboQuantMetalKernels {
         uint row = index / output_columns;
         uint column = index - row * output_columns;
         uint reduction = uint(X_COLUMNS);
-        ulong seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
+        ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
         float sum = 0.0f;
 
         if (uint(ROLE) != 1u && TRANSPOSE_WEIGHT
@@ -4575,6 +5201,13 @@ private enum TurboQuantMetalKernels {
 
         inline bool tq_random_sign_index(ulong seed, ulong index) {
             return (tq_mix_index(seed, index) & 1ul) != 0ul;
+        }
+
+        inline ulong tq_make_seed(uint word3, uint word2, uint word1, uint word0) {
+            return (ulong(word3) << 48)
+                | (ulong(word2) << 32)
+                | (ulong(word1) << 16)
+                | ulong(word0);
         }
 
         inline ulong tq_product_channel_rank(ulong seed, uint group_index, uint local_index) {
@@ -4996,11 +5629,17 @@ private enum TurboQuantMetalKernels {
                 batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)];
         }
 
+        template <
+            typename PackedPtr,
+            typename SignsPtr,
+            typename HighMaskPtr,
+            typename ScalesPtr
+        >
         inline float tq_product_attention_inner_product_group(
-            device const uint* packed,
-            device const uint* signs,
-            device const uint* high_mask,
-            device const float* scales,
+            PackedPtr packed,
+            SignsPtr signs,
+            HighMaskPtr high_mask,
+            ScalesPtr scales,
             thread float* query_values,
             uint batch,
             uint head,
@@ -5127,7 +5766,7 @@ private enum TurboQuantMetalKernels {
         }
 
         thread float values[GROUP_SIZE];
-        ulong seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
+        ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
         uint storage_group = tq_storage_group_index(
             batch, head, token, group, kv_heads, capacity, groups_per_vector);
         float norm_squared = 0.0f;
@@ -5215,7 +5854,7 @@ private enum TurboQuantMetalKernels {
             logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
 
         float sum = 0.0f;
-        ulong seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
+        ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
         for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
             uint group_start = group * uint(GROUP_SIZE);
             uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
@@ -5254,7 +5893,7 @@ private enum TurboQuantMetalKernels {
         out[index] = static_cast<OUTPUT_DTYPE>(tq_decode_attention_value(
             packed, signs, high_mask, residual_signs, scales,
             batch, head, physical_token, dimension,
-            (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO)), uint(ROLE),
+            tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0)), uint(ROLE),
             uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
             uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
             uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
@@ -5286,7 +5925,7 @@ private enum TurboQuantMetalKernels {
             float value = tq_decode_attention_value(
                 v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
                 batch, kv_head, physical_token, dimension,
-                (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO)), 1u,
+                tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0)), 1u,
                 uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
                 uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
                 uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
@@ -5318,7 +5957,7 @@ private enum TurboQuantMetalKernels {
         uint repeats = uint(QUERY_HEADS) / uint(KV_HEADS);
         uint kv_head = q_head / repeats;
         uint causal_limit = uint(LOGICAL_LENGTH) - uint(QUERY_LENGTH) + q_token;
-        ulong key_seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
+        ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
 
         float row_max = -INFINITY;
         float row_sum = 0.0f;
@@ -5398,7 +6037,9 @@ private enum TurboQuantMetalKernels {
                         float value = tq_decode_attention_value(
                             v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
                             batch, kv_head, tile_physical_tokens[tile_lane], lane,
-                            (ulong(uint(VALUE_SEED_HI)) << 32) | ulong(uint(VALUE_SEED_LO)), 1u,
+                            tq_make_seed(
+                                uint(VALUE_SEED_3), uint(VALUE_SEED_2),
+                                uint(VALUE_SEED_1), uint(VALUE_SEED_0)), 1u,
                             uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
                             uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
                             uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
