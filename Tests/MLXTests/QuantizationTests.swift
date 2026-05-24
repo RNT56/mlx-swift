@@ -443,9 +443,14 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(availability.selfTestStatus, capabilities.runtimeProbe.status)
         XCTAssertEqual(
             availability.selectedKernelProfile, capabilities.runtimeProbe.selectedKernelProfile)
+        XCTAssertEqual(
+            availability.supportsMetalPolarQJLCodec,
+            capabilities.runtimeProbe.metalRuntimeAvailable && capabilities.runtimeProbe.flatCodecPassed
+        )
 
         if availability.supportsMetalPolarQJLAttention {
             XCTAssertEqual(capabilities.runtimeProbe.status, .passed)
+            XCTAssertTrue(capabilities.runtimeProbe.flatCodecPassed)
             XCTAssertNotEqual(capabilities.runtimeProbe.selectedKernelProfile, .mlxPackedFallback)
             XCTAssertNil(capabilities.runtimeProbe.failureReason)
         } else {
@@ -659,6 +664,61 @@ class QuantizationTests: XCTestCase {
         }
     }
 
+    func testTurboQuantMetalCodecUsesCompactUnusedBitsetsWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
+            throw XCTSkip("Metal runtime unavailable")
+        }
+
+        let values = (0 ..< 128).map { index in
+            Float(0.2 * sin(Double(index) * 0.07))
+        }
+        let x = MLXArray(values, [2, 64])
+        let keyCode = try turboQuantMetalEncode(
+            x,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo3_5,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0xC0DE
+            )
+        )
+        let valueCode = try turboQuantMetalEncode(
+            x,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo3_5,
+                role: .value,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0xC0DE,
+                valueBits: 4
+            )
+        )
+        let uniformPrecisionKeyCode = try turboQuantMetalEncode(
+            x,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0xC0DE
+            )
+        )
+
+        XCTAssertEqual(keyCode.signs.shape, [keyCode.groupCount * keyCode.bitsetWordsPerGroup])
+        XCTAssertEqual(
+            keyCode.highPrecisionMask.shape, [keyCode.groupCount * keyCode.bitsetWordsPerGroup])
+        XCTAssertEqual(keyCode.residualSigns.shape, [1])
+        XCTAssertEqual(valueCode.signs.shape, [1])
+        XCTAssertEqual(valueCode.highPrecisionMask.shape, [1])
+        XCTAssertEqual(valueCode.residualSigns.shape, [1])
+        XCTAssertTrue(uniformPrecisionKeyCode.highPrecisionMask.asArray(UInt32.self).allSatisfy {
+            $0 == 0
+        })
+        XCTAssertEqual(try turboQuantMetalDecode(keyCode).shape, x.shape)
+        XCTAssertEqual(try turboQuantMetalDecode(valueCode).shape, x.shape)
+    }
+
     func testTurboQuantMetalCodecUsesGPUStreamWhenDefaultDeviceIsCPU() throws {
         guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
             throw XCTSkip("Metal runtime unavailable")
@@ -786,6 +846,63 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(layout.pinnedPrefixLength, 0)
         XCTAssertEqual(layout.groupsPerVector, 2)
         XCTAssertEqual(layout.bitsetWordsPerGroup, 2)
+    }
+
+    func testTurboQuantAttentionLayoutUsesPresetHighPrecisionFraction() throws {
+        let turbo35 = try turboQuantAttentionLayout(
+            shape: [1, 1, 1, 64],
+            preset: .turbo3_5,
+            role: .key,
+            groupSize: 64
+        )
+        let turbo4v2 = try turboQuantAttentionLayout(
+            shape: [1, 1, 1, 64],
+            preset: .turbo4v2,
+            role: .key,
+            groupSize: 64
+        )
+
+        XCTAssertEqual(turbo35.magnitudeWordsPerGroup, 5)
+        XCTAssertEqual(turbo4v2.magnitudeWordsPerGroup, 6)
+    }
+
+    func testTurboQuantAttentionCodeUsesCompactUnusedBitsetsWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let keys = MLXArray.ones([1, 1, 2, 64], dtype: .float32)
+        let values = keys + 0.25
+        let keyCode = try turboQuantMetalEncodeAttention(
+            keys,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo3_5,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0xCAFE
+            )
+        )
+        let valueCode = try turboQuantMetalEncodeAttention(
+            values,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo3_5,
+                role: .value,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0xCAFE,
+                valueBits: 4
+            )
+        )
+
+        XCTAssertEqual(keyCode.signs.shape, [1, 1, 2, 1, 2])
+        XCTAssertEqual(keyCode.highPrecisionMask.shape, [1, 1, 2, 1, 2])
+        XCTAssertEqual(keyCode.residualSigns.shape, [1])
+        XCTAssertEqual(valueCode.signs.shape, [1])
+        XCTAssertEqual(valueCode.highPrecisionMask.shape, [1])
+        XCTAssertEqual(valueCode.residualSigns.shape, [1])
+        XCTAssertEqual(try turboQuantMetalDecodeAttention(keyCode).shape, keys.shape)
+        XCTAssertEqual(try turboQuantMetalDecodeAttention(valueCode).shape, values.shape)
     }
 
     func testTurboQuantCompressedAttentionUsesProductEstimatorWhenAvailable() throws {
