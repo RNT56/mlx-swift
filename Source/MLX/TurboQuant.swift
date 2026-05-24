@@ -146,6 +146,15 @@ public enum TurboQuantKernelProfile: String, Codable, Sendable, CaseIterable {
     }
 }
 
+private func turboQuantOnlineFusedThreadgroupWidth(minimum: Int) -> Int {
+    let target = max(1, min(256, minimum))
+    var width = 1
+    while width < target {
+        width <<= 1
+    }
+    return width
+}
+
 public enum TurboQuantRuntimeSelfTestStatus: String, Codable, Sendable, CaseIterable {
     case notRun
     case passed
@@ -1623,9 +1632,8 @@ private func turboQuantMetalOnlineFusedAttention(
 ) throws -> MLXArray {
     let outputShape = [queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]
     let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
-    let threadgroupWidth = min(
-        256,
-        max(queries.dim(3), max(1, kernelProfile.fusedDecodeThreadgroupWidth))
+    let threadgroupWidth = turboQuantOnlineFusedThreadgroupWidth(
+        minimum: max(queries.dim(3), kernelProfile.fusedDecodeThreadgroupWidth)
     )
     let causal: Bool
     switch mask {
@@ -4748,6 +4756,7 @@ private enum TurboQuantMetalKernels {
         }
 
         threadgroup float partial[256];
+        threadgroup float tile_scores[256];
         threadgroup float tile_weights[256];
         threadgroup uint tile_physical_tokens[256];
         threadgroup float output_accum[HEAD_DIM];
@@ -4762,83 +4771,7 @@ private enum TurboQuantMetalKernels {
         ulong key_seed = (ulong(uint(SEED_HI)) << 32) | ulong(uint(SEED_LO));
 
         float row_max = -INFINITY;
-        for (uint logical_token = lane; logical_token < uint(LOGICAL_LENGTH); logical_token += threads_per_row) {
-            if (DO_CAUSAL && logical_token > causal_limit) {
-                continue;
-            }
-            uint physical_token = tq_physical_token(
-                logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
-            float score = 0.0f;
-            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
-                uint group_start = group * uint(GROUP_SIZE);
-                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
-                thread float query_values[GROUP_SIZE];
-                for (uint local = 0u; local < count; local++) {
-                    uint dimension = group_start + local;
-                    uint q_index =
-                        (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
-                            * uint(HEAD_DIM)) + dimension;
-                    query_values[local] = float(q[q_index]);
-                }
-                score += tq_product_attention_inner_product_group(
-                    k_packed, k_signs, k_high_mask, k_scales, query_values,
-                    batch, kv_head, physical_token, group, key_seed,
-                    uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
-                    uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
-                    uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM));
-            }
-            row_max = max(row_max, score * attention_scale);
-        }
-        partial[lane] = row_max;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = threads_per_row >> 1; stride > 0u; stride >>= 1) {
-            if (lane < stride) {
-                partial[lane] = max(partial[lane], partial[lane + stride]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        row_max = partial[0];
-
         float row_sum = 0.0f;
-        for (uint logical_token = lane; logical_token < uint(LOGICAL_LENGTH); logical_token += threads_per_row) {
-            if (DO_CAUSAL && logical_token > causal_limit) {
-                continue;
-            }
-            uint physical_token = tq_physical_token(
-                logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
-            float score = 0.0f;
-            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
-                uint group_start = group * uint(GROUP_SIZE);
-                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
-                thread float query_values[GROUP_SIZE];
-                for (uint local = 0u; local < count; local++) {
-                    uint dimension = group_start + local;
-                    uint q_index =
-                        (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
-                            * uint(HEAD_DIM)) + dimension;
-                    query_values[local] = float(q[q_index]);
-                }
-                score += tq_product_attention_inner_product_group(
-                    k_packed, k_signs, k_high_mask, k_scales, query_values,
-                    batch, kv_head, physical_token, group, key_seed,
-                    uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
-                    uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
-                    uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM));
-            }
-            float weight = exp(score * attention_scale - row_max);
-            row_sum += weight;
-        }
-        partial[lane] = row_sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = threads_per_row >> 1; stride > 0u; stride >>= 1) {
-            if (lane < stride) {
-                partial[lane] += partial[lane + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        row_sum = partial[0];
-
-        float inv_sum = 1.0f / max(row_sum, 1.17549435e-38f);
         if (lane < uint(HEAD_DIM)) {
             output_accum[lane] = 0.0f;
         }
@@ -4848,7 +4781,7 @@ private enum TurboQuantMetalKernels {
             uint logical_token = tile_start + lane;
             bool active = logical_token < uint(LOGICAL_LENGTH)
                 && (!DO_CAUSAL || logical_token <= causal_limit);
-            float weight = 0.0f;
+            float scaled_score = -INFINITY;
             uint physical_token = 0u;
             if (active) {
                 physical_token = tq_physical_token(
@@ -4872,20 +4805,46 @@ private enum TurboQuantMetalKernels {
                         uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
                         uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM));
                 }
-                weight = exp(score * attention_scale - row_max) * inv_sum;
+                scaled_score = score * attention_scale;
             }
-            tile_weights[lane] = weight;
+            tile_scores[lane] = scaled_score;
             tile_physical_tokens[lane] = physical_token;
+            partial[lane] = scaled_score;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
+            for (uint stride = threads_per_row >> 1; stride > 0u; stride >>= 1) {
+                if (lane < stride) {
+                    partial[lane] = max(partial[lane], partial[lane + stride]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            float tile_max = partial[0];
+            float new_row_max = max(row_max, tile_max);
+            float old_scale = row_sum > 0.0f ? exp(row_max - new_row_max) : 0.0f;
+            if (lane < uint(HEAD_DIM)) {
+                output_accum[lane] *= old_scale;
+            }
+
+            float weight = active ? exp(tile_scores[lane] - new_row_max) : 0.0f;
+            tile_weights[lane] = weight;
+            partial[lane] = weight;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = threads_per_row >> 1; stride > 0u; stride >>= 1) {
+                if (lane < stride) {
+                    partial[lane] += partial[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            float next_row_sum = row_sum * old_scale + partial[0];
             if (lane < uint(HEAD_DIM)) {
                 thread float decode_scratch[GROUP_SIZE];
                 float dimension_accum = output_accum[lane];
                 for (uint tile_lane = 0u; tile_lane < threads_per_row; tile_lane++) {
-                    uint tile_logical_token = tile_start + tile_lane;
-                    bool tile_active = tile_logical_token < uint(LOGICAL_LENGTH)
-                        && (!DO_CAUSAL || tile_logical_token <= causal_limit);
-                    if (tile_active) {
+                    float tile_weight = tile_weights[tile_lane];
+                    if (tile_weight > 0.0f) {
                         float value = tq_decode_attention_value(
                             v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
                             batch, kv_head, tile_physical_tokens[tile_lane], lane,
@@ -4894,18 +4853,21 @@ private enum TurboQuantMetalKernels {
                             uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
                             uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
                             decode_scratch);
-                        dimension_accum += tile_weights[tile_lane] * value;
+                        dimension_accum += tile_weight * value;
                     }
                 }
                 output_accum[lane] = dimension_accum;
             }
+            row_max = new_row_max;
+            row_sum = next_row_sum;
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (lane < uint(HEAD_DIM)) {
+            float inv_sum = 1.0f / max(row_sum, 1.17549435e-38f);
             uint out_index =
                 (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
                     * uint(HEAD_DIM)) + lane;
-            out[out_index] = static_cast<OUTPUT_DTYPE>(output_accum[lane]);
+            out[out_index] = static_cast<OUTPUT_DTYPE>(output_accum[lane] * inv_sum);
         }
         """
 }
