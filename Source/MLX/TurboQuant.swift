@@ -153,7 +153,7 @@ public enum TurboQuantRuntimeSelfTestStatus: String, Codable, Sendable, CaseIter
 }
 
 public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
-    public static let throughputOptimizedOnlineFusedHeadDimensions = [64, 80, 96, 128]
+    public static let throughputOptimizedOnlineFusedHeadDimensions = [64, 80, 96, 128, 192, 256]
 
     public var status: TurboQuantRuntimeSelfTestStatus
     public var metalRuntimeAvailable: Bool
@@ -1623,7 +1623,10 @@ private func turboQuantMetalOnlineFusedAttention(
 ) throws -> MLXArray {
     let outputShape = [queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]
     let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
-    let threadgroupWidth = min(256, max(1, kernelProfile.fusedDecodeThreadgroupWidth))
+    let threadgroupWidth = min(
+        256,
+        max(queries.dim(3), max(1, kernelProfile.fusedDecodeThreadgroupWidth))
+    )
     let causal: Bool
     switch mask {
     case .causal:
@@ -2917,7 +2920,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
         }
 
         do {
-            let selfTestHeadDimension = 128
+            let selfTestHeadDimension = 256
             let queryValues: [Float] = (0 ..< (1 * 4 * 2 * selfTestHeadDimension)).map { index in
                 let position = Double(index)
                 return Float(sin(position * 0.07) + 0.25 * cos(position * 0.013))
@@ -4875,33 +4878,28 @@ private enum TurboQuantMetalKernels {
             tile_physical_tokens[lane] = physical_token;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            thread float decode_scratch[GROUP_SIZE];
-            for (uint dimension = 0; dimension < uint(HEAD_DIM); dimension++) {
-                float contribution = 0.0f;
-                if (active) {
-                    float value = tq_decode_attention_value(
-                        v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
-                        batch, kv_head, tile_physical_tokens[lane], dimension,
-                        (ulong(uint(VALUE_SEED_HI)) << 32) | ulong(uint(VALUE_SEED_LO)), 1u,
-                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
-                        uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
-                        uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
-                        decode_scratch);
-                    contribution = tile_weights[lane] * value;
-                }
-                partial[lane] = contribution;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint stride = threads_per_row >> 1; stride > 0u; stride >>= 1) {
-                    if (lane < stride) {
-                        partial[lane] += partial[lane + stride];
+            if (lane < uint(HEAD_DIM)) {
+                thread float decode_scratch[GROUP_SIZE];
+                float dimension_accum = output_accum[lane];
+                for (uint tile_lane = 0u; tile_lane < threads_per_row; tile_lane++) {
+                    uint tile_logical_token = tile_start + tile_lane;
+                    bool tile_active = tile_logical_token < uint(LOGICAL_LENGTH)
+                        && (!DO_CAUSAL || tile_logical_token <= causal_limit);
+                    if (tile_active) {
+                        float value = tq_decode_attention_value(
+                            v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
+                            batch, kv_head, tile_physical_tokens[tile_lane], lane,
+                            (ulong(uint(VALUE_SEED_HI)) << 32) | ulong(uint(VALUE_SEED_LO)), 1u,
+                            uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                            uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
+                            uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
+                            decode_scratch);
+                        dimension_accum += tile_weights[tile_lane] * value;
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                if (lane == 0u) {
-                    output_accum[dimension] += partial[0];
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                output_accum[lane] = dimension_accum;
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (lane < uint(HEAD_DIM)) {
             uint out_index =
