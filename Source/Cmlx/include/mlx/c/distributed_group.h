@@ -5,6 +5,7 @@
 
 #include <stdbool.h>
 
+#include "mlx/c/error.h"
 #include "mlx/c/stream.h"
 
 #ifdef __cplusplus
@@ -36,7 +37,7 @@ int mlx_distributed_group_free(mlx_distributed_group group);
 /**
  * Initialize distributed.
  */
-int mlx_distributed_init(
+mlx_status mlx_distributed_init(
     mlx_distributed_group* res,
     bool strict,
     const char* bk /* may be null */);
@@ -52,9 +53,23 @@ int mlx_distributed_group_rank(mlx_distributed_group group);
 int mlx_distributed_group_size(mlx_distributed_group group);
 
 /**
+ * Get the rank with explicit status reporting.
+ */
+mlx_status mlx_distributed_group_rank_status(
+    int* res,
+    mlx_distributed_group group);
+
+/**
+ * Get the group size with explicit status reporting.
+ */
+mlx_status mlx_distributed_group_size_status(
+    int* res,
+    mlx_distributed_group group);
+
+/**
  * Split the group.
  */
-int mlx_distributed_group_split(
+mlx_status mlx_distributed_group_split(
     mlx_distributed_group* res,
     mlx_distributed_group group,
     int color,
@@ -64,6 +79,13 @@ int mlx_distributed_group_split(
  * Check if distributed is available.
  */
 bool mlx_distributed_is_available(const char* bk /* may be null */);
+
+/**
+ * Check if distributed is available with explicit status reporting.
+ */
+mlx_status mlx_distributed_is_available_status(
+    bool* res,
+    const char* bk /* may be null */);
 
 /**@}*/
 
