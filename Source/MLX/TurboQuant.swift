@@ -327,7 +327,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
     }
 }
 
-public struct TurboQuantKernelCapabilities: Equatable, Codable, Sendable {
+public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
     public var flatEncodeDecode: Bool
     public var linearMatmul: Bool
     public var attentionEncode: Bool
@@ -492,6 +492,10 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
             selfTestFailureReason: probe.failureReason,
             onlineFusedHeadDimensions: probe.onlineFusedHeadDimensions
         )
+    }
+
+    public static func currentCapabilities() -> TurboQuantKernelCapabilities {
+        current.kernelCapabilities
     }
 
     public func supports(_ backend: TurboQuantBackend) -> Bool {
@@ -809,7 +813,7 @@ public enum TurboQuantAttentionPath: String, Codable, Sendable, CaseIterable {
     case baseline
 }
 
-public struct RejectedPath: Equatable, Codable, Sendable {
+public struct RejectedPath: Hashable, Codable, Sendable {
     public var path: TurboQuantAttentionPath
     public var reason: String
 
