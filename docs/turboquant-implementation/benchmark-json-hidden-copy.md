@@ -29,6 +29,7 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
     public var storageEstimate: TurboQuantStorageEstimate
     public var pathDecision: TurboQuantAttentionDecision?
     public var metrics: TurboQuantCoreBenchmarkMetrics
+    public var hiddenCopyAudit: TurboQuantHiddenCopyAudit
 }
 
 public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
@@ -43,8 +44,18 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var qkMS: Double?
     public var avMS: Double?
     public var fusedMS: Double?
+    public var firstTokenLatencyMS: Double?
+    public var prefillTokensPerSecond: Double?
+    public var decodeTokensPerSecondP50: Double?
+    public var decodeTokensPerSecondP95: Double?
     public var totalBytes: Int
+    public var compressedKVBytes: Int
+    public var peakMemoryBytes: Int?
     public var actualBitsPerValue: Double
+    public var fallbackUsed: Bool
+    public var fallbackReason: String?
+    public var memoryWarningsSeen: Int
+    public var jetsamObserved: Bool
 }
 ```
 
@@ -81,12 +92,16 @@ Audit table template:
 
 | Kernel | Large input | Copy risk | Mitigation | Status |
 | --- | --- | --- | --- | --- |
-| encode flat | source K/V chunk | low/medium | chunk-limited input | pending |
-| decode flat | compressed code | medium | canonical layout validation | pending |
-| compressed QK | compressed K cache | high | canonical contiguous storage, shape/stride indexing if needed | pending |
-| compressed AV | compressed V cache | high | canonical contiguous storage, no full decoded K/V | pending |
-| online fused | compressed K/V cache | high | no hidden full-cache row copy | pending |
-| tiled fused | compressed K/V cache | high | no hidden full-cache row copy | pending |
+| encode flat | source K/V chunk | low | benchmark input is chunk-bounded; no long-cache array is prepared | audited-bounded |
+| decode flat | compressed code | medium | canonical storage validation rejects non-row-contiguous code arrays before dispatch | guarded |
+| compressed QK | compressed K cache | high | canonical compressed storage validation runs before dispatch; no decoded K cache is materialized | guarded |
+| compressed AV | compressed V cache | high | canonical compressed storage validation runs before dispatch; attention weights must already be row-contiguous | guarded |
+| online fused | compressed K/V cache | high | fused dispatch consumes canonical compressed K/V arrays directly and does not decode a full cache | guarded |
+| tiled fused | compressed K/V cache | high | tiled path shares fused dispatch guards; non-canonical compressed storage is rejected before launch | guarded |
+
+Current W3 audit status: `pass`.
+
+This status means the current source paths and validation gates have been audited for hidden full-cache K/V copies. It is not a production verification claim. Query tensors may require bounded row-contiguous preparation; compressed K/V cache tensors must remain canonical or be rejected before Metal launch.
 
 ## Audit acceptance
 
