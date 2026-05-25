@@ -334,7 +334,7 @@ private func turboQuantValidateAttentionStorageArray(
 }
 
 private func turboQuantAttentionSupportedScaleDTypes(layoutVersion: Int) -> [DType] {
-    layoutVersion == TurboQuantAttentionLayout.nextVersion
+    layoutVersion == TurboQuantAttentionLayout.currentVersion
         ? [.float32, .float16]
         : [.float32]
 }

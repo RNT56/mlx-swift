@@ -204,7 +204,7 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
             ),
         ],
         notes: currentW3.notes + [
-            "Layout V5 is feature-gated and off by default; V4 remains the default write layout.",
+            "Layout V5 is the default write layout; V4 remains supported for compatibility comparisons.",
         ]
     )
 }

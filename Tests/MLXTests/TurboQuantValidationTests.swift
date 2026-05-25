@@ -58,7 +58,7 @@ final class TurboQuantValidationTests: XCTestCase {
 
     func testLayoutV5AcceptsFp16ScaleStorage() throws {
         var code = Self.makeCode(role: .key)
-        code.layout.layoutVersion = TurboQuantAttentionLayout.nextVersion
+        code.layout.layoutVersion = TurboQuantAttentionLayout.currentVersion
         code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
 
         try validateTurboQuantAttentionCode(code, expectedRole: .key)
@@ -66,6 +66,7 @@ final class TurboQuantValidationTests: XCTestCase {
 
     func testLayoutV4RejectsFp16ScaleStorage() {
         var code = Self.makeCode(role: .key)
+        code.layout.layoutVersion = TurboQuantAttentionLayout.legacyVersion
         code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
 
         XCTAssertThrowsError(try validateTurboQuantAttentionCode(code, expectedRole: .key)) {

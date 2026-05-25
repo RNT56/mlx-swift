@@ -1130,9 +1130,10 @@ public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
 }
 
 public struct TurboQuantAttentionLayout: Hashable, Codable, Sendable {
-    public static let currentVersion = 4
-    public static let nextVersion = 5
-    public static let supportedVersions = [currentVersion, nextVersion]
+    public static let legacyVersion = 4
+    public static let currentVersion = 5
+    public static let nextVersion = currentVersion
+    public static let supportedVersions = [legacyVersion, currentVersion]
 
     public var layoutVersion: Int
     public var batchSize: Int
@@ -1181,7 +1182,7 @@ public struct TurboQuantAttentionLayout: Hashable, Codable, Sendable {
     }
 
     public var isLayoutV5: Bool {
-        layoutVersion == TurboQuantAttentionLayout.nextVersion
+        layoutVersion == TurboQuantAttentionLayout.currentVersion
     }
 }
 
@@ -4339,16 +4340,9 @@ private func validateRequestedAttentionLayoutVersion(
     _ layoutVersion: Int,
     allowExperimentalLayoutV5: Bool
 ) throws {
-    if layoutVersion == TurboQuantAttentionLayout.currentVersion {
+    _ = allowExperimentalLayoutV5
+    if TurboQuantAttentionLayout.supportedVersions.contains(layoutVersion) {
         return
-    }
-    if layoutVersion == TurboQuantAttentionLayout.nextVersion, allowExperimentalLayoutV5 {
-        return
-    }
-    if layoutVersion == TurboQuantAttentionLayout.nextVersion {
-        throw TurboQuantError.invalidMetalConfiguration(
-            "TurboQuant layout V5 is experimental and disabled by default"
-        )
     }
     throw TurboQuantError.invalidMetalConfiguration(
         "unsupported compressed attention layout version \(layoutVersion)"
@@ -4364,11 +4358,11 @@ private func validateAttentionScaleStorage(
     case .float32:
         return
     case .float16:
-        guard layoutVersion == TurboQuantAttentionLayout.nextVersion,
-            allowExperimentalLayoutV5
+        _ = allowExperimentalLayoutV5
+        guard layoutVersion == TurboQuantAttentionLayout.currentVersion
         else {
             throw TurboQuantError.invalidMetalConfiguration(
-                "fp16 TurboQuant attention scales require experimental Layout V5"
+                "fp16 TurboQuant attention scales require Layout V5"
             )
         }
     }
@@ -4395,7 +4389,7 @@ private func turboQuantAttentionScaleStorage(
 private func supportedAttentionScaleDTypes(
     for layoutVersion: Int
 ) -> [DType] {
-    layoutVersion == TurboQuantAttentionLayout.nextVersion
+    layoutVersion == TurboQuantAttentionLayout.currentVersion
         ? [.float32, .float16]
         : [.float32]
 }

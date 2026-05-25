@@ -757,11 +757,10 @@ private func corePathDecision(
 
 private func validateCoreBenchmarkOptions(_ options: BenchmarkOptions) throws {
     if options.scaleStorage == .float16 {
-        guard options.layoutVersion == TurboQuantAttentionLayout.nextVersion,
-              options.enableLayoutV5
+        guard options.layoutVersion == TurboQuantAttentionLayout.currentVersion
         else {
             throw TurboQuantError.invalidMetalConfiguration(
-                "float16 attention scale storage requires --layout-version \(TurboQuantAttentionLayout.nextVersion) and --enable-layout-v5"
+                "float16 attention scale storage requires Layout V\(TurboQuantAttentionLayout.currentVersion)"
             )
         }
     }

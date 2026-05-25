@@ -194,7 +194,7 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(loadedMetadata["turboquant_seed_policy"], "fixed")
     }
 
-    func testTurboQuantConfigurationDecodesLegacyPayloadWithV4Defaults() throws {
+    func testTurboQuantConfigurationDecodesLegacyPayloadWithCurrentLayoutDefaults() throws {
         let legacyJSON = Data("""
         {
           "preset": "turbo4v2",
@@ -213,6 +213,7 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(configuration.preset, .turbo4v2)
         XCTAssertEqual(configuration.role, .key)
         XCTAssertEqual(configuration.attentionLayoutVersion, TurboQuantAttentionLayout.currentVersion)
+        XCTAssertEqual(configuration.attentionLayoutVersion, 5)
         XCTAssertFalse(configuration.allowExperimentalLayoutV5)
         XCTAssertEqual(configuration.attentionScaleStorage, .float32)
         XCTAssertTrue(configuration.deterministicHighPrecisionMask)
@@ -1277,55 +1278,38 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(layout.bitsetWordsPerGroup, 2)
     }
 
-    func testTurboQuantAttentionLayoutV5RequiresExplicitOptIn() throws {
-        XCTAssertThrowsError(
-            try turboQuantAttentionLayout(
-                shape: [1, 2, 3, 80],
-                groupSize: 64,
-                layoutVersion: TurboQuantAttentionLayout.nextVersion
-            )
-        ) { error in
-            XCTAssertEqual(
-                error as? TurboQuantError,
-                .invalidMetalConfiguration(
-                    "TurboQuant layout V5 is experimental and disabled by default"
-                )
-            )
-        }
+    func testTurboQuantAttentionLayoutV5IsDefaultAndV4RemainsSupported() throws {
+        XCTAssertEqual(TurboQuantAttentionLayout.legacyVersion, 4)
+        XCTAssertEqual(TurboQuantAttentionLayout.currentVersion, 5)
+        XCTAssertEqual(TurboQuantAttentionLayout.nextVersion, TurboQuantAttentionLayout.currentVersion)
+
+        let defaultLayout = try turboQuantAttentionLayout(shape: [1, 2, 3, 80], groupSize: 64)
+        XCTAssertEqual(defaultLayout.layoutVersion, TurboQuantAttentionLayout.currentVersion)
+        XCTAssertTrue(defaultLayout.isLayoutV5)
+
+        let legacyLayout = try turboQuantAttentionLayout(
+            shape: [1, 2, 3, 80],
+            groupSize: 64,
+            layoutVersion: TurboQuantAttentionLayout.legacyVersion
+        )
+        XCTAssertEqual(legacyLayout.layoutVersion, TurboQuantAttentionLayout.legacyVersion)
+        XCTAssertFalse(legacyLayout.isLayoutV5)
 
         let layout = try turboQuantAttentionLayout(
             shape: [1, 2, 3, 80],
             groupSize: 64,
-            layoutVersion: TurboQuantAttentionLayout.nextVersion,
-            allowExperimentalLayoutV5: true
+            layoutVersion: TurboQuantAttentionLayout.currentVersion
         )
 
-        XCTAssertEqual(layout.layoutVersion, TurboQuantAttentionLayout.nextVersion)
+        XCTAssertEqual(layout.layoutVersion, TurboQuantAttentionLayout.currentVersion)
         XCTAssertTrue(layout.isLayoutV5)
         XCTAssertEqual(layout.logicalShape, [1, 2, 3, 80])
-
-        XCTAssertThrowsError(
-            try turboQuantEmptyAttentionCode(
-                layout: layout,
-                preset: .turbo4v2,
-                role: .key,
-                groupSize: 64
-            )
-        ) { error in
-            XCTAssertEqual(
-                error as? TurboQuantError,
-                .invalidMetalConfiguration(
-                    "TurboQuant layout V5 is experimental and disabled by default"
-                )
-            )
-        }
 
         _ = try turboQuantEmptyAttentionCode(
             layout: layout,
             preset: .turbo4v2,
             role: .key,
-            groupSize: 64,
-            allowExperimentalLayoutV5: true
+            groupSize: 64
         )
     }
 
