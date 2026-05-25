@@ -194,6 +194,30 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(loadedMetadata["turboquant_seed_policy"], "fixed")
     }
 
+    func testTurboQuantConfigurationDecodesLegacyPayloadWithV4Defaults() throws {
+        let legacyJSON = Data("""
+        {
+          "preset": "turbo4v2",
+          "role": "key",
+          "groupSize": 64,
+          "mode": "affine",
+          "backend": "mlxPacked",
+          "seed": 7,
+          "qjlResidualScale": 0.5,
+          "valueBits": 4
+        }
+        """.utf8)
+
+        let configuration = try JSONDecoder().decode(TurboQuantConfiguration.self, from: legacyJSON)
+
+        XCTAssertEqual(configuration.preset, .turbo4v2)
+        XCTAssertEqual(configuration.role, .key)
+        XCTAssertEqual(configuration.attentionLayoutVersion, TurboQuantAttentionLayout.currentVersion)
+        XCTAssertFalse(configuration.allowExperimentalLayoutV5)
+        XCTAssertEqual(configuration.attentionScaleStorage, .float32)
+        XCTAssertTrue(configuration.deterministicHighPrecisionMask)
+    }
+
     func testTurboQuantPackedRoundTrip() throws {
         try requireMLXRuntime()
 
@@ -1246,11 +1270,87 @@ class QuantizationTests: XCTestCase {
     func testTurboQuantAttentionLayoutIsRowWise() throws {
         let layout = try turboQuantAttentionLayout(shape: [1, 2, 3, 80], groupSize: 64)
 
-        XCTAssertEqual(layout.layoutVersion, 4)
+        XCTAssertEqual(layout.layoutVersion, TurboQuantAttentionLayout.currentVersion)
         XCTAssertEqual(layout.logicalShape, [1, 2, 3, 80])
         XCTAssertEqual(layout.pinnedPrefixLength, 0)
         XCTAssertEqual(layout.groupsPerVector, 2)
         XCTAssertEqual(layout.bitsetWordsPerGroup, 2)
+    }
+
+    func testTurboQuantAttentionLayoutV5RequiresExplicitOptIn() throws {
+        XCTAssertThrowsError(
+            try turboQuantAttentionLayout(
+                shape: [1, 2, 3, 80],
+                groupSize: 64,
+                layoutVersion: TurboQuantAttentionLayout.nextVersion
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? TurboQuantError,
+                .invalidMetalConfiguration(
+                    "TurboQuant layout V5 is experimental and disabled by default"
+                )
+            )
+        }
+
+        let layout = try turboQuantAttentionLayout(
+            shape: [1, 2, 3, 80],
+            groupSize: 64,
+            layoutVersion: TurboQuantAttentionLayout.nextVersion,
+            allowExperimentalLayoutV5: true
+        )
+
+        XCTAssertEqual(layout.layoutVersion, TurboQuantAttentionLayout.nextVersion)
+        XCTAssertTrue(layout.isLayoutV5)
+        XCTAssertEqual(layout.logicalShape, [1, 2, 3, 80])
+
+        XCTAssertThrowsError(
+            try turboQuantEmptyAttentionCode(
+                layout: layout,
+                preset: .turbo4v2,
+                role: .key,
+                groupSize: 64
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? TurboQuantError,
+                .invalidMetalConfiguration(
+                    "TurboQuant layout V5 is experimental and disabled by default"
+                )
+            )
+        }
+
+        _ = try turboQuantEmptyAttentionCode(
+            layout: layout,
+            preset: .turbo4v2,
+            role: .key,
+            groupSize: 64,
+            allowExperimentalLayoutV5: true
+        )
+    }
+
+    func testTurboQuantAttentionLayoutV5Fp16ScalesReduceStorageEstimate() {
+        let logicalValues = 1 * 2 * 256 * 128
+        let v4 = estimateTurboQuantStorage(
+            role: .key,
+            logicalValues: logicalValues,
+            preset: .turbo4v2,
+            groupSize: 64,
+            dtype: .float32
+        )
+        let v5 = estimateTurboQuantStorage(
+            role: .key,
+            logicalValues: logicalValues,
+            preset: .turbo4v2,
+            groupSize: 64,
+            dtype: .float32,
+            scaleStorage: .float16
+        )
+
+        XCTAssertLessThan(v5.scaleBytes, v4.scaleBytes)
+        XCTAssertLessThan(v5.actualBitsPerValue, v4.actualBitsPerValue)
+        XCTAssertEqual(v5.packedBytes, v4.packedBytes)
+        XCTAssertEqual(v5.bitsetBytes, v4.bitsetBytes)
     }
 
     func testTurboQuantAttentionLayoutUsesPresetHighPrecisionFraction() throws {

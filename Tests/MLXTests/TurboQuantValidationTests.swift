@@ -56,6 +56,26 @@ final class TurboQuantValidationTests: XCTestCase {
         }
     }
 
+    func testLayoutV5AcceptsFp16ScaleStorage() throws {
+        var code = Self.makeCode(role: .key)
+        code.layout.layoutVersion = TurboQuantAttentionLayout.nextVersion
+        code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
+
+        try validateTurboQuantAttentionCode(code, expectedRole: .key)
+    }
+
+    func testLayoutV4RejectsFp16ScaleStorage() {
+        var code = Self.makeCode(role: .key)
+        code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
+
+        XCTAssertThrowsError(try validateTurboQuantAttentionCode(code, expectedRole: .key)) {
+            error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("compressed attention scales"))
+            XCTAssertTrue(message.contains("float32"))
+        }
+    }
+
     private static func makeCode(role: TurboQuantTensorRole) -> TurboQuantAttentionCode {
         let layout = TurboQuantAttentionLayout(
             batchSize: 1,

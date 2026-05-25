@@ -29,6 +29,8 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
         XCTAssertEqual(decoded.storageEstimate.totalBytes, 112)
         XCTAssertEqual(decoded.pathDecision?.selectedPath, .twoStageCompressed)
         XCTAssertEqual(decoded.metrics.contextTokens, 256)
+        XCTAssertEqual(decoded.metrics.layoutVersion, TurboQuantAttentionLayout.currentVersion)
+        XCTAssertEqual(decoded.metrics.scaleStorage, TurboQuantScaleStorage.float32.rawValue)
         XCTAssertEqual(decoded.metrics.compressedKVBytes, decoded.metrics.totalBytes)
         XCTAssertEqual(decoded.hiddenCopyAudit.status, .pass)
     }
@@ -106,7 +108,17 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
         XCTAssertTrue(kernelNames.contains("compressed AV"))
         XCTAssertTrue(kernelNames.contains("online fused"))
         XCTAssertTrue(kernelNames.contains("tiled fused"))
+        XCTAssertFalse(kernelNames.contains("layout V5 fp16 scales"))
         XCTAssertTrue(audit.entries.allSatisfy { !$0.status.isEmpty })
+    }
+
+    func testCurrentW5HiddenCopyAuditAddsLayoutV5ScalePath() {
+        let audit = TurboQuantHiddenCopyAudit.currentW5
+        let kernelNames = Set(audit.entries.map(\.kernelName))
+
+        XCTAssertEqual(audit.status, .pass)
+        XCTAssertTrue(kernelNames.contains("layout V5 fp16 scales"))
+        XCTAssertTrue(audit.notes.contains { $0.contains("Layout V5") })
     }
 
     private static func sampleReport() -> TurboQuantCoreBenchmarkReport {
@@ -144,12 +156,15 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
                 preset: TurboQuantPreset.turbo4v2.rawValue,
                 valueBits: 4,
                 groupSize: 64,
+                layoutVersion: TurboQuantAttentionLayout.currentVersion,
+                scaleStorage: TurboQuantScaleStorage.float32.rawValue,
+                warmupIterations: 1,
                 qkMS: 0.4,
                 avMS: 0.5,
                 totalBytes: 112,
                 actualBitsPerValue: 3.5
             ),
-            hiddenCopyAudit: TurboQuantHiddenCopyAudit.currentW3
+            hiddenCopyAudit: TurboQuantHiddenCopyAudit.currentW5
         )
     }
 }

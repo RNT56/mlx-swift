@@ -44,6 +44,7 @@ private enum BenchmarkCLIError: Error, CustomStringConvertible {
     case invalidInteger(String)
     case invalidPreset(String)
     case invalidPath(String)
+    case invalidScaleStorage(String)
 
     var description: String {
         switch self {
@@ -53,6 +54,8 @@ private enum BenchmarkCLIError: Error, CustomStringConvertible {
             "Invalid TurboQuant preset '\(value)'."
         case .invalidPath(let value):
             "Invalid TurboQuant path '\(value)'."
+        case .invalidScaleStorage(let value):
+            "Invalid TurboQuant scale storage '\(value)'."
         }
     }
 }
@@ -68,6 +71,9 @@ private struct BenchmarkOptions {
     var preset: TurboQuantPreset
     var valueBits: Int?
     var groupSize: Int
+    var layoutVersion: Int
+    var enableLayoutV5: Bool
+    var scaleStorage: TurboQuantScaleStorage
     var requestedPath: TurboQuantAttentionPath?
 
     var resolvedValueBits: Int {
@@ -91,6 +97,14 @@ private struct BenchmarkOptions {
             preset: preset,
             valueBits: try optionalIntValue("--value-bits", in: arguments, minimum: 1),
             groupSize: try intValue("--group-size", in: arguments, default: 64, minimum: 1),
+            layoutVersion: try intValue(
+                "--layout-version",
+                in: arguments,
+                default: TurboQuantAttentionLayout.currentVersion,
+                minimum: 1
+            ),
+            enableLayoutV5: arguments.contains("--enable-layout-v5"),
+            scaleStorage: try scaleStorage(in: arguments),
             requestedPath: try requestedPath(in: arguments)
         )
     }
@@ -151,6 +165,16 @@ private struct BenchmarkOptions {
         default:
             throw BenchmarkCLIError.invalidPath(value)
         }
+    }
+
+    private static func scaleStorage(in arguments: [String]) throws -> TurboQuantScaleStorage {
+        guard let value = stringValue("--scale-storage", in: arguments) else {
+            return .float32
+        }
+        guard let storage = TurboQuantScaleStorage(rawValue: value) else {
+            throw BenchmarkCLIError.invalidScaleStorage(value)
+        }
+        return storage
     }
 }
 
@@ -231,7 +255,7 @@ private func writeJSON<T: Encodable>(_ value: T) throws {
 private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     let availability = TurboQuantKernelAvailability.current
     let capabilities = availability.kernelCapabilities
-    let hiddenCopyAudit = TurboQuantHiddenCopyAudit.currentW3
+    let hiddenCopyAudit = TurboQuantHiddenCopyAudit.currentW5
     guard hiddenCopyAudit.status != .fail else {
         throw TurboQuantError.invalidMetalConfiguration(
             "TurboQuant hidden-copy audit failed; benchmark report is blocked."
@@ -299,6 +323,9 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         preset: options.preset.rawValue,
         valueBits: options.resolvedValueBits,
         groupSize: options.groupSize,
+        layoutVersion: options.layoutVersion,
+        scaleStorage: options.scaleStorage.rawValue,
+        warmupIterations: options.warmup,
         encodeMS: encodeMS,
         decodeMS: decodeMS,
         qkMS: qkMS,
@@ -386,7 +413,10 @@ private func measureCoreAttention(
                 role: .key,
                 groupSize: options.groupSize,
                 backend: .metalPolarQJL,
-                seed: 0xBEEF_0000_0000_0101
+                seed: 0xBEEF_0000_0000_0101,
+                attentionLayoutVersion: options.layoutVersion,
+                allowExperimentalLayoutV5: options.enableLayoutV5,
+                attentionScaleStorage: options.scaleStorage
             )
         )
         let valueCode = try turboQuantMetalEncodeAttention(
@@ -397,7 +427,10 @@ private func measureCoreAttention(
                 groupSize: options.groupSize,
                 backend: .metalPolarQJL,
                 seed: 0xBEEF_0000_0000_0102,
-                valueBits: options.resolvedValueBits
+                valueBits: options.resolvedValueBits,
+                attentionLayoutVersion: options.layoutVersion,
+                allowExperimentalLayoutV5: options.enableLayoutV5,
+                attentionScaleStorage: options.scaleStorage
             )
         )
         return (keyCode, valueCode)
@@ -730,7 +763,8 @@ private func symbolicAttentionLayout(
         preset: options.preset,
         valueBits: role == .value ? options.resolvedValueBits : nil,
         groupSize: options.groupSize,
-        dtype: .float32
+        dtype: .float32,
+        scaleStorage: options.scaleStorage
     )
     let groupCount = benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
         * groupsPerVector
@@ -740,6 +774,7 @@ private func symbolicAttentionLayout(
     )
 
     return TurboQuantAttentionLayout(
+        layoutVersion: options.layoutVersion,
         batchSize: benchmarkBatchSize,
         kvHeadCount: benchmarkKVHeadCount,
         capacity: options.contextTokens,
@@ -759,7 +794,8 @@ private func symbolicAggregateStorageEstimate(options: BenchmarkOptions) -> Turb
         logicalValues: logicalValues,
         preset: options.preset,
         groupSize: options.groupSize,
-        dtype: .float32
+        dtype: .float32,
+        scaleStorage: options.scaleStorage
     )
     let valueEstimate = estimateTurboQuantStorage(
         role: .value,
@@ -767,7 +803,8 @@ private func symbolicAggregateStorageEstimate(options: BenchmarkOptions) -> Turb
         preset: options.preset,
         valueBits: options.resolvedValueBits,
         groupSize: options.groupSize,
-        dtype: .float32
+        dtype: .float32,
+        scaleStorage: options.scaleStorage
     )
     return aggregateStorageEstimate(keyEstimate: keyEstimate, valueEstimate: valueEstimate)
 }

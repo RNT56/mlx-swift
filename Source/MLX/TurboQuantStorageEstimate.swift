@@ -53,7 +53,8 @@ public func estimateTurboQuantStorage(
     preset: TurboQuantPreset,
     valueBits: Int? = nil,
     groupSize: Int,
-    dtype: DType
+    dtype: DType,
+    scaleStorage: TurboQuantScaleStorage = .float32
 ) -> TurboQuantStorageEstimate {
     let clampedLogicalValues = Swift.max(0, logicalValues)
     let clampedGroupSize = Swift.max(1, groupSize)
@@ -68,7 +69,7 @@ public func estimateTurboQuantStorage(
     let scalesPerGroup = role == .value ? 2 : 3
     let packedBytes = groupCount * magnitudeWords * MemoryLayout<UInt32>.size
     let bitsetBytes = role == .value ? 0 : groupCount * bitsetWords * 3 * MemoryLayout<UInt32>.size
-    let scaleBytes = groupCount * scalesPerGroup * DType.float32.size
+    let scaleBytes = groupCount * scalesPerGroup * scaleStorage.dtype.size
 
     return TurboQuantStorageEstimate(
         role: role,

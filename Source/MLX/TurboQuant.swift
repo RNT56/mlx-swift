@@ -134,6 +134,20 @@ public enum TurboQuantBackend: String, Codable, Sendable, CaseIterable {
     case metalPolarQJL
 }
 
+public enum TurboQuantScaleStorage: String, Codable, Sendable, Hashable, CaseIterable {
+    case float32
+    case float16
+
+    public var dtype: DType {
+        switch self {
+        case .float32:
+            .float32
+        case .float16:
+            .float16
+        }
+    }
+}
+
 public enum TurboQuantReferenceFormat: String, Codable, Sendable, Hashable, CaseIterable {
     case magnitudeResidualSign
     case turboQuantProd
@@ -524,6 +538,25 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
     public var seed: UInt64
     public var qjlResidualScale: Float
     public var valueBits: Int?
+    public var attentionLayoutVersion: Int
+    public var allowExperimentalLayoutV5: Bool
+    public var attentionScaleStorage: TurboQuantScaleStorage
+    public var deterministicHighPrecisionMask: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case preset
+        case role
+        case groupSize
+        case mode
+        case backend
+        case seed
+        case qjlResidualScale
+        case valueBits
+        case attentionLayoutVersion
+        case allowExperimentalLayoutV5
+        case attentionScaleStorage
+        case deterministicHighPrecisionMask
+    }
 
     public init(
         preset: TurboQuantPreset = .turbo3_5,
@@ -533,7 +566,11 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
         backend: TurboQuantBackend = .mlxPacked,
         seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
         qjlResidualScale: Float = 0.5,
-        valueBits: Int? = nil
+        valueBits: Int? = nil,
+        attentionLayoutVersion: Int = TurboQuantAttentionLayout.currentVersion,
+        allowExperimentalLayoutV5: Bool = false,
+        attentionScaleStorage: TurboQuantScaleStorage = .float32,
+        deterministicHighPrecisionMask: Bool = true
     ) {
         self.preset = preset
         self.role = role
@@ -543,6 +580,38 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
         self.seed = seed
         self.qjlResidualScale = qjlResidualScale
         self.valueBits = valueBits
+        self.attentionLayoutVersion = attentionLayoutVersion
+        self.allowExperimentalLayoutV5 = allowExperimentalLayoutV5
+        self.attentionScaleStorage = attentionScaleStorage
+        self.deterministicHighPrecisionMask = deterministicHighPrecisionMask
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        preset = try container.decodeIfPresent(TurboQuantPreset.self, forKey: .preset) ?? .turbo3_5
+        role = try container.decodeIfPresent(TurboQuantTensorRole.self, forKey: .role) ?? .vector
+        groupSize = try container.decodeIfPresent(Int.self, forKey: .groupSize) ?? 64
+        mode = try container.decodeIfPresent(QuantizationMode.self, forKey: .mode) ?? .affine
+        backend = try container.decodeIfPresent(TurboQuantBackend.self, forKey: .backend) ?? .mlxPacked
+        seed = try container.decodeIfPresent(UInt64.self, forKey: .seed) ?? 0x9E37_79B9_7F4A_7C15
+        qjlResidualScale = try container.decodeIfPresent(Float.self, forKey: .qjlResidualScale) ?? 0.5
+        valueBits = try container.decodeIfPresent(Int.self, forKey: .valueBits)
+        attentionLayoutVersion = try container.decodeIfPresent(
+            Int.self,
+            forKey: .attentionLayoutVersion
+        ) ?? TurboQuantAttentionLayout.currentVersion
+        allowExperimentalLayoutV5 = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .allowExperimentalLayoutV5
+        ) ?? false
+        attentionScaleStorage = try container.decodeIfPresent(
+            TurboQuantScaleStorage.self,
+            forKey: .attentionScaleStorage
+        ) ?? .float32
+        deterministicHighPrecisionMask = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .deterministicHighPrecisionMask
+        ) ?? true
     }
 
     public var effectiveBits: Int { preset.effectiveBits }
@@ -1052,6 +1121,8 @@ public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
 
 public struct TurboQuantAttentionLayout: Hashable, Codable, Sendable {
     public static let currentVersion = 4
+    public static let nextVersion = 5
+    public static let supportedVersions = [currentVersion, nextVersion]
 
     public var layoutVersion: Int
     public var batchSize: Int
@@ -1097,6 +1168,10 @@ public struct TurboQuantAttentionLayout: Hashable, Codable, Sendable {
 
     public var storageShape: [Int] {
         [batchSize, kvHeadCount, capacity, headDimension]
+    }
+
+    public var isLayoutV5: Bool {
+        layoutVersion == TurboQuantAttentionLayout.nextVersion
     }
 }
 
@@ -1754,9 +1829,20 @@ public func turboQuantEmptyAttentionCode(
     role: TurboQuantTensorRole,
     groupSize: Int = 64,
     seed: UInt64 = 0x9E37_79B9_7F4A_7C15,
-    valueBits: Int? = nil
+    valueBits: Int? = nil,
+    attentionScaleStorage: TurboQuantScaleStorage = .float32,
+    allowExperimentalLayoutV5: Bool = false
 ) throws -> TurboQuantAttentionCode {
     try validateAttentionLayout(layout, role: role, groupSize: groupSize)
+    try validateRequestedAttentionLayoutVersion(
+        layout.layoutVersion,
+        allowExperimentalLayoutV5: allowExperimentalLayoutV5
+    )
+    try validateAttentionScaleStorage(
+        attentionScaleStorage,
+        layoutVersion: layout.layoutVersion,
+        allowExperimentalLayoutV5: allowExperimentalLayoutV5
+    )
     let resolvedValueBits = valueBits ?? preset.defaultValueBits
     let bitsetShape = [
         layout.batchSize, layout.kvHeadCount, layout.capacity,
@@ -1789,7 +1875,7 @@ public func turboQuantEmptyAttentionCode(
                 layout.batchSize, layout.kvHeadCount, layout.capacity,
                 layout.groupsPerVector, scalesPerGroup,
             ],
-            dtype: .float32
+            dtype: attentionScaleStorage.dtype
         )
     )
 }
@@ -1803,7 +1889,9 @@ public func turboQuantAttentionLayout(
     capacity: Int? = nil,
     logicalLength: Int? = nil,
     ringOffset: Int = 0,
-    pinnedPrefixLength: Int = 0
+    pinnedPrefixLength: Int = 0,
+    layoutVersion: Int = TurboQuantAttentionLayout.currentVersion,
+    allowExperimentalLayoutV5: Bool = false
 ) throws -> TurboQuantAttentionLayout {
     try validateAttentionArray(array, groupSize: groupSize)
     return try turboQuantAttentionLayout(
@@ -1816,7 +1904,9 @@ public func turboQuantAttentionLayout(
         capacity: capacity,
         logicalLength: logicalLength,
         ringOffset: ringOffset,
-        pinnedPrefixLength: pinnedPrefixLength
+        pinnedPrefixLength: pinnedPrefixLength,
+        layoutVersion: layoutVersion,
+        allowExperimentalLayoutV5: allowExperimentalLayoutV5
     )
 }
 
@@ -1830,14 +1920,21 @@ public func turboQuantAttentionLayout(
     capacity: Int? = nil,
     logicalLength: Int? = nil,
     ringOffset: Int = 0,
-    pinnedPrefixLength: Int = 0
+    pinnedPrefixLength: Int = 0,
+    layoutVersion: Int = TurboQuantAttentionLayout.currentVersion,
+    allowExperimentalLayoutV5: Bool = false
 ) throws -> TurboQuantAttentionLayout {
+    try validateRequestedAttentionLayoutVersion(
+        layoutVersion,
+        allowExperimentalLayoutV5: allowExperimentalLayoutV5
+    )
     try validateAttentionShape(shape, dtype: dtype, groupSize: groupSize)
     let headDimension = shape[3]
     let groupsPerVector = (headDimension + groupSize - 1) / groupSize
     let resolvedCapacity = capacity ?? shape[2]
     let resolvedLogicalLength = logicalLength ?? shape[2]
     let layout = TurboQuantAttentionLayout(
+        layoutVersion: layoutVersion,
         batchSize: shape[0],
         kvHeadCount: shape[1],
         capacity: resolvedCapacity,
@@ -1871,6 +1968,7 @@ public func turboQuantMetalEncodeAttention(
     stream: StreamOrDevice = .gpu
 ) throws -> TurboQuantAttentionCode {
     try validateAttentionArray(array, groupSize: configuration.groupSize)
+    try validateAttentionConfiguration(configuration)
     if configuration.role == .value {
         try validateTurboQuantValueBits(configuration.resolvedValueBits)
     }
@@ -1885,7 +1983,9 @@ public func turboQuantMetalEncodeAttention(
         capacity: capacity,
         logicalLength: logicalLength,
         ringOffset: ringOffset,
-        pinnedPrefixLength: pinnedPrefixLength
+        pinnedPrefixLength: pinnedPrefixLength,
+        layoutVersion: configuration.attentionLayoutVersion,
+        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5
     )
     guard layout.logicalLength <= layout.capacity else {
         throw TurboQuantError.invalidMetalConfiguration(
@@ -1936,7 +2036,9 @@ public func turboQuantMetalEncodeAttention(
                 layout.groupsPerVector, scalesPerGroup,
             ],
         ],
-        outputDTypes: [.uint32, .uint32, .uint32, .uint32, .float32],
+        outputDTypes: [
+            .uint32, .uint32, .uint32, .uint32, configuration.attentionScaleStorage.dtype,
+        ],
         initValue: 0,
         stream: stream
     )
@@ -1984,7 +2086,10 @@ public func turboQuantMetalDecodeAttention(
                 groupSize: code.groupSize,
                 backend: .metalPolarQJL,
                 seed: code.seed,
-                valueBits: code.valueBits
+                valueBits: code.valueBits,
+                attentionLayoutVersion: code.layout.layoutVersion,
+                allowExperimentalLayoutV5: code.layout.isLayoutV5,
+                attentionScaleStorage: turboQuantAttentionScaleStorage(for: code)
             ),
             layout: code.layout,
             inputLength: code.layout.logicalLength,
@@ -2042,7 +2147,10 @@ public func turboQuantMetalQK(
                 groupSize: keyCode.groupSize,
                 backend: .metalPolarQJL,
                 seed: keyCode.seed,
-                valueBits: keyCode.valueBits
+                valueBits: keyCode.valueBits,
+                attentionLayoutVersion: keyCode.layout.layoutVersion,
+                allowExperimentalLayoutV5: keyCode.layout.isLayoutV5,
+                attentionScaleStorage: turboQuantAttentionScaleStorage(for: keyCode)
             ),
             layout: keyCode.layout,
             inputLength: keyCode.layout.logicalLength,
@@ -2117,7 +2225,10 @@ public func turboQuantMetalAV(
                 groupSize: valueCode.groupSize,
                 backend: .metalPolarQJL,
                 seed: valueCode.seed,
-                valueBits: valueCode.valueBits
+                valueBits: valueCode.valueBits,
+                attentionLayoutVersion: valueCode.layout.layoutVersion,
+                allowExperimentalLayoutV5: valueCode.layout.isLayoutV5,
+                attentionScaleStorage: turboQuantAttentionScaleStorage(for: valueCode)
             ),
             layout: valueCode.layout,
             inputLength: valueCode.layout.logicalLength,
@@ -2393,7 +2504,10 @@ private func turboQuantMetalOnlineFusedAttention(
                 groupSize: keyCode.groupSize,
                 backend: .metalPolarQJL,
                 seed: keyCode.seed,
-                valueBits: valueCode.valueBits
+                valueBits: valueCode.valueBits,
+                attentionLayoutVersion: keyCode.layout.layoutVersion,
+                allowExperimentalLayoutV5: keyCode.layout.isLayoutV5,
+                attentionScaleStorage: turboQuantAttentionScaleStorage(for: keyCode)
             ),
             layout: keyCode.layout,
             inputLength: keyCode.layout.logicalLength,
@@ -4119,17 +4233,45 @@ private func validateStorageArray(
     expectedShapes: [[Int]],
     expectedDType: DType
 ) throws {
+    try validateStorageArray(
+        array,
+        name: name,
+        expectedShapes: expectedShapes,
+        expectedDTypes: [expectedDType]
+    )
+}
+
+private func validateStorageArray(
+    _ array: MLXArray,
+    name: String,
+    expectedShape: [Int],
+    expectedDTypes: [DType]
+) throws {
+    try validateStorageArray(
+        array,
+        name: name,
+        expectedShapes: [expectedShape],
+        expectedDTypes: expectedDTypes
+    )
+}
+
+private func validateStorageArray(
+    _ array: MLXArray,
+    name: String,
+    expectedShapes: [[Int]],
+    expectedDTypes: [DType]
+) throws {
     guard expectedShapes.contains(array.shape) else {
         throw TurboQuantError.invalidMetalConfiguration(
             "\(name) has shape \(array.shape), expected one of \(expectedShapes)"
         )
     }
-    guard array.dtype == expectedDType else {
+    guard expectedDTypes.contains(array.dtype) else {
         throw TurboQuantError.invalidMetalConfiguration(
-            "\(name) has dtype \(array.dtype), expected \(expectedDType)"
+            "\(name) has dtype \(array.dtype), expected one of \(expectedDTypes)"
         )
     }
-    let expectedByteCount = array.shape.reduce(1, *) * expectedDType.size
+    let expectedByteCount = array.shape.reduce(1, *) * array.dtype.size
     guard array.nbytes == expectedByteCount else {
         throw TurboQuantError.invalidMetalConfiguration(
             "\(name) uses \(array.nbytes) storage bytes, expected \(expectedByteCount)"
@@ -4169,6 +4311,71 @@ private func metalMagnitudeWordsPerGroup(
 
 private func metalScalesPerGroup(role: TurboQuantTensorRole) -> Int {
     role == .value ? 2 : 3
+}
+
+private func validateRequestedAttentionLayoutVersion(
+    _ layoutVersion: Int,
+    allowExperimentalLayoutV5: Bool
+) throws {
+    if layoutVersion == TurboQuantAttentionLayout.currentVersion {
+        return
+    }
+    if layoutVersion == TurboQuantAttentionLayout.nextVersion, allowExperimentalLayoutV5 {
+        return
+    }
+    if layoutVersion == TurboQuantAttentionLayout.nextVersion {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "TurboQuant layout V5 is experimental and disabled by default"
+        )
+    }
+    throw TurboQuantError.invalidMetalConfiguration(
+        "unsupported compressed attention layout version \(layoutVersion)"
+    )
+}
+
+private func validateAttentionScaleStorage(
+    _ scaleStorage: TurboQuantScaleStorage,
+    layoutVersion: Int,
+    allowExperimentalLayoutV5: Bool
+) throws {
+    switch scaleStorage {
+    case .float32:
+        return
+    case .float16:
+        guard layoutVersion == TurboQuantAttentionLayout.nextVersion,
+            allowExperimentalLayoutV5
+        else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "fp16 TurboQuant attention scales require experimental Layout V5"
+            )
+        }
+    }
+}
+
+private func validateAttentionConfiguration(_ configuration: TurboQuantConfiguration) throws {
+    try validateRequestedAttentionLayoutVersion(
+        configuration.attentionLayoutVersion,
+        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5
+    )
+    try validateAttentionScaleStorage(
+        configuration.attentionScaleStorage,
+        layoutVersion: configuration.attentionLayoutVersion,
+        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5
+    )
+}
+
+private func turboQuantAttentionScaleStorage(
+    for code: TurboQuantAttentionCode
+) -> TurboQuantScaleStorage {
+    code.scales.dtype == .float16 ? .float16 : .float32
+}
+
+private func supportedAttentionScaleDTypes(
+    for layoutVersion: Int
+) -> [DType] {
+    layoutVersion == TurboQuantAttentionLayout.nextVersion
+        ? [.float32, .float16]
+        : [.float32]
 }
 
 private func metalTemplate(
@@ -4263,7 +4470,7 @@ private func validateAttentionLayout(
             "compressed attention codes must be encoded as key or value"
         )
     }
-    guard layout.layoutVersion == TurboQuantAttentionLayout.currentVersion else {
+    guard TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion) else {
         throw TurboQuantError.invalidMetalConfiguration(
             "unsupported compressed attention layout version \(layout.layoutVersion)"
         )
@@ -4376,7 +4583,7 @@ private func validateAttentionCodeStorage(_ code: TurboQuantAttentionCode) throw
         code.scales,
         name: "compressed attention scales",
         expectedShape: scalesShape,
-        expectedDType: .float32
+        expectedDTypes: supportedAttentionScaleDTypes(for: code.layout.layoutVersion)
     )
 }
 
@@ -4612,6 +4819,8 @@ private func attentionTemplate(
         ("BITSET_WORDS_PER_GROUP", layout.bitsetWordsPerGroup),
         ("VALUE_BITS", configuration.resolvedValueBits),
         ("SCALES_PER_GROUP", metalScalesPerGroup(role: configuration.role)),
+        ("LAYOUT_VERSION", layout.layoutVersion),
+        ("DETERMINISTIC_HIGH_MASK", configuration.deterministicHighPrecisionMask),
         ("ROLE", metalRoleValue(configuration.role)),
         ("OUTPUT_DTYPE", outputDType),
         ("DO_CAUSAL", causal),
@@ -5929,7 +6138,9 @@ private enum TurboQuantMetalKernels {
         float residual_squared = 0.0f;
         uint bit_offset = 0u;
         for (uint local = 0; local < count; local++) {
-            bool high_precision = tq_product_high_precision(seed, storage_group, local, count, high_count);
+            bool high_precision = bool(DETERMINISTIC_HIGH_MASK)
+                ? tq_product_high_precision(seed, storage_group, local, count, high_count)
+                : local < high_count;
             uint bits = high_precision ? uint(KEY_HIGH_BITS) : uint(KEY_BASE_BITS);
             uint quantized = tq_nearest_codebook_index(values[local], bits, count);
             float reconstructed = tq_codebook_level(bits, quantized, count);

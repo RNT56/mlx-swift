@@ -105,7 +105,9 @@ public func validateTurboQuantAttentionCode(
         code.scales,
         name: "compressed attention scales",
         expectedShape: scalesShape,
-        expectedDType: .float32
+        expectedDTypes: turboQuantAttentionSupportedScaleDTypes(
+            layoutVersion: code.layout.layoutVersion
+        )
     )
 }
 
@@ -113,10 +115,10 @@ func turboQuantValidateAttentionLayoutBasics(
     _ layout: TurboQuantAttentionLayout,
     context: String
 ) throws {
-    guard layout.layoutVersion == TurboQuantAttentionLayout.currentVersion else {
+    guard TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion) else {
         throw turboQuantAttentionValidationError(
             "\(context) layout version actual \(layout.layoutVersion), "
-                + "expected \(TurboQuantAttentionLayout.currentVersion)"
+                + "expected one of \(TurboQuantAttentionLayout.supportedVersions)"
         )
     }
     guard layout.batchSize > 0 else {
@@ -280,17 +282,45 @@ private func turboQuantValidateAttentionStorageArray(
     expectedShapes: [[Int]],
     expectedDType: DType
 ) throws {
+    try turboQuantValidateAttentionStorageArray(
+        array,
+        name: name,
+        expectedShapes: expectedShapes,
+        expectedDTypes: [expectedDType]
+    )
+}
+
+private func turboQuantValidateAttentionStorageArray(
+    _ array: MLXArray,
+    name: String,
+    expectedShape: [Int],
+    expectedDTypes: [DType]
+) throws {
+    try turboQuantValidateAttentionStorageArray(
+        array,
+        name: name,
+        expectedShapes: [expectedShape],
+        expectedDTypes: expectedDTypes
+    )
+}
+
+private func turboQuantValidateAttentionStorageArray(
+    _ array: MLXArray,
+    name: String,
+    expectedShapes: [[Int]],
+    expectedDTypes: [DType]
+) throws {
     guard expectedShapes.contains(array.shape) else {
         throw turboQuantAttentionValidationError(
             "\(name) shape actual \(array.shape), expected one of \(expectedShapes)"
         )
     }
-    guard array.dtype == expectedDType else {
+    guard expectedDTypes.contains(array.dtype) else {
         throw turboQuantAttentionValidationError(
-            "\(name) dtype actual \(array.dtype), expected \(expectedDType)"
+            "\(name) dtype actual \(array.dtype), expected one of \(expectedDTypes)"
         )
     }
-    let expectedByteCount = array.shape.reduce(1, *) * expectedDType.size
+    let expectedByteCount = array.shape.reduce(1, *) * array.dtype.size
     guard array.nbytes == expectedByteCount else {
         throw turboQuantAttentionValidationError(
             "\(name) storage bytes actual \(array.nbytes), expected \(expectedByteCount)"
@@ -301,6 +331,12 @@ private func turboQuantValidateAttentionStorageArray(
             "\(name) layout actual non-contiguous, expected canonical row-contiguous storage"
         )
     }
+}
+
+private func turboQuantAttentionSupportedScaleDTypes(layoutVersion: Int) -> [DType] {
+    layoutVersion == TurboQuantAttentionLayout.nextVersion
+        ? [.float32, .float16]
+        : [.float32]
 }
 
 private func turboQuantAttentionMagnitudeWordsPerGroup(

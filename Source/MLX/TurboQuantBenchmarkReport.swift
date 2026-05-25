@@ -39,6 +39,9 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var preset: String
     public var valueBits: Int?
     public var groupSize: Int
+    public var layoutVersion: Int?
+    public var scaleStorage: String?
+    public var warmupIterations: Int?
     public var encodeMS: Double?
     public var decodeMS: Double?
     public var qkMS: Double?
@@ -64,6 +67,9 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         preset: String,
         valueBits: Int?,
         groupSize: Int,
+        layoutVersion: Int? = nil,
+        scaleStorage: String? = nil,
+        warmupIterations: Int? = nil,
         encodeMS: Double? = nil,
         decodeMS: Double? = nil,
         qkMS: Double? = nil,
@@ -88,6 +94,9 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.preset = preset
         self.valueBits = valueBits
         self.groupSize = groupSize
+        self.layoutVersion = layoutVersion
+        self.scaleStorage = scaleStorage
+        self.warmupIterations = warmupIterations
         self.encodeMS = encodeMS
         self.decodeMS = decodeMS
         self.qkMS = qkMS
@@ -180,6 +189,22 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
         notes: [
             "Query tensors may require bounded row-contiguous preparation; compressed K/V cache tensors must not be copied into decoded full-cache arrays.",
             "This is a source audit and validation-gate status, not a production verification claim.",
+        ]
+    )
+
+    public static let currentW5 = TurboQuantHiddenCopyAudit(
+        status: .pass,
+        entries: currentW3.entries + [
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "layout V5 fp16 scales",
+                largeInput: "compressed scale tables",
+                copyRisk: "medium",
+                mitigation: "V5 scale tables are emitted directly by the Metal encode kernel and validated as canonical float16/float32 storage before dispatch",
+                status: "guarded"
+            ),
+        ],
+        notes: currentW3.notes + [
+            "Layout V5 is feature-gated and off by default; V4 remains the default write layout.",
         ]
     )
 }
