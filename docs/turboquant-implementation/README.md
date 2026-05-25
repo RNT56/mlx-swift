@@ -28,6 +28,7 @@ For this repo, the launch order is:
 2. Wave 1: W2 validation/router.
 3. Wave 3: W3 benchmark JSON and hidden-copy audit.
 4. Wave 5: W13 Layout V5 and kernels.
+5. Wave 7: W29+ platform contracts for adaptive precision, open KV descriptors, and feature gates.
 
 W1 can run immediately in parallel with LM W4 and Pines W7/W24. W13 must not product-activate before benchmark, quality, and memory-calibration gates exist.
 
@@ -56,6 +57,7 @@ Final merge to the repo default branch waits for the cross-repo compatibility pa
 - kernel warmup;
 - Layout V5;
 - fused head-dimension specializations.
+- Wave 7 platform policy contracts, disabled by default.
 
 ## Required reading
 
@@ -75,3 +77,4 @@ Final merge to the repo default branch waits for the cross-repo compatibility pa
 6. Long-KV hot paths must not accidentally create full-cache row-contiguous copies.
 7. Benchmark JSON must include storage estimates and path decisions.
 8. Layout V5 must stay feature-gated and V4-compatible.
+9. Wave 7 platform features must fail closed when unsupported or enabled without evidence.

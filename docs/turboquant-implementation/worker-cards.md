@@ -10,6 +10,7 @@ Use the Pines [Worker Launch Schedule](/Users/mt/Programming/Schtack/pines/docs/
 | Wave 1 | W2 validation/router | W1 contracts compile |
 | Wave 3 | W3 benchmark JSON | W1/W2 stable enough for reports |
 | Wave 5 | W13 Layout V5/kernels | benchmark JSON, quality gates, memory calibration exist |
+| Wave 7 | W29+ platform contracts | post-Wave-6 platform backlog; disabled by default |
 
 W1 and W2 are correctness/control-plane enablers. W13 is optimization and must remain gated until measurement proves improvement.
 
@@ -166,3 +167,29 @@ Acceptance:
 | CORE-028 | Quality A/B report |
 | CORE-029 | TurboQuant linear remains gated |
 | CORE-030 | Open-format prep |
+| CORE-031 | Adaptive precision policy contract |
+| CORE-032 | Platform feature gates and capability report |
+
+## Wave 7 - W29+ platform contracts
+
+Branch: `tq/wave7-core-platform`
+
+Likely owned files:
+
+- `Source/MLX/TurboQuantPlatformPolicy.swift`
+- `Tests/MLXTests/TurboQuantWave7PlatformPolicyTests.swift`
+
+Tasks:
+
+- add disabled-by-default adaptive precision policy DTOs;
+- add precision segment DTOs;
+- add open KV format descriptor DTO;
+- add platform feature gate and capability report DTOs;
+- add validation helpers that fail closed for unsupported active states and activation without measured or verified evidence.
+
+Acceptance:
+
+- contracts are `Codable` and `Sendable`;
+- validation works without Metal;
+- V5 remains opt-in/default-off;
+- no product activation.
