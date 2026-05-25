@@ -2150,8 +2150,8 @@ public func turboQuantMetalScaledDotProductAttention(
 ) throws -> MLXArray {
     try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
     try validateAttentionQuery(queries, code: keyCode)
-    try validateAttentionCodeStorage(keyCode)
-    try validateAttentionCodeStorage(valueCode)
+    try validateTurboQuantAttentionCode(keyCode, expectedRole: .key)
+    try validateTurboQuantAttentionCode(valueCode, expectedRole: .value)
     try validateAttentionMask(
         mask,
         scoreShape: [
