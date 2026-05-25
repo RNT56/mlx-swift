@@ -48,9 +48,11 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
             )
         )
 
-        XCTAssertEqual(decision.selectedPath, .baseline)
+        XCTAssertEqual(decision.selectedPath, .unavailable)
         XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .twoStageCompressed })
         XCTAssertTrue(decision.rejectedPaths.allSatisfy { !$0.reason.isEmpty })
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .baseline })
+        XCTAssertFalse(decision.fallbackReason?.isEmpty ?? true)
     }
 
     private static func request(

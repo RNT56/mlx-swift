@@ -20,21 +20,29 @@ public func selectTurboQuantAttentionPath(
         return try turboQuantAttentionDecision(request: request, capabilities: capabilities)
     } catch {
         var rejected = turboQuantRejectedPathsForUnavailableDecision(error)
+        let fallbackReason = rejected.map { "\($0.path.rawValue): \($0.reason)" }.joined(separator: "; ")
 
-        if request.fallbackState.packedFallbackAvailable {
-            return TurboQuantAttentionDecision(
-                selectedPath: .mlxPackedFallback,
+        func fallbackDecision(_ path: TurboQuantAttentionPath) -> TurboQuantAttentionDecision {
+            TurboQuantAttentionDecision(
+                selectedPath: path,
                 outputDType: request.outputDType,
-                rejectedPaths: rejected
+                rejectedPaths: rejected,
+                headDimension: request.queryShape.indices.contains(3) ? request.queryShape[3] : nil,
+                queryLength: request.queryShape.indices.contains(2) ? request.queryShape[2] : nil,
+                logicalLength: request.keyLayout.logicalLength,
+                dtype: "\(request.queryDType)->\(request.outputDType)",
+                maskKind: request.maskKind.rawValue,
+                kernelProfile: TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe(),
+                fallbackReason: fallbackReason
             )
         }
 
+        if request.fallbackState.packedFallbackAvailable {
+            return fallbackDecision(.mlxPackedFallback)
+        }
+
         if request.fallbackState.decodedFallbackAvailable || request.fallbackState.baselineAvailable {
-            return TurboQuantAttentionDecision(
-                selectedPath: .baseline,
-                outputDType: request.outputDType,
-                rejectedPaths: rejected
-            )
+            return fallbackDecision(.baseline)
         }
 
         rejected.append(
@@ -51,9 +59,16 @@ public func selectTurboQuantAttentionPath(
         )
 
         return TurboQuantAttentionDecision(
-            selectedPath: .baseline,
+            selectedPath: .unavailable,
             outputDType: request.outputDType,
-            rejectedPaths: rejected
+            rejectedPaths: rejected,
+            headDimension: request.queryShape.indices.contains(3) ? request.queryShape[3] : nil,
+            queryLength: request.queryShape.indices.contains(2) ? request.queryShape[2] : nil,
+            logicalLength: request.keyLayout.logicalLength,
+            dtype: "\(request.queryDType)->\(request.outputDType)",
+            maskKind: request.maskKind.rawValue,
+            kernelProfile: TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe(),
+            fallbackReason: rejected.map { "\($0.path.rawValue): \($0.reason)" }.joined(separator: "; ")
         )
     }
 }

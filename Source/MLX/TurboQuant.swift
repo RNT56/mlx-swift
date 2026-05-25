@@ -336,7 +336,11 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
             attentionQK: qkAvailable,
             attentionAV: avAvailable,
             attentionFusedDecode: qkAvailable && avAvailable && tiledFusedPassed,
-            bfloatOutput: attentionCodecPassed && bfloatOutputPassed
+            attentionTiledFusedDecode: qkAvailable && avAvailable && tiledFusedPassed,
+            bfloatOutput: attentionCodecPassed && bfloatOutputPassed,
+            supportedHeadDimensions: onlineFusedHeadDimensions,
+            selectedKernelProfile: selectedKernelProfile,
+            failureReasons: failureReason.map { [$0] } ?? []
         )
     }
 }
@@ -406,7 +410,12 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
             attentionAV: supportsMetalPolarQJLAttention && probeCapabilities.attentionAV,
             attentionFusedDecode: supportsMetalPolarQJLAttention
                 && probeCapabilities.attentionFusedDecode,
-            bfloatOutput: supportsMetalPolarQJLAttention && probeCapabilities.bfloatOutput
+            attentionTiledFusedDecode: supportsMetalPolarQJLAttention
+                && probeCapabilities.attentionTiledFusedDecode,
+            bfloatOutput: supportsMetalPolarQJLAttention && probeCapabilities.bfloatOutput,
+            supportedHeadDimensions: onlineFusedHeadDimensions,
+            selectedKernelProfile: selectedKernelProfile,
+            failureReasons: selfTestFailureReason.map { [$0] } ?? probeCapabilities.failureReasons
         )
     }
 
@@ -835,6 +844,7 @@ public enum TurboQuantAttentionPath: String, Codable, Sendable, CaseIterable {
     case twoStageCompressed
     case mlxPackedFallback
     case baseline
+    case unavailable
 }
 
 public struct RejectedPath: Hashable, Codable, Sendable {
@@ -1252,6 +1262,26 @@ public func turboQuantAttentionDecision(
         rejected.append(RejectedPath(path: path, reason: reason))
     }
 
+    func decision(
+        _ path: TurboQuantAttentionPath,
+        scratchBytes: Int = 0,
+        fallbackReason: String? = nil
+    ) -> TurboQuantAttentionDecision {
+        TurboQuantAttentionDecision(
+            selectedPath: path,
+            outputDType: request.outputDType,
+            estimatedScratchBytes: scratchBytes,
+            rejectedPaths: rejected,
+            headDimension: request.queryShape[3],
+            queryLength: request.queryShape[2],
+            logicalLength: request.keyLayout.logicalLength,
+            dtype: "\(request.queryDType)->\(request.outputDType)",
+            maskKind: request.maskKind.rawValue,
+            kernelProfile: TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe(),
+            fallbackReason: fallbackReason
+        )
+    }
+
     func supportsRequestDTypes(_ path: TurboQuantAttentionPath) -> Bool {
         guard let queryDTypeKind, let outputDTypeKind else {
             reject(path, "compressed attention supports only float16, bfloat16, or float32 tensors")
@@ -1329,12 +1359,7 @@ public func turboQuantAttentionDecision(
             reject(
                 .onlineFused, "online fused compressed attention supports only none/causal masks")
         } else {
-            return TurboQuantAttentionDecision(
-                selectedPath: .onlineFused,
-                outputDType: request.outputDType,
-                estimatedScratchBytes: 0,
-                rejectedPaths: rejected
-            )
+            return decision(.onlineFused)
         }
 
         if request.queryShape[2] > capabilities.maxOnlineFusedQueryLength {
@@ -1385,12 +1410,7 @@ public func turboQuantAttentionDecision(
                     "tiled online fused compressed attention supports only none/causal masks"
                 )
             } else {
-                return TurboQuantAttentionDecision(
-                    selectedPath: .tiledOnlineFused,
-                    outputDType: request.outputDType,
-                    estimatedScratchBytes: 0,
-                    rejectedPaths: rejected
-                )
+                return decision(.tiledOnlineFused)
             }
         }
     } else {
@@ -1430,24 +1450,26 @@ public func turboQuantAttentionDecision(
             selectedPath: .twoStageCompressed,
             outputDType: request.outputDType,
             estimatedScratchBytes: scoreScratchBytes,
-            rejectedPaths: rejected
+            rejectedPaths: rejected,
+            headDimension: request.queryShape[3],
+            queryLength: request.queryShape[2],
+            logicalLength: request.keyLayout.logicalLength,
+            dtype: "\(request.queryDType)->\(request.outputDType)",
+            maskKind: request.maskKind.rawValue,
+            kernelProfile: TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe()
         )
     }
 
     if request.fallbackState.packedFallbackAvailable {
-        return TurboQuantAttentionDecision(
-            selectedPath: .mlxPackedFallback,
-            outputDType: request.outputDType,
-            estimatedScratchBytes: 0,
-            rejectedPaths: rejected
+        return decision(
+            .mlxPackedFallback,
+            fallbackReason: rejected.map { "\($0.path.rawValue): \($0.reason)" }.joined(separator: "; ")
         )
     }
     if request.fallbackState.decodedFallbackAvailable || request.fallbackState.baselineAvailable {
-        return TurboQuantAttentionDecision(
-            selectedPath: .baseline,
-            outputDType: request.outputDType,
-            estimatedScratchBytes: 0,
-            rejectedPaths: rejected
+        return decision(
+            .baseline,
+            fallbackReason: rejected.map { "\($0.path.rawValue): \($0.reason)" }.joined(separator: "; ")
         )
     }
 

@@ -253,6 +253,7 @@ private func writeJSON<T: Encodable>(_ value: T) throws {
 }
 
 private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
+    try validateCoreBenchmarkOptions(options)
     let availability = TurboQuantKernelAvailability.current
     let capabilities = availability.kernelCapabilities
     let hiddenCopyAudit = TurboQuantHiddenCopyAudit.currentW5
@@ -299,8 +300,22 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
             }
         } catch {
             benchmarkError = String(describing: error)
-            pathDecision.rejectedPaths.append(
+            var rejected = pathDecision.rejectedPaths
+            rejected.append(
                 RejectedPath(path: pathDecision.selectedPath, reason: "benchmark failed: \(error)")
+            )
+            pathDecision = TurboQuantAttentionDecision(
+                selectedPath: .unavailable,
+                outputDType: pathDecision.outputDType,
+                estimatedScratchBytes: pathDecision.estimatedScratchBytes,
+                rejectedPaths: rejected,
+                headDimension: pathDecision.headDimension,
+                queryLength: pathDecision.queryLength,
+                logicalLength: pathDecision.logicalLength,
+                dtype: pathDecision.dtype,
+                maskKind: pathDecision.maskKind,
+                kernelProfile: pathDecision.kernelProfile,
+                fallbackReason: "benchmark failed: \(error)"
             )
         }
     }
@@ -714,6 +729,12 @@ private func corePathDecision(
     )
 
     switch options.requestedPath {
+    case .unavailable:
+        return forcedFallbackDecision(
+            selectedPath: .unavailable,
+            outputDType: request.outputDType,
+            reason: "caller requested unavailable path"
+        )
     case .baseline:
         return forcedFallbackDecision(
             selectedPath: .baseline,
@@ -731,6 +752,18 @@ private func corePathDecision(
             request: request,
             capabilities: availability.attentionCapabilities
         )
+    }
+}
+
+private func validateCoreBenchmarkOptions(_ options: BenchmarkOptions) throws {
+    if options.scaleStorage == .float16 {
+        guard options.layoutVersion == TurboQuantAttentionLayout.nextVersion,
+              options.enableLayoutV5
+        else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "float16 attention scale storage requires --layout-version \(TurboQuantAttentionLayout.nextVersion) and --enable-layout-v5"
+            )
+        }
     }
 }
 
@@ -886,10 +919,10 @@ private func currentGitCommit() -> String? {
 
 private extension TurboQuantAttentionPath {
     var usesCompressedMetal: Bool {
-        switch self {
+    switch self {
         case .onlineFused, .tiledOnlineFused, .twoStageCompressed:
             return true
-        case .mlxPackedFallback, .baseline:
+        case .mlxPackedFallback, .baseline, .unavailable:
             return false
         }
     }
