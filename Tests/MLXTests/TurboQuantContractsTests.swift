@@ -186,6 +186,21 @@ final class TurboQuantContractsTests: XCTestCase {
         )
         XCTAssertEqual(Set(decision.rejectedPaths).count, 1)
         XCTAssertEqual(decision.rejectedPaths.first?.reason, "fused path is not certified")
+        XCTAssertTrue(capabilities.qk)
+        XCTAssertTrue(capabilities.av)
+        XCTAssertFalse(capabilities.onlineFused)
+        XCTAssertFalse(capabilities.tiledFused)
+        XCTAssertEqual(
+            capabilities.supportedHeadDimensions,
+            TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
+        )
+    }
+
+    func testRejectedTurboQuantPathAliasMatchesRouterContract() {
+        let rejected = RejectedTurboQuantPath(path: .twoStageCompressed, reason: "unsupported mask")
+
+        XCTAssertEqual(rejected.path, .twoStageCompressed)
+        XCTAssertEqual(rejected.reason, "unsupported mask")
     }
 
     func testKernelCapabilityDefaultsAreSafeAndPathSpecific() {
