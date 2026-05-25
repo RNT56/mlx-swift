@@ -8,6 +8,16 @@ MLX is an array framework for machine learning on Apple silicon. MLX Swift
 expands MLX to the Swift language, making research and experimentation easier
 on Apple silicon.
 
+> [!NOTE]
+> This branch is the RNT56 TurboQuant integration branch used by Pines. It keeps
+> the upstream MLX Swift API shape while adding release-train contracts for
+> TurboQuant storage estimates, capability probes, validation, attention-path
+> decisions, benchmark JSON, Layout V5 opt-in storage, and fail-closed platform
+> policy descriptors. The branch currently forms the Pines green local
+> compatibility pair at commit `21a897c5d1ae1930bd7c7a47bb3ed6c9fe8c8772`.
+> See [docs/turboquant-implementation](docs/turboquant-implementation/README.md)
+> for the implementation packet and release constraints.
+
 ## Language Models
 
 LLM and VLM implementations are available in [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm).

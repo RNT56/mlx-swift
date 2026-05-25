@@ -10,6 +10,16 @@ Cross-repo release-train docs live in:
 
 This repo-local packet defines what core workers must implement and expose.
 
+Current status:
+
+- The Pines local compatibility pair is green with this branch at
+  `21a897c5d1ae1930bd7c7a47bb3ed6c9fe8c8772`.
+- Full `swift test` passes after regenerating the Metal reduce JIT source.
+- Layout V5 and platform policy descriptors remain opt-in/evidence-gated; the
+  default runtime path stays V4-compatible.
+- Real-device model/device/mode verification is still owned by the Pines
+  evidence pipeline and is not implied by this core branch alone.
+
 The executable launch order is owned by the Pines packet:
 
 ```text
@@ -32,13 +42,14 @@ For this repo, the launch order is:
 
 W1 can run immediately in parallel with LM W4 and Pines W7/W24. W13 must not product-activate before benchmark, quality, and memory-calibration gates exist.
 
-Worker PRs in this repo target:
+Worker PRs for the completed train targeted:
 
 ```text
-codex/turboquant-core-completion
+tq/wave7-core-platform
 ```
 
-Final merge to the repo default branch waits for the cross-repo compatibility pair and Pines production pin gate.
+Final merge to the repo default branch should preserve the cross-repo
+compatibility pair and Pines production pin gate recorded in the Pines packet.
 
 ## Core responsibilities
 
