@@ -1127,6 +1127,73 @@ class QuantizationTests: XCTestCase {
         XCTAssertLessThan(relativeMSE(referenceDecoded, metalDecoded), 1e-6)
     }
 
+    func testTurboQuantMetalLowerBitQKMatchesProductReferenceWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let queryHeadCount = 4
+        let kvHeadCount = 2
+        let queryLength = 2
+        let keyLength = 5
+        let headDimension = 64
+        let qValues: [Float] = (0 ..< (queryHeadCount * queryLength * headDimension)).map {
+            index in
+            let position = Double(index)
+            return Float(0.37 * sin(position * 0.031) + 0.13 * cos(position * 0.109))
+        }
+        let kValues: [Float] = (0 ..< (kvHeadCount * keyLength * headDimension)).map { index in
+            let position = Double(index)
+            return Float(0.41 * cos(position * 0.047) - 0.19 * sin(position * 0.083))
+        }
+        let queries = MLXArray(qValues, [1, queryHeadCount, queryLength, headDimension])
+        let keys = MLXArray(kValues, [1, kvHeadCount, keyLength, headDimension])
+
+        for (preset, expectedMagnitudeWords) in [
+            (TurboQuantPreset.turbo2_5, 3),
+            (.turbo3_5, 5),
+            (.turbo4, 6),
+            (.turbo4v2, 6),
+        ] {
+            let configuration = TurboQuantConfiguration(
+                preset: preset,
+                role: .key,
+                groupSize: headDimension,
+                backend: .metalPolarQJL,
+                seed: 0xA11C_E000_0000_0001
+            )
+            let keyCode = try turboQuantMetalEncodeAttention(keys, configuration: configuration)
+            let referenceCode = try turboQuantReferenceEncode(keys, configuration: configuration)
+            let scores = try turboQuantMetalQK(
+                queries: queries,
+                keyCode: keyCode,
+                scale: 1
+            ).asArray(Float.self)
+
+            XCTAssertEqual(keyCode.layout.magnitudeWordsPerGroup, expectedMagnitudeWords)
+            for qHead in 0 ..< queryHeadCount {
+                let kvHead = qHead / (queryHeadCount / kvHeadCount)
+                for qToken in 0 ..< queryLength {
+                    for keyToken in 0 ..< keyLength {
+                        var referenceQuery = [Float](repeating: 0, count: kValues.count)
+                        let queryBase = (qHead * queryLength + qToken) * headDimension
+                        let keyBase = (kvHead * keyLength + keyToken) * headDimension
+                        for dimension in 0 ..< headDimension {
+                            referenceQuery[keyBase + dimension] = qValues[queryBase + dimension]
+                        }
+                        let expected = try turboQuantReferenceInnerProduct(
+                            query: MLXArray(referenceQuery, [1, kvHeadCount, keyLength, headDimension]),
+                            code: referenceCode
+                        )
+                        let scoreIndex =
+                            ((qHead * queryLength + qToken) * keyLength) + keyToken
+                        XCTAssertEqual(scores[scoreIndex], expected, accuracy: 1e-4)
+                    }
+                }
+            }
+        }
+    }
+
     func testTurboQuantMetalCodecUsesCompactUnusedBitsetsWhenAvailable() throws {
         guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
             throw XCTSkip("Metal runtime unavailable")
