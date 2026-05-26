@@ -1506,6 +1506,13 @@ class QuantizationTests: XCTestCase {
             let queries = MLXArray(qValues, [1, 4, 2, headDimension])
             let keys = MLXArray(kValues, [1, 2, 5, headDimension])
             let values = MLXArray(vValues, [1, 2, 5, headDimension])
+            let fullPrecisionReference = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: 1 / sqrt(Float(headDimension)),
+                mask: .causal
+            )
             let keyCode = try turboQuantMetalEncodeAttention(
                 keys,
                 configuration: TurboQuantConfiguration(
@@ -1558,6 +1565,14 @@ class QuantizationTests: XCTestCase {
             XCTAssertTrue(
                 allClose(fused, twoStage, rtol: 1e-4, atol: 1e-4).item(Bool.self),
                 "Expected online fused output to match two-stage output for \(headDimension)-dimensional heads"
+            )
+            XCTAssertLessThan(
+                relativeMSE(
+                    fullPrecisionReference.asArray(Float.self),
+                    fused.asArray(Float.self)
+                ),
+                0.12,
+                "Expected compressed attention to remain within quality bounds for \(headDimension)-dimensional heads"
             )
         }
     }
@@ -1905,6 +1920,62 @@ class QuantizationTests: XCTestCase {
                 )
             )
         }
+    }
+
+    func testTurboQuantPortableProfileDoesNotAdvertiseLargeOnlineFusedHeads() {
+        XCTAssertEqual(
+            TurboQuantRuntimeProbeResult.defaultOnlineFusedHeadDimensions(
+                for: .portableA16A17
+            ),
+            [64, 80, 96, 128]
+        )
+        XCTAssertTrue(
+            TurboQuantRuntimeProbeResult.defaultOnlineFusedHeadDimensions(
+                for: .wideA18A19
+            )
+            .contains(256)
+        )
+    }
+
+    func testTurboQuantKernelProfileKeepsA17IPhoneOnPortableProfile() {
+        XCTAssertEqual(
+            TurboQuantKernelProfile.selected(
+                architectureName: "Apple GPU",
+                hardwareModelIdentifier: "iPhone16,2",
+                supportedGPUFamilies: ["apple8": true, "apple9": true],
+                recommendedWorkingSetBytes: 5_726_633_984
+            ),
+            .portableA16A17
+        )
+        XCTAssertEqual(
+            TurboQuantKernelProfile.selected(
+                architectureName: "A18 Pro",
+                hardwareModelIdentifier: "iPhone17,2",
+                supportedGPUFamilies: ["apple9": true],
+                recommendedWorkingSetBytes: 5_726_633_984
+            ),
+            .wideA18A19
+        )
+    }
+
+    func testTurboQuantProbeWithFailedFusedSelfTestDoesNotAdvertiseFusedHeads() {
+        let probe = TurboQuantRuntimeProbeResult(
+            status: .passed,
+            metalRuntimeAvailable: true,
+            flatCodecPassed: true,
+            encodeDecodePassed: true,
+            qkPassed: true,
+            avPassed: true,
+            tiledFusedPassed: false,
+            selectedKernelProfile: .wideA18A19,
+            onlineFusedHeadDimensions: [64, 128, 256]
+        )
+
+        let capabilities = probe.kernelCapabilities
+        XCTAssertTrue(capabilities.attentionQK)
+        XCTAssertTrue(capabilities.attentionAV)
+        XCTAssertFalse(capabilities.attentionTiledFusedDecode)
+        XCTAssertEqual(capabilities.supportedHeadDimensions, [])
     }
 
     func testTurboQuantOnlineFusedSupportsLargeContextContract() throws {

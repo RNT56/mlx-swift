@@ -3,6 +3,10 @@
 import Cmlx
 import Foundation
 
+#if canImport(Darwin)
+    import Darwin
+#endif
+
 #if canImport(Metal)
     import Metal
 #endif
@@ -183,6 +187,20 @@ public enum TurboQuantKernelProfile: String, Codable, Sendable, CaseIterable {
             128
         }
     }
+
+    public static func selected(
+        architectureName: String,
+        hardwareModelIdentifier: String? = nil,
+        supportedGPUFamilies: [String: Bool],
+        recommendedWorkingSetBytes: Int? = nil
+    ) -> TurboQuantKernelProfile {
+        selectTurboQuantKernelProfile(
+            architectureName: architectureName,
+            hardwareModelIdentifier: hardwareModelIdentifier,
+            supportedGPUFamilies: supportedGPUFamilies,
+            recommendedWorkingSetBytes: recommendedWorkingSetBytes
+        )
+    }
 }
 
 private func turboQuantOnlineFusedThreadgroupWidth(minimum: Int) -> Int {
@@ -202,6 +220,18 @@ public enum TurboQuantRuntimeSelfTestStatus: String, Codable, Sendable, CaseIter
 
 public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
     public static let throughputOptimizedOnlineFusedHeadDimensions = [64, 80, 96, 128, 192, 256]
+    public static func defaultOnlineFusedHeadDimensions(
+        for profile: TurboQuantKernelProfile
+    ) -> [Int] {
+        switch profile {
+        case .portableA16A17:
+            return [64, 80, 96, 128]
+        case .wideA18A19, .sustainedA19Pro:
+            return throughputOptimizedOnlineFusedHeadDimensions
+        case .mlxPackedFallback:
+            return []
+        }
+    }
 
     public var status: TurboQuantRuntimeSelfTestStatus
     public var metalRuntimeAvailable: Bool
@@ -338,7 +368,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
             attentionFusedDecode: qkAvailable && avAvailable && tiledFusedPassed,
             attentionTiledFusedDecode: qkAvailable && avAvailable && tiledFusedPassed,
             bfloatOutput: attentionCodecPassed && bfloatOutputPassed,
-            supportedHeadDimensions: onlineFusedHeadDimensions,
+            supportedHeadDimensions: (qkAvailable && avAvailable && tiledFusedPassed) ? onlineFusedHeadDimensions : [],
             selectedKernelProfile: selectedKernelProfile,
             failureReasons: failureReason.map { [$0] } ?? []
         )
@@ -348,6 +378,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
 public struct TurboQuantDeviceCapabilities: Equatable, Codable, Sendable {
     public var metalAvailable: Bool
     public var architectureName: String
+    public var hardwareModelIdentifier: String?
     public var supportedGPUFamilies: [String: Bool]
     public var maxBufferBytes: Int
     public var recommendedWorkingSetBytes: Int?
@@ -358,6 +389,7 @@ public struct TurboQuantDeviceCapabilities: Equatable, Codable, Sendable {
     public init(
         metalAvailable: Bool,
         architectureName: String,
+        hardwareModelIdentifier: String? = nil,
         supportedGPUFamilies: [String: Bool] = [:],
         maxBufferBytes: Int = 0,
         recommendedWorkingSetBytes: Int? = nil,
@@ -367,6 +399,7 @@ public struct TurboQuantDeviceCapabilities: Equatable, Codable, Sendable {
     ) {
         self.metalAvailable = metalAvailable
         self.architectureName = architectureName
+        self.hardwareModelIdentifier = hardwareModelIdentifier
         self.supportedGPUFamilies = supportedGPUFamilies
         self.maxBufferBytes = maxBufferBytes
         self.recommendedWorkingSetBytes = recommendedWorkingSetBytes
@@ -3664,6 +3697,7 @@ private func appendSwiftPMMetalBundleCandidates(from directory: URL, to candidat
 private func detectedTurboQuantDeviceCapabilities() -> TurboQuantDeviceCapabilities {
     let metalAvailable = metalRuntimeAvailable()
     let physicalMemory = Int(ProcessInfo.processInfo.physicalMemory)
+    let hardwareModelIdentifier = turboQuantHardwareModelIdentifier()
 
     #if canImport(Metal)
         if let device = MTLCreateSystemDefaultDevice() {
@@ -3686,6 +3720,7 @@ private func detectedTurboQuantDeviceCapabilities() -> TurboQuantDeviceCapabilit
             return TurboQuantDeviceCapabilities(
                 metalAvailable: metalAvailable,
                 architectureName: architecture,
+                hardwareModelIdentifier: hardwareModelIdentifier,
                 supportedGPUFamilies: turboQuantSupportedGPUFamilies(device),
                 maxBufferBytes: device.maxBufferLength,
                 recommendedWorkingSetBytes: recommendedWorkingSet,
@@ -3698,8 +3733,24 @@ private func detectedTurboQuantDeviceCapabilities() -> TurboQuantDeviceCapabilit
     return TurboQuantDeviceCapabilities(
         metalAvailable: metalAvailable,
         architectureName: "Unknown",
+        hardwareModelIdentifier: hardwareModelIdentifier,
         physicalMemoryBytes: physicalMemory
     )
+}
+
+private func turboQuantHardwareModelIdentifier() -> String? {
+    #if canImport(Darwin)
+        var systemInfo = utsname()
+        guard uname(&systemInfo) == 0 else { return nil }
+        let identifier = Mirror(reflecting: systemInfo.machine).children.reduce(into: "") {
+            partial, element in
+            guard let value = element.value as? Int8, value != 0 else { return }
+            partial.append(String(UnicodeScalar(UInt8(value))))
+        }
+        return identifier.isEmpty ? nil : identifier
+    #else
+        return nil
+    #endif
 }
 
 #if canImport(Metal)
@@ -3727,11 +3778,19 @@ private func detectedTurboQuantDeviceCapabilities() -> TurboQuantDeviceCapabilit
 
 private func selectTurboQuantKernelProfile(
     architectureName: String,
+    hardwareModelIdentifier: String?,
     supportedGPUFamilies: [String: Bool],
     recommendedWorkingSetBytes: Int?
 ) -> TurboQuantKernelProfile {
     let architecture = architectureName.lowercased()
+    let hardwareModel = hardwareModelIdentifier?.lowercased() ?? ""
     let workingSet = recommendedWorkingSetBytes ?? 0
+
+    if let iPhoneGeneration = turboQuantIPhoneGeneration(from: hardwareModel),
+        iPhoneGeneration <= 16
+    {
+        return .portableA16A17
+    }
 
     if workingSet >= 10_000_000_000
         || architecture.contains("a19pro")
@@ -3751,6 +3810,13 @@ private func selectTurboQuantKernelProfile(
     }
 
     return .portableA16A17
+}
+
+private func turboQuantIPhoneGeneration(from hardwareModel: String) -> Int? {
+    guard hardwareModel.hasPrefix("iphone") else { return nil }
+    let suffix = hardwareModel.dropFirst("iphone".count)
+    let generation = suffix.prefix { $0.isNumber }
+    return Int(generation)
 }
 
 private func turboQuantExperimentalLinearMetalEnabled() -> Bool {
@@ -3868,6 +3934,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
         guard capabilities.metalAvailable else { return .mlxPackedFallback }
         return selectTurboQuantKernelProfile(
             architectureName: capabilities.architectureName,
+            hardwareModelIdentifier: capabilities.hardwareModelIdentifier,
             supportedGPUFamilies: capabilities.supportedGPUFamilies,
             recommendedWorkingSetBytes: capabilities.recommendedWorkingSetBytes
         )
@@ -3893,9 +3960,12 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
 
         let selectedProfile = selectTurboQuantKernelProfile(
             architectureName: capabilities.architectureName,
+            hardwareModelIdentifier: capabilities.hardwareModelIdentifier,
             supportedGPUFamilies: capabilities.supportedGPUFamilies,
             recommendedWorkingSetBytes: capabilities.recommendedWorkingSetBytes
         )
+        let onlineFusedHeadDimensions = TurboQuantRuntimeProbeResult
+            .defaultOnlineFusedHeadDimensions(for: selectedProfile)
 
         lock.lock()
         runningSelfTest = true
@@ -3953,7 +4023,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                 && turboQuantRelativeMSE(flatKeyValues, decodedFlatKeyValues) < 0.2
                 && turboQuantRelativeMSE(flatValueValues, decodedFlatValueValues) < 0.02
 
-            let selfTestHeadDimension = 256
+            let selfTestHeadDimension = onlineFusedHeadDimensions.last ?? 128
             let queryValues: [Float] = (0 ..< (1 * 4 * 2 * selfTestHeadDimension)).map { index in
                 let position = Double(index)
                 return Float(sin(position * 0.07) + 0.25 * cos(position * 0.013))
@@ -4052,6 +4122,12 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
             let referenceEnergy = referenceValues.reduce(Float(0)) { partial, value in
                 partial + value * value
             }
+            let avReferenceRelativeMSE =
+                zip(avValues, referenceValues).reduce(Float(0)) {
+                    current, pair in
+                    let delta = pair.0 - pair.1
+                    return current + delta * delta
+                } / Swift.max(referenceEnergy, Float.leastNonzeroMagnitude)
             let fusedReferenceRelativeMSE =
                 zip(fusedValues, referenceValues).reduce(Float(0)) {
                     current, pair in
@@ -4061,9 +4137,10 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
             let avPassed =
                 av.shape == [1, 4, 2, selfTestHeadDimension]
                 && avValues.allSatisfy(\.isFinite)
+                && avReferenceRelativeMSE < 0.12
             let fusedPassed =
                 av.shape == fused.shape && maxDelta < 1e-3
-                && fusedReferenceRelativeMSE < 0.5
+                && fusedReferenceRelativeMSE < 0.12
                 && fusedValues.allSatisfy(\.isFinite)
             let bfloatOutputPassed: Bool
             do {
@@ -4098,13 +4175,16 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
             } catch {
                 bfloatOutputPassed = false
             }
-            try turboQuantWarmAttentionKernelVariants(kernelProfile: selectedProfile)
+            try turboQuantWarmAttentionKernelVariants(
+                headDimensions: onlineFusedHeadDimensions,
+                kernelProfile: selectedProfile
+            )
             let passed =
                 flatCodecPassed && encodeDecodePassed && qkPassed && avPassed
             let failureReason =
                 passed
                 ? nil
-                : "TurboQuant Metal self-test failed: flatCodec=\(flatCodecPassed), attentionCodec=\(encodeDecodePassed), qk=\(qkPassed), av=\(avPassed), fused=\(fusedPassed), bfloat=\(bfloatOutputPassed)."
+                : "TurboQuant Metal self-test failed: flatCodec=\(flatCodecPassed), attentionCodec=\(encodeDecodePassed), qk=\(qkPassed), av=\(avPassed), fused=\(fusedPassed), bfloat=\(bfloatOutputPassed), avRelativeMSE=\(avReferenceRelativeMSE), fusedRelativeMSE=\(fusedReferenceRelativeMSE)."
 
             return TurboQuantRuntimeProbeResult(
                 status: passed ? .passed : .failed,
@@ -4120,8 +4200,7 @@ public final class TurboQuantRuntimeProbe: @unchecked Sendable {
                 encodeDecodeLatencySeconds: encodeDecodeLatency,
                 twoStageLatencySeconds: twoStageLatency,
                 tiledFusedLatencySeconds: fusedLatency,
-                onlineFusedHeadDimensions: TurboQuantRuntimeProbeResult
-                    .throughputOptimizedOnlineFusedHeadDimensions
+                onlineFusedHeadDimensions: fusedPassed ? onlineFusedHeadDimensions : []
             )
         } catch {
             return TurboQuantRuntimeProbeResult(
