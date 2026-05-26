@@ -1,9 +1,9 @@
 import Foundation
 import MLX
 
-private let benchmarkBatchSize = 1
-private let benchmarkQueryHeadCount = 4
-private let benchmarkKVHeadCount = 2
+private let defaultBenchmarkBatchSize = 1
+private let defaultBenchmarkQueryHeadCount = 4
+private let defaultBenchmarkKVHeadCount = 2
 
 struct QualityMetrics: Codable {
     var relativeMSE: Float
@@ -65,6 +65,9 @@ private struct BenchmarkOptions {
     var includeTimestamp: Bool
     var iterations: Int
     var warmup: Int
+    var batchSize: Int
+    var queryHeadCount: Int
+    var kvHeadCount: Int
     var headDimension: Int
     var contextTokens: Int
     var queryLength: Int
@@ -81,7 +84,8 @@ private struct BenchmarkOptions {
     }
 
     static func parse(_ arguments: [String] = CommandLine.arguments) throws -> BenchmarkOptions {
-        let presetName = stringValue("--preset", in: arguments) ?? TurboQuantPreset.turbo4v2.rawValue
+        let presetName =
+            stringValue("--preset", in: arguments) ?? TurboQuantPreset.turbo4v2.rawValue
         guard let preset = TurboQuantPreset(rawValue: presetName) else {
             throw BenchmarkCLIError.invalidPreset(presetName)
         }
@@ -91,6 +95,13 @@ private struct BenchmarkOptions {
             includeTimestamp: arguments.contains("--include-timestamp"),
             iterations: try intValue("--iterations", in: arguments, default: 10, minimum: 1),
             warmup: try intValue("--warmup", in: arguments, default: 1, minimum: 0),
+            batchSize: try intValue(
+                "--batch-size", in: arguments, default: defaultBenchmarkBatchSize, minimum: 1),
+            queryHeadCount: try intValue(
+                "--query-heads", in: arguments, default: defaultBenchmarkQueryHeadCount,
+                minimum: 1),
+            kvHeadCount: try intValue(
+                "--kv-heads", in: arguments, default: defaultBenchmarkKVHeadCount, minimum: 1),
             headDimension: try intValue("--head-dim", in: arguments, default: 128, minimum: 1),
             contextTokens: try intValue("--context", in: arguments, default: 256, minimum: 1),
             queryLength: try intValue("--query-length", in: arguments, default: 1, minimum: 1),
@@ -156,7 +167,8 @@ private struct BenchmarkOptions {
             return .onlineFused
         case TurboQuantAttentionPath.tiledOnlineFused.rawValue, "tiled-online-fused":
             return .tiledOnlineFused
-        case TurboQuantAttentionPath.twoStageCompressed.rawValue, "two-stage", "two-stage-compressed":
+        case TurboQuantAttentionPath.twoStageCompressed.rawValue, "two-stage",
+            "two-stage-compressed":
             return .twoStageCompressed
         case TurboQuantAttentionPath.mlxPackedFallback.rawValue, "mlx-packed-fallback":
             return .mlxPackedFallback
@@ -343,7 +355,8 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     var decodeTokensPerSecondP50: Double?
     var decodeTokensPerSecondP95: Double?
 
-    if availability.supportsMetalPolarQJLAttention && pathDecision.selectedPath.usesCompressedMetal {
+    if availability.supportsMetalPolarQJLAttention && pathDecision.selectedPath.usesCompressedMetal
+    {
         do {
             let measurement = try measureCoreAttention(options: options, decision: pathDecision)
             storageEstimate = measurement.storageEstimate
@@ -468,29 +481,29 @@ private func measureCoreAttention(
 ) throws -> CoreAttentionMeasurement {
     let query = MLXArray(
         values(
-            count: benchmarkBatchSize * benchmarkQueryHeadCount * options.queryLength
+            count: options.batchSize * options.queryHeadCount * options.queryLength
                 * options.headDimension,
             scale: 0.019
         ),
-        [benchmarkBatchSize, benchmarkQueryHeadCount, options.queryLength, options.headDimension]
+        [options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension]
     )
     let keys = MLXArray(
         values(
-            count: benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
+            count: options.batchSize * options.kvHeadCount * options.contextTokens
                 * options.headDimension,
             scale: 0.007,
             phase: 0.1
         ),
-        [benchmarkBatchSize, benchmarkKVHeadCount, options.contextTokens, options.headDimension]
+        [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
     )
     let valuesArray = MLXArray(
         values(
-            count: benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
+            count: options.batchSize * options.kvHeadCount * options.contextTokens
                 * options.headDimension,
             scale: 0.009,
             phase: 0.2
         ),
-        [benchmarkBatchSize, benchmarkKVHeadCount, options.contextTokens, options.headDimension]
+        [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
     )
 
     let (encodeSeconds, codes) = try timedValue(
@@ -807,7 +820,7 @@ private func corePathDecision(
 ) -> TurboQuantAttentionDecision {
     let request = TurboQuantAttentionRequest(
         queryShape: [
-            benchmarkBatchSize, benchmarkQueryHeadCount, options.queryLength, options.headDimension,
+            options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension,
         ],
         keyLayout: symbolicAttentionLayout(options: options, role: .key),
         valueLayout: symbolicAttentionLayout(options: options, role: .value),
@@ -849,6 +862,10 @@ private func corePathDecision(
 }
 
 private func validateCoreBenchmarkOptions(_ options: BenchmarkOptions) throws {
+    guard options.queryHeadCount % options.kvHeadCount == 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "query heads must be a multiple of KV heads")
+    }
     if options.scaleStorage == .float16 {
         guard options.layoutVersion == TurboQuantAttentionLayout.currentVersion
         else {
@@ -881,7 +898,7 @@ private func symbolicAttentionLayout(
 ) -> TurboQuantAttentionLayout {
     let groupsPerVector = ceilDivide(options.headDimension, by: options.groupSize)
     let logicalValues =
-        benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens * options.headDimension
+        options.batchSize * options.kvHeadCount * options.contextTokens * options.headDimension
     let estimate = estimateTurboQuantStorage(
         role: role,
         logicalValues: logicalValues,
@@ -891,7 +908,8 @@ private func symbolicAttentionLayout(
         dtype: .float32,
         scaleStorage: options.scaleStorage
     )
-    let groupCount = benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
+    let groupCount =
+        options.batchSize * options.kvHeadCount * options.contextTokens
         * groupsPerVector
     let magnitudeWordsPerGroup = max(
         1,
@@ -900,8 +918,8 @@ private func symbolicAttentionLayout(
 
     return TurboQuantAttentionLayout(
         layoutVersion: options.layoutVersion,
-        batchSize: benchmarkBatchSize,
-        kvHeadCount: benchmarkKVHeadCount,
+        batchSize: options.batchSize,
+        kvHeadCount: options.kvHeadCount,
         capacity: options.contextTokens,
         logicalLength: options.contextTokens,
         headDimension: options.headDimension,
@@ -911,9 +929,11 @@ private func symbolicAttentionLayout(
     )
 }
 
-private func symbolicAggregateStorageEstimate(options: BenchmarkOptions) -> TurboQuantStorageEstimate {
+private func symbolicAggregateStorageEstimate(options: BenchmarkOptions)
+    -> TurboQuantStorageEstimate
+{
     let logicalValues =
-        benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens * options.headDimension
+        options.batchSize * options.kvHeadCount * options.contextTokens * options.headDimension
     let keyEstimate = estimateTurboQuantStorage(
         role: .key,
         logicalValues: logicalValues,
@@ -1009,9 +1029,9 @@ private func currentGitCommit() -> String? {
     return commit?.isEmpty == false ? commit : nil
 }
 
-private extension TurboQuantAttentionPath {
-    var usesCompressedMetal: Bool {
-    switch self {
+extension TurboQuantAttentionPath {
+    fileprivate var usesCompressedMetal: Bool {
+        switch self {
         case .onlineFused, .tiledOnlineFused, .twoStageCompressed:
             return true
         case .mlxPackedFallback, .baseline, .unavailable:
