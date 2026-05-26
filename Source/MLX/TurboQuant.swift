@@ -6664,6 +6664,7 @@ private enum TurboQuantMetalKernels {
         threadgroup float tile_scores[256];
         threadgroup float tile_weights[256];
         threadgroup uint tile_physical_tokens[256];
+        threadgroup float query_cache[HEAD_DIM];
         threadgroup float output_accum[HEAD_DIM];
 
         float attention_scale = as_type<float>(uint(ATTENTION_SCALE_BITS));
@@ -6678,6 +6679,10 @@ private enum TurboQuantMetalKernels {
         float row_max = -INFINITY;
         float row_sum = 0.0f;
         if (lane < uint(HEAD_DIM)) {
+            uint q_index =
+                (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
+                    * uint(HEAD_DIM)) + lane;
+            query_cache[lane] = float(q[q_index]);
             output_accum[lane] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -6697,11 +6702,7 @@ private enum TurboQuantMetalKernels {
                     uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
                     thread float query_values[GROUP_SIZE];
                     for (uint local = 0u; local < count; local++) {
-                        uint dimension = group_start + local;
-                        uint q_index =
-                            (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
-                                * uint(HEAD_DIM)) + dimension;
-                        query_values[local] = float(q[q_index]);
+                        query_values[local] = query_cache[group_start + local];
                     }
                     score += tq_product_attention_inner_product_group(
                         k_packed, k_signs, k_high_mask, k_scales, query_values,
