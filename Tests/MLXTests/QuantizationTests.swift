@@ -77,6 +77,9 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(TurboQuantPreset.turbo4.effectiveBits, 4)
         XCTAssertEqual(TurboQuantPreset.turbo4v2.defaultValueBits, 4)
         XCTAssertEqual(TurboQuantPreset.turbo4v2.targetMagnitudeBits, 4)
+        XCTAssertEqual(TurboQuantPreset.turbo8.effectiveBits, 8)
+        XCTAssertEqual(TurboQuantPreset.turbo8.defaultValueBits, 8)
+        XCTAssertEqual(TurboQuantPreset.turbo8.targetMagnitudeBits, 8)
     }
 
     func testTurboQuantLinearMatchesDecodedFallbackShape() {
