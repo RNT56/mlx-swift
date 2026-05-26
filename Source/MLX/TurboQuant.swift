@@ -6205,6 +6205,65 @@ private enum TurboQuantMetalKernels {
                 * groups_per_vector + group) * mag_words_per_group + word;
         }
 
+        template <typename PackedPtr>
+        inline uint tq_read_packed_unsigned(
+            PackedPtr packed,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint bit_offset,
+            uint bits,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint packed_word = bit_offset >> 5;
+            uint packed_bit = bit_offset & 31u;
+            uint first = packed[tq_packed_offset(
+                batch, head, token, group, packed_word,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group)] >> packed_bit;
+            if (packed_bit + bits > 32u) {
+                uint next = packed[tq_packed_offset(
+                    batch, head, token, group, packed_word + 1u,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group)];
+                first |= next << (32u - packed_bit);
+            }
+            return first & ((1u << bits) - 1u);
+        }
+
+        template <typename PackedPtr>
+        inline void tq_write_packed_unsigned(
+            PackedPtr packed,
+            uint quantized,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint bit_offset,
+            uint bits,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint packed_word = bit_offset >> 5;
+            uint packed_bit = bit_offset & 31u;
+            uint mask = ((1u << bits) - 1u);
+            uint value = quantized & mask;
+            packed[tq_packed_offset(
+                batch, head, token, group, packed_word,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
+                value << packed_bit;
+            if (packed_bit + bits > 32u) {
+                packed[tq_packed_offset(
+                    batch, head, token, group, packed_word + 1u,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
+                    value >> (32u - packed_bit);
+            }
+        }
+
         inline uint tq_scale_offset(
             uint batch,
             uint head,
@@ -6267,6 +6326,43 @@ private enum TurboQuantMetalKernels {
             return count;
         }
 
+        template <typename HighMaskPtr>
+        inline uint tq_attention_magnitude_bit_offset(
+            HighMaskPtr high_mask,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint local,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint bitset_words_per_group,
+            uint base_bits,
+            uint high_bits,
+            thread uint* bits_out
+        ) {
+            uint bits = base_bits;
+            uint bit_offset = local * base_bits;
+            if (high_bits > base_bits) {
+                uint bitset_word = local >> 5;
+                uint bitset_bit = local & 31u;
+                bool high_precision =
+                    (high_mask[tq_bitset_offset(
+                        batch, head, token, group, bitset_word,
+                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)]
+                        & (1u << bitset_bit)) != 0u;
+                bits = high_precision ? high_bits : base_bits;
+
+                uint high_before = tq_attention_high_count_before(
+                    high_mask, batch, head, token, group, local,
+                    kv_heads, capacity, groups_per_vector, bitset_words_per_group);
+                bit_offset += high_before * (high_bits - base_bits);
+            }
+            *bits_out = bits;
+            return bit_offset;
+        }
+
         template <typename PackedPtr, typename HighMaskPtr>
         inline uint tq_read_magnitude(
             PackedPtr packed,
@@ -6284,33 +6380,14 @@ private enum TurboQuantMetalKernels {
             uint base_bits,
             uint high_bits
         ) {
-            uint bitset_word = local >> 5;
-            uint bitset_bit = local & 31u;
-            bool high_precision =
-                (high_mask[tq_bitset_offset(
-                    batch, head, token, group, bitset_word,
-                    kv_heads, capacity, groups_per_vector, bitset_words_per_group)]
-                    & (1u << bitset_bit)) != 0u;
-            uint bits = high_precision ? high_bits : base_bits;
-
-            uint high_before = tq_attention_high_count_before(
+            uint bits = base_bits;
+            uint bit_offset = tq_attention_magnitude_bit_offset(
                 high_mask, batch, head, token, group, local,
-                kv_heads, capacity, groups_per_vector, bitset_words_per_group);
-            uint bit_offset = local * base_bits + high_before * (high_bits - base_bits);
-
-            uint quantized = 0u;
-            for (uint bit = 0; bit < bits; bit++) {
-                uint global_bit = bit_offset + bit;
-                uint packed_word = global_bit >> 5;
-                uint packed_bit = global_bit & 31u;
-                if ((packed[tq_packed_offset(
-                    batch, head, token, group, packed_word,
-                    kv_heads, capacity, groups_per_vector, mag_words_per_group)]
-                    & (1u << packed_bit)) != 0u) {
-                    quantized |= 1u << bit;
-                }
-            }
-            return quantized;
+                kv_heads, capacity, groups_per_vector, bitset_words_per_group,
+                base_bits, high_bits, &bits);
+            return tq_read_packed_unsigned(
+                packed, batch, head, token, group, bit_offset, bits,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
         }
 
         inline uint tq_storage_group_index(
@@ -6362,18 +6439,9 @@ private enum TurboQuantMetalKernels {
             uint local = dimension - group * group_size;
             if (role == 1u) {
                 uint bit_offset = local * value_bits;
-                uint quantized = 0u;
-                for (uint bit = 0; bit < value_bits; bit++) {
-                    uint global_bit = bit_offset + bit;
-                    uint packed_word = global_bit >> 5;
-                    uint packed_bit = global_bit & 31u;
-                    if ((packed[tq_packed_offset(
-                        batch, head, token, group, packed_word,
-                        kv_heads, capacity, groups_per_vector, mag_words_per_group)]
-                        & (1u << packed_bit)) != 0u) {
-                        quantized |= 1u << bit;
-                    }
-                }
+                uint quantized = tq_read_packed_unsigned(
+                    packed, batch, head, token, group, bit_offset, value_bits,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group);
                 uint scale_base = ((((batch * kv_heads + head) * capacity + token)
                     * groups_per_vector + group) * 2u);
                 return scales[scale_base + 1u] + float(quantized) * scales[scale_base];
@@ -6384,19 +6452,14 @@ private enum TurboQuantMetalKernels {
             uint storage_group = tq_storage_group_index(
                 batch, head, token, group, kv_heads, capacity, groups_per_vector);
             for (uint decode_local = 0u; decode_local < count; decode_local++) {
-                uint bitset_word = decode_local >> 5;
-                uint bitset_bit = decode_local & 31u;
-                bool high_precision =
-                    (high_mask[tq_bitset_offset(
-                        batch, head, token, group, bitset_word,
-                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)]
-                        & (1u << bitset_bit)) != 0u;
-                uint bits = high_precision ? key_high_bits : key_base_bits;
-                uint code = tq_read_magnitude(
-                    packed, high_mask, batch, head, token, group, decode_local,
-                    kv_heads, capacity, groups_per_vector,
-                    mag_words_per_group, bitset_words_per_group,
-                    key_base_bits, key_high_bits);
+                uint bits = key_base_bits;
+                uint bit_offset = tq_attention_magnitude_bit_offset(
+                    high_mask, batch, head, token, group, decode_local,
+                    kv_heads, capacity, groups_per_vector, bitset_words_per_group,
+                    key_base_bits, key_high_bits, &bits);
+                uint code = tq_read_packed_unsigned(
+                    packed, batch, head, token, group, bit_offset, bits,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group);
                 rotated[decode_local] = tq_codebook_level(bits, code, count);
             }
             tq_apply_product_rotation(rotated, count, seed, storage_group, true);
@@ -6443,16 +6506,14 @@ private enum TurboQuantMetalKernels {
                 uint bitset_word = local >> 5;
                 uint bitset_bit = local & 31u;
                 uint bit_mask = 1u << bitset_bit;
-                bool high_precision =
-                    (high_mask[tq_bitset_offset(
-                        batch, head, token, group, bitset_word,
-                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)] & bit_mask) != 0u;
-                uint bits = high_precision ? key_high_bits : key_base_bits;
-                uint code = tq_read_magnitude(
-                    packed, high_mask, batch, head, token, group, local,
-                    kv_heads, capacity, groups_per_vector,
-                    mag_words_per_group, bitset_words_per_group,
-                    key_base_bits, key_high_bits);
+                uint bits = key_base_bits;
+                uint bit_offset = tq_attention_magnitude_bit_offset(
+                    high_mask, batch, head, token, group, local,
+                    kv_heads, capacity, groups_per_vector, bitset_words_per_group,
+                    key_base_bits, key_high_bits, &bits);
+                uint code = tq_read_packed_unsigned(
+                    packed, batch, head, token, group, bit_offset, bits,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group);
                 quantized_dot += query_values[local] * tq_codebook_level(bits, code, count);
                 float qjl_sign =
                     (signs[tq_bitset_offset(
@@ -6527,15 +6588,9 @@ private enum TurboQuantMetalKernels {
                     ? 0u
                     : uint(clamp(round((value - minimum) / value_scale), 0.0f, value_max));
                 uint bit_offset = local * uint(VALUE_BITS);
-                for (uint packed_bit = 0; packed_bit < uint(VALUE_BITS); packed_bit++) {
-                    if ((quantized & (1u << packed_bit)) != 0u) {
-                        uint global_bit = bit_offset + packed_bit;
-                        uint packed_word = global_bit >> 5;
-                        uint packed_word_bit = global_bit & 31u;
-                        packed[tq_packed_offset(batch, head, token, group, packed_word, kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
-                            1u << packed_word_bit;
-                    }
-                }
+                tq_write_packed_unsigned(
+                    packed, quantized, batch, head, token, group, bit_offset, uint(VALUE_BITS),
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group);
             }
             return;
         }
@@ -6579,9 +6634,12 @@ private enum TurboQuantMetalKernels {
         float residual_squared = 0.0f;
         uint bit_offset = 0u;
         for (uint local = 0; local < count; local++) {
-            bool high_precision = bool(DETERMINISTIC_HIGH_MASK)
-                ? tq_product_high_precision(seed, storage_group, local, count, high_count)
-                : local < high_count;
+            bool high_precision = false;
+            if (uint(KEY_HIGH_BITS) > uint(KEY_BASE_BITS) && high_count > 0u) {
+                high_precision = bool(DETERMINISTIC_HIGH_MASK)
+                    ? tq_product_high_precision(seed, storage_group, local, count, high_count)
+                    : local < high_count;
+            }
             uint bits = high_precision ? uint(KEY_HIGH_BITS) : uint(KEY_BASE_BITS);
             uint quantized = tq_nearest_codebook_index(values[local], bits, count);
             float reconstructed = tq_codebook_level(bits, quantized, count);
@@ -6598,15 +6656,9 @@ private enum TurboQuantMetalKernels {
                 signs[tq_bitset_offset(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, bitset_words_per_group)] |= mask;
             }
 
-            for (uint packed_bit = 0; packed_bit < bits; packed_bit++) {
-                if ((quantized & (1u << packed_bit)) != 0u) {
-                    uint global_bit = bit_offset + packed_bit;
-                    uint packed_word = global_bit >> 5;
-                    uint packed_word_bit = global_bit & 31u;
-                    packed[tq_packed_offset(batch, head, token, group, packed_word, kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
-                        1u << packed_word_bit;
-                }
-            }
+            tq_write_packed_unsigned(
+                packed, quantized, batch, head, token, group, bit_offset, bits,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
             bit_offset += bits;
         }
         scales[tq_scale_offset(batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)] =
