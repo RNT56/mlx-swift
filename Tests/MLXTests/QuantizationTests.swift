@@ -1096,6 +1096,37 @@ class QuantizationTests: XCTestCase {
         }
     }
 
+    func testTurboQuantMetalTurbo8KeyCodecMatchesReferenceWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
+            throw XCTSkip("Metal runtime unavailable")
+        }
+
+        let values = (0 ..< 192).map { index in
+            let position = Double(index)
+            return Float(
+                0.39 * sin(position * 0.031)
+                    + 0.27 * cos(position * 0.083)
+                    + 0.11 * sin(position * 0.173)
+            )
+        }
+        let x = MLXArray(values, [3, 64])
+        let configuration = TurboQuantConfiguration(
+            preset: .turbo8,
+            role: .key,
+            groupSize: 64,
+            backend: .metalPolarQJL,
+            seed: 0xD1CE_0000_0000_0008
+        )
+
+        let metalCode = try turboQuantMetalEncode(x, configuration: configuration)
+        let referenceCode = try turboQuantReferenceEncode(x, configuration: configuration)
+        let metalDecoded = try turboQuantMetalDecode(metalCode).asArray(Float.self)
+        let referenceDecoded = try turboQuantReferenceDecode(referenceCode).asArray(Float.self)
+
+        XCTAssertEqual(metalCode.magnitudeWordsPerGroup, 14)
+        XCTAssertLessThan(relativeMSE(referenceDecoded, metalDecoded), 1e-6)
+    }
+
     func testTurboQuantMetalCodecUsesCompactUnusedBitsetsWhenAvailable() throws {
         guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
             throw XCTSkip("Metal runtime unavailable")
@@ -1237,6 +1268,58 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(columnOutput.shape, [3, 5])
         XCTAssertTrue(
             allClose(columnOutput, columnReference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+    }
+
+    func testTurboQuantMetalTurbo8MatmulMatchesReferenceWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLCodec else {
+            throw XCTSkip("Metal runtime unavailable")
+        }
+
+        let xValues = (0 ..< 192).map { index in
+            let position = Double(index)
+            return Float(0.43 * sin(position * 0.037) + 0.19 * cos(position * 0.113))
+        }
+        let wValues = (0 ..< 320).map { index in
+            let position = Double(index)
+            return Float(
+                0.31 * cos(position * 0.043)
+                    - 0.17 * sin(position * 0.097)
+                    + 0.07 * cos(position * 0.181)
+            )
+        }
+        let x = MLXArray(xValues, [3, 64])
+        let w = MLXArray(wValues, [5, 64])
+        let configuration = TurboQuantConfiguration(
+            preset: .turbo8,
+            role: .key,
+            groupSize: 64,
+            backend: .metalPolarQJL,
+            seed: 0xC0FF_EE00_0000_0008
+        )
+
+        let code = try turboQuantMetalEncode(w, configuration: configuration)
+        let referenceCode = try turboQuantReferenceEncode(w, configuration: configuration)
+        var expectedValues: [Float] = []
+        for row in 0 ..< 3 {
+            for column in 0 ..< 5 {
+                var query = [Float](repeating: 0, count: wValues.count)
+                for k in 0 ..< 64 {
+                    query[column * 64 + k] = xValues[row * 64 + k]
+                }
+                expectedValues.append(
+                    try turboQuantReferenceInnerProduct(
+                        query: MLXArray(query, [5, 64]),
+                        code: referenceCode
+                    )
+                )
+            }
+        }
+        let reference = MLXArray(expectedValues, [3, 5])
+        let output = try turboQuantizedMM(x, code, transpose: true, outputDType: .float32)
+
+        XCTAssertEqual(output.shape, [3, 5])
+        XCTAssertEqual(code.magnitudeWordsPerGroup, 14)
+        XCTAssertTrue(allClose(output, reference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
     }
 
     func testTurboQuantMetalMatmulSupportsBFloat16OutputWhenAvailable() throws {

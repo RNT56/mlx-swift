@@ -5093,6 +5093,142 @@ private enum TurboQuantMetalKernels {
                 default: return 2.175028018f;
                 }
             }
+            if (bits == 5u) {
+                uint clamped = min(code, 31u);
+                uint magnitude_index = clamped < 16u ? clamped : 31u - clamped;
+                float magnitude = 0.0f;
+                switch (magnitude_index) {
+                case 0u: magnitude = 3.167510584f; break;
+                case 1u: magnitude = 2.601080629f; break;
+                case 2u: magnitude = 2.248054067f; break;
+                case 3u: magnitude = 1.990376987f; break;
+                case 4u: magnitude = 1.784481424f; break;
+                case 5u: magnitude = 1.607119170f; break;
+                case 6u: magnitude = 1.444524024f; break;
+                case 7u: magnitude = 1.288831640f; break;
+                case 8u: magnitude = 1.135990256f; break;
+                case 9u: magnitude = 0.984174410f; break;
+                case 10u: magnitude = 0.832676140f; break;
+                case 11u: magnitude = 0.681261776f; break;
+                case 12u: magnitude = 0.529866428f; break;
+                case 13u: magnitude = 0.378475081f; break;
+                case 14u: magnitude = 0.227084777f; break;
+                default: magnitude = 0.075694884f; break;
+                }
+                return clamped < 16u ? -magnitude : magnitude;
+            }
+            if (bits == 6u) {
+                uint clamped = min(code, 63u);
+                uint magnitude_index = clamped < 32u ? clamped : 63u - clamped;
+                float magnitude = 0.0f;
+                switch (magnitude_index) {
+                case 0u: magnitude = 3.370567258f; break;
+                case 1u: magnitude = 2.846634435f; break;
+                case 2u: magnitude = 2.539498403f; break;
+                case 3u: magnitude = 2.334801410f; break;
+                case 4u: magnitude = 2.189068534f; break;
+                case 5u: magnitude = 2.077692738f; break;
+                case 6u: magnitude = 1.985038395f; break;
+                case 7u: magnitude = 1.901543224f; break;
+                case 8u: magnitude = 1.821977755f; break;
+                case 9u: magnitude = 1.743867835f; break;
+                case 10u: magnitude = 1.666217206f; break;
+                case 11u: magnitude = 1.588688278f; break;
+                case 12u: magnitude = 1.511185949f; break;
+                case 13u: magnitude = 1.433688315f; break;
+                case 14u: magnitude = 1.356191352f; break;
+                case 15u: magnitude = 1.278694490f; break;
+                case 16u: magnitude = 1.201197668f; break;
+                case 17u: magnitude = 1.123700882f; break;
+                case 18u: magnitude = 1.046204128f; break;
+                case 19u: magnitude = 0.968707404f; break;
+                case 20u: magnitude = 0.891210709f; break;
+                case 21u: magnitude = 0.813714039f; break;
+                case 22u: magnitude = 0.736217393f; break;
+                case 23u: magnitude = 0.658720768f; break;
+                case 24u: magnitude = 0.581224162f; break;
+                case 25u: magnitude = 0.503727573f; break;
+                case 26u: magnitude = 0.426230999f; break;
+                case 27u: magnitude = 0.348734437f; break;
+                case 28u: magnitude = 0.271237885f; break;
+                case 29u: magnitude = 0.193741341f; break;
+                case 30u: magnitude = 0.116244802f; break;
+                default: magnitude = 0.038748267f; break;
+                }
+                return clamped < 32u ? -magnitude : magnitude;
+            }
+            if (bits >= 7u) {
+                uint clamped = min(code, 127u);
+                uint magnitude_index = clamped < 64u ? clamped : 127u - clamped;
+                float magnitude = 0.0f;
+                switch (magnitude_index) {
+                case 0u: magnitude = 3.471692079f; break;
+                case 1u: magnitude = 2.967922351f; break;
+                case 2u: magnitude = 2.682760472f; break;
+                case 3u: magnitude = 2.503778860f; break;
+                case 4u: magnitude = 2.387735667f; break;
+                case 5u: magnitude = 2.309487569f; break;
+                case 6u: magnitude = 2.252475440f; break;
+                case 7u: magnitude = 2.206174364f; break;
+                case 8u: magnitude = 2.164605881f; break;
+                case 9u: magnitude = 2.124839178f; break;
+                case 10u: magnitude = 2.085655475f; break;
+                case 11u: magnitude = 2.046629763f; break;
+                case 12u: magnitude = 2.007639247f; break;
+                case 13u: magnitude = 1.968655011f; break;
+                case 14u: magnitude = 1.929671639f; break;
+                case 15u: magnitude = 1.890688353f; break;
+                case 16u: magnitude = 1.851705074f; break;
+                case 17u: magnitude = 1.812721796f; break;
+                case 18u: magnitude = 1.773738519f; break;
+                case 19u: magnitude = 1.734755243f; break;
+                case 20u: magnitude = 1.695771967f; break;
+                case 21u: magnitude = 1.656788693f; break;
+                case 22u: magnitude = 1.617805419f; break;
+                case 23u: magnitude = 1.578822145f; break;
+                case 24u: magnitude = 1.539838873f; break;
+                case 25u: magnitude = 1.500855601f; break;
+                case 26u: magnitude = 1.461872330f; break;
+                case 27u: magnitude = 1.422889060f; break;
+                case 28u: magnitude = 1.383905790f; break;
+                case 29u: magnitude = 1.344922521f; break;
+                case 30u: magnitude = 1.305939253f; break;
+                case 31u: magnitude = 1.266955985f; break;
+                case 32u: magnitude = 1.227972718f; break;
+                case 33u: magnitude = 1.188989451f; break;
+                case 34u: magnitude = 1.150006185f; break;
+                case 35u: magnitude = 1.111022919f; break;
+                case 36u: magnitude = 1.072039654f; break;
+                case 37u: magnitude = 1.033056390f; break;
+                case 38u: magnitude = 0.994073126f; break;
+                case 39u: magnitude = 0.955089862f; break;
+                case 40u: magnitude = 0.916106599f; break;
+                case 41u: magnitude = 0.877123336f; break;
+                case 42u: magnitude = 0.838140074f; break;
+                case 43u: magnitude = 0.799156812f; break;
+                case 44u: magnitude = 0.760173551f; break;
+                case 45u: magnitude = 0.721190290f; break;
+                case 46u: magnitude = 0.682207029f; break;
+                case 47u: magnitude = 0.643223768f; break;
+                case 48u: magnitude = 0.604240508f; break;
+                case 49u: magnitude = 0.565257248f; break;
+                case 50u: magnitude = 0.526273989f; break;
+                case 51u: magnitude = 0.487290729f; break;
+                case 52u: magnitude = 0.448307470f; break;
+                case 53u: magnitude = 0.409324211f; break;
+                case 54u: magnitude = 0.370340952f; break;
+                case 55u: magnitude = 0.331357694f; break;
+                case 56u: magnitude = 0.292374435f; break;
+                case 57u: magnitude = 0.253391177f; break;
+                case 58u: magnitude = 0.214407919f; break;
+                case 59u: magnitude = 0.175424661f; break;
+                case 60u: magnitude = 0.136441403f; break;
+                case 61u: magnitude = 0.097458145f; break;
+                case 62u: magnitude = 0.058474887f; break;
+                default: magnitude = 0.019491629f; break;
+                }
+                return clamped < 64u ? -magnitude : magnitude;
+            }
             switch (min(code, 15u)) {
             case 0u: return -2.778927695f;
             case 1u: return -2.124836923f;
@@ -5711,6 +5847,142 @@ private enum TurboQuantMetalKernels {
                 case 6u: return 1.367204388f;
                 default: return 2.175028018f;
                 }
+            }
+            if (bits == 5u) {
+                uint clamped = min(code, 31u);
+                uint magnitude_index = clamped < 16u ? clamped : 31u - clamped;
+                float magnitude = 0.0f;
+                switch (magnitude_index) {
+                case 0u: magnitude = 3.167510584f; break;
+                case 1u: magnitude = 2.601080629f; break;
+                case 2u: magnitude = 2.248054067f; break;
+                case 3u: magnitude = 1.990376987f; break;
+                case 4u: magnitude = 1.784481424f; break;
+                case 5u: magnitude = 1.607119170f; break;
+                case 6u: magnitude = 1.444524024f; break;
+                case 7u: magnitude = 1.288831640f; break;
+                case 8u: magnitude = 1.135990256f; break;
+                case 9u: magnitude = 0.984174410f; break;
+                case 10u: magnitude = 0.832676140f; break;
+                case 11u: magnitude = 0.681261776f; break;
+                case 12u: magnitude = 0.529866428f; break;
+                case 13u: magnitude = 0.378475081f; break;
+                case 14u: magnitude = 0.227084777f; break;
+                default: magnitude = 0.075694884f; break;
+                }
+                return clamped < 16u ? -magnitude : magnitude;
+            }
+            if (bits == 6u) {
+                uint clamped = min(code, 63u);
+                uint magnitude_index = clamped < 32u ? clamped : 63u - clamped;
+                float magnitude = 0.0f;
+                switch (magnitude_index) {
+                case 0u: magnitude = 3.370567258f; break;
+                case 1u: magnitude = 2.846634435f; break;
+                case 2u: magnitude = 2.539498403f; break;
+                case 3u: magnitude = 2.334801410f; break;
+                case 4u: magnitude = 2.189068534f; break;
+                case 5u: magnitude = 2.077692738f; break;
+                case 6u: magnitude = 1.985038395f; break;
+                case 7u: magnitude = 1.901543224f; break;
+                case 8u: magnitude = 1.821977755f; break;
+                case 9u: magnitude = 1.743867835f; break;
+                case 10u: magnitude = 1.666217206f; break;
+                case 11u: magnitude = 1.588688278f; break;
+                case 12u: magnitude = 1.511185949f; break;
+                case 13u: magnitude = 1.433688315f; break;
+                case 14u: magnitude = 1.356191352f; break;
+                case 15u: magnitude = 1.278694490f; break;
+                case 16u: magnitude = 1.201197668f; break;
+                case 17u: magnitude = 1.123700882f; break;
+                case 18u: magnitude = 1.046204128f; break;
+                case 19u: magnitude = 0.968707404f; break;
+                case 20u: magnitude = 0.891210709f; break;
+                case 21u: magnitude = 0.813714039f; break;
+                case 22u: magnitude = 0.736217393f; break;
+                case 23u: magnitude = 0.658720768f; break;
+                case 24u: magnitude = 0.581224162f; break;
+                case 25u: magnitude = 0.503727573f; break;
+                case 26u: magnitude = 0.426230999f; break;
+                case 27u: magnitude = 0.348734437f; break;
+                case 28u: magnitude = 0.271237885f; break;
+                case 29u: magnitude = 0.193741341f; break;
+                case 30u: magnitude = 0.116244802f; break;
+                default: magnitude = 0.038748267f; break;
+                }
+                return clamped < 32u ? -magnitude : magnitude;
+            }
+            if (bits >= 7u) {
+                uint clamped = min(code, 127u);
+                uint magnitude_index = clamped < 64u ? clamped : 127u - clamped;
+                float magnitude = 0.0f;
+                switch (magnitude_index) {
+                case 0u: magnitude = 3.471692079f; break;
+                case 1u: magnitude = 2.967922351f; break;
+                case 2u: magnitude = 2.682760472f; break;
+                case 3u: magnitude = 2.503778860f; break;
+                case 4u: magnitude = 2.387735667f; break;
+                case 5u: magnitude = 2.309487569f; break;
+                case 6u: magnitude = 2.252475440f; break;
+                case 7u: magnitude = 2.206174364f; break;
+                case 8u: magnitude = 2.164605881f; break;
+                case 9u: magnitude = 2.124839178f; break;
+                case 10u: magnitude = 2.085655475f; break;
+                case 11u: magnitude = 2.046629763f; break;
+                case 12u: magnitude = 2.007639247f; break;
+                case 13u: magnitude = 1.968655011f; break;
+                case 14u: magnitude = 1.929671639f; break;
+                case 15u: magnitude = 1.890688353f; break;
+                case 16u: magnitude = 1.851705074f; break;
+                case 17u: magnitude = 1.812721796f; break;
+                case 18u: magnitude = 1.773738519f; break;
+                case 19u: magnitude = 1.734755243f; break;
+                case 20u: magnitude = 1.695771967f; break;
+                case 21u: magnitude = 1.656788693f; break;
+                case 22u: magnitude = 1.617805419f; break;
+                case 23u: magnitude = 1.578822145f; break;
+                case 24u: magnitude = 1.539838873f; break;
+                case 25u: magnitude = 1.500855601f; break;
+                case 26u: magnitude = 1.461872330f; break;
+                case 27u: magnitude = 1.422889060f; break;
+                case 28u: magnitude = 1.383905790f; break;
+                case 29u: magnitude = 1.344922521f; break;
+                case 30u: magnitude = 1.305939253f; break;
+                case 31u: magnitude = 1.266955985f; break;
+                case 32u: magnitude = 1.227972718f; break;
+                case 33u: magnitude = 1.188989451f; break;
+                case 34u: magnitude = 1.150006185f; break;
+                case 35u: magnitude = 1.111022919f; break;
+                case 36u: magnitude = 1.072039654f; break;
+                case 37u: magnitude = 1.033056390f; break;
+                case 38u: magnitude = 0.994073126f; break;
+                case 39u: magnitude = 0.955089862f; break;
+                case 40u: magnitude = 0.916106599f; break;
+                case 41u: magnitude = 0.877123336f; break;
+                case 42u: magnitude = 0.838140074f; break;
+                case 43u: magnitude = 0.799156812f; break;
+                case 44u: magnitude = 0.760173551f; break;
+                case 45u: magnitude = 0.721190290f; break;
+                case 46u: magnitude = 0.682207029f; break;
+                case 47u: magnitude = 0.643223768f; break;
+                case 48u: magnitude = 0.604240508f; break;
+                case 49u: magnitude = 0.565257248f; break;
+                case 50u: magnitude = 0.526273989f; break;
+                case 51u: magnitude = 0.487290729f; break;
+                case 52u: magnitude = 0.448307470f; break;
+                case 53u: magnitude = 0.409324211f; break;
+                case 54u: magnitude = 0.370340952f; break;
+                case 55u: magnitude = 0.331357694f; break;
+                case 56u: magnitude = 0.292374435f; break;
+                case 57u: magnitude = 0.253391177f; break;
+                case 58u: magnitude = 0.214407919f; break;
+                case 59u: magnitude = 0.175424661f; break;
+                case 60u: magnitude = 0.136441403f; break;
+                case 61u: magnitude = 0.097458145f; break;
+                case 62u: magnitude = 0.058474887f; break;
+                default: magnitude = 0.019491629f; break;
+                }
+                return clamped < 64u ? -magnitude : magnitude;
             }
             switch (min(code, 15u)) {
             case 0u: return -2.778927695f;
