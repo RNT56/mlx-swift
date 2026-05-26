@@ -2147,8 +2147,11 @@ public func turboQuantMetalDecodeAttention(
             code.highPrecisionMask,
             code.residualSigns,
             code.scales,
+            Int32(code.layout.logicalLength),
+            Int32(code.layout.ringOffset),
+            Int32(code.layout.pinnedPrefixLength),
         ],
-        template: attentionTemplate(
+        template: runtimeLayoutAttentionTemplate(
             configuration: TurboQuantConfiguration(
                 preset: code.preset,
                 role: code.role,
@@ -2208,8 +2211,12 @@ public func turboQuantMetalQK(
             keyCode.highPrecisionMask,
             keyCode.residualSigns,
             keyCode.scales,
+            Int32(keyCode.layout.logicalLength),
+            Int32(keyCode.layout.ringOffset),
+            Int32(keyCode.layout.pinnedPrefixLength),
+            scale,
         ],
-        template: attentionTemplate(
+        template: runtimeLayoutAttentionTemplate(
             configuration: TurboQuantConfiguration(
                 preset: keyCode.preset,
                 role: keyCode.role,
@@ -2228,7 +2235,7 @@ public func turboQuantMetalQK(
             queryLength: queries.dim(2),
             outputDType: .float32,
             causal: false
-        ) + [("ATTENTION_SCALE_BITS", scale.bitPattern)],
+        ),
         grid: (elementCount, 1, 1),
         threadGroup: (Swift.max(1, Swift.min(elementCount, 256)), 1, 1),
         outputShapes: [outputShape],
@@ -2286,8 +2293,11 @@ public func turboQuantMetalAV(
             valueCode.highPrecisionMask,
             valueCode.residualSigns,
             valueCode.scales,
+            Int32(valueCode.layout.logicalLength),
+            Int32(valueCode.layout.ringOffset),
+            Int32(valueCode.layout.pinnedPrefixLength),
         ],
-        template: attentionTemplate(
+        template: runtimeLayoutAttentionTemplate(
             configuration: TurboQuantConfiguration(
                 preset: valueCode.preset,
                 role: valueCode.role,
@@ -2565,8 +2575,12 @@ private func turboQuantMetalOnlineFusedAttention(
             valueCode.highPrecisionMask,
             valueCode.residualSigns,
             valueCode.scales,
+            Int32(keyCode.layout.logicalLength),
+            Int32(keyCode.layout.ringOffset),
+            Int32(keyCode.layout.pinnedPrefixLength),
+            scale,
         ],
-        template: attentionTemplate(
+        template: runtimeLayoutAttentionTemplate(
             configuration: TurboQuantConfiguration(
                 preset: keyCode.preset,
                 role: .key,
@@ -2588,7 +2602,6 @@ private func turboQuantMetalOnlineFusedAttention(
         ) + [
             ("VALUE_MAG_WORDS_PER_GROUP", valueCode.layout.magnitudeWordsPerGroup),
             ("VALUE_SCALES_PER_GROUP", valueCode.scalesPerGroup),
-            ("ATTENTION_SCALE_BITS", scale.bitPattern),
             ("THREADS_PER_ROW", threadgroupWidth),
         ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed),
         grid: (rowCount * threadgroupWidth, 1, 1),
@@ -4935,6 +4948,36 @@ private func attentionTemplate(
     ] + metalTemplateSeedWords(prefix: "SEED", value: configuration.seed)
 }
 
+private let runtimeLayoutTemplateKeys: Set<String> = [
+    "INPUT_LENGTH",
+    "OUTPUT_LENGTH",
+    "LOGICAL_LENGTH",
+    "RING_OFFSET",
+    "PINNED_PREFIX_LENGTH",
+]
+
+private func runtimeLayoutAttentionTemplate(
+    configuration: TurboQuantConfiguration,
+    layout: TurboQuantAttentionLayout,
+    inputLength: Int,
+    outputLength: Int,
+    queryHeadCount: Int,
+    queryLength: Int,
+    outputDType: DType,
+    causal: Bool
+) -> [(String, any KernelTemplateArg)] {
+    attentionTemplate(
+        configuration: configuration,
+        layout: layout,
+        inputLength: inputLength,
+        outputLength: outputLength,
+        queryHeadCount: queryHeadCount,
+        queryLength: queryLength,
+        outputDType: outputDType,
+        causal: causal
+    ).filter { !runtimeLayoutTemplateKeys.contains($0.0) }
+}
+
 private enum TurboQuantMetalKernels {
     static let encode = MLXFast.metalKernel(
         name: "turboquant_polar_qjl_encode",
@@ -4970,8 +5013,13 @@ private enum TurboQuantMetalKernels {
     )
 
     static let decodeAttention = MLXFast.metalKernel(
-        name: "turboquant_attention_decode",
-        inputNames: ["packed", "signs", "high_mask", "residual_signs", "scales"],
+        name: "turboquant_attention_decode_runtime_layout",
+        inputNames: [
+            "packed", "signs", "high_mask", "residual_signs", "scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+        ],
         outputNames: ["out"],
         source: decodeAttentionSource,
         header: attentionHeader,
@@ -4979,8 +5027,14 @@ private enum TurboQuantMetalKernels {
     )
 
     static let qk = MLXFast.metalKernel(
-        name: "turboquant_attention_qk",
-        inputNames: ["q", "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales"],
+        name: "turboquant_attention_qk_runtime_layout",
+        inputNames: [
+            "q", "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
+        ],
         outputNames: ["scores"],
         source: qkSource,
         header: attentionHeader,
@@ -4988,9 +5042,12 @@ private enum TurboQuantMetalKernels {
     )
 
     static let av = MLXFast.metalKernel(
-        name: "turboquant_attention_av",
+        name: "turboquant_attention_av_runtime_layout",
         inputNames: [
             "weights", "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
         ],
         outputNames: ["out"],
         source: avSource,
@@ -4999,11 +5056,15 @@ private enum TurboQuantMetalKernels {
     )
 
     static let fusedAttention = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_decode",
+        name: "turboquant_attention_fused_decode_runtime_layout",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
             "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
         ],
         outputNames: ["out"],
         source: fusedAttentionSource,
@@ -6554,20 +6615,23 @@ private enum TurboQuantMetalKernels {
 
     private static let qkSource = """
         uint index = thread_position_in_grid.x;
-        uint total = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH) * uint(LOGICAL_LENGTH);
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        uint total = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH) * logical_length;
         if (index >= total) {
             return;
         }
 
-        float attention_scale = as_type<float>(uint(ATTENTION_SCALE_BITS));
-        uint logical_token = index % uint(LOGICAL_LENGTH);
-        uint q_token = (index / uint(LOGICAL_LENGTH)) % uint(QUERY_LENGTH);
-        uint q_head = (index / (uint(LOGICAL_LENGTH) * uint(QUERY_LENGTH))) % uint(QUERY_HEADS);
-        uint batch = index / (uint(LOGICAL_LENGTH) * uint(QUERY_LENGTH) * uint(QUERY_HEADS));
+        float attention_scale = float(runtime_attention_scale);
+        uint logical_token = index % logical_length;
+        uint q_token = (index / logical_length) % uint(QUERY_LENGTH);
+        uint q_head = (index / (logical_length * uint(QUERY_LENGTH))) % uint(QUERY_HEADS);
+        uint batch = index / (logical_length * uint(QUERY_LENGTH) * uint(QUERY_HEADS));
         uint repeats = uint(QUERY_HEADS) / uint(KV_HEADS);
         uint kv_head = q_head / repeats;
         uint physical_token = tq_physical_token(
-            logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
+            logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
 
         float sum = 0.0f;
         ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
@@ -6594,17 +6658,20 @@ private enum TurboQuantMetalKernels {
 
     private static let decodeAttentionSource = """
         uint index = thread_position_in_grid.x;
-        uint total = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(LOGICAL_LENGTH) * uint(HEAD_DIM);
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        uint total = uint(BATCH_SIZE) * uint(KV_HEADS) * logical_length * uint(HEAD_DIM);
         if (index >= total) {
             return;
         }
 
         uint dimension = index % uint(HEAD_DIM);
-        uint logical_token = (index / uint(HEAD_DIM)) % uint(LOGICAL_LENGTH);
-        uint head = (index / (uint(HEAD_DIM) * uint(LOGICAL_LENGTH))) % uint(KV_HEADS);
-        uint batch = index / (uint(HEAD_DIM) * uint(LOGICAL_LENGTH) * uint(KV_HEADS));
+        uint logical_token = (index / uint(HEAD_DIM)) % logical_length;
+        uint head = (index / (uint(HEAD_DIM) * logical_length)) % uint(KV_HEADS);
+        uint batch = index / (uint(HEAD_DIM) * logical_length * uint(KV_HEADS));
         uint physical_token = tq_physical_token(
-            logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
+            logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
         thread float decode_scratch[GROUP_SIZE];
         out[index] = static_cast<OUTPUT_DTYPE>(tq_decode_attention_value(
             packed, signs, high_mask, residual_signs, scales,
@@ -6619,6 +6686,9 @@ private enum TurboQuantMetalKernels {
     private static let avSource = """
         uint index = thread_position_in_grid.x;
         uint total = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH) * uint(HEAD_DIM);
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
         if (index >= total) {
             return;
         }
@@ -6632,12 +6702,12 @@ private enum TurboQuantMetalKernels {
 
         float sum = 0.0f;
         thread float decode_scratch[GROUP_SIZE];
-        for (uint logical_token = 0; logical_token < uint(LOGICAL_LENGTH); logical_token++) {
+        for (uint logical_token = 0; logical_token < logical_length; logical_token++) {
             uint physical_token = tq_physical_token(
-                logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
+                logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
             uint weight_index =
                 (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
-                    * uint(LOGICAL_LENGTH)) + logical_token;
+                    * logical_length) + logical_token;
             float value = tq_decode_attention_value(
                 v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
                 batch, kv_head, physical_token, dimension,
@@ -6667,13 +6737,16 @@ private enum TurboQuantMetalKernels {
         threadgroup float query_cache[HEAD_DIM];
         threadgroup float output_accum[HEAD_DIM];
 
-        float attention_scale = as_type<float>(uint(ATTENTION_SCALE_BITS));
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        float attention_scale = float(runtime_attention_scale);
         uint q_token = row % uint(QUERY_LENGTH);
         uint q_head = (row / uint(QUERY_LENGTH)) % uint(QUERY_HEADS);
         uint batch = row / (uint(QUERY_LENGTH) * uint(QUERY_HEADS));
         uint repeats = uint(QUERY_HEADS) / uint(KV_HEADS);
         uint kv_head = q_head / repeats;
-        uint causal_limit = uint(LOGICAL_LENGTH) - uint(QUERY_LENGTH) + q_token;
+        uint causal_limit = logical_length - uint(QUERY_LENGTH) + q_token;
         ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
 
         float row_max = -INFINITY;
@@ -6687,15 +6760,15 @@ private enum TurboQuantMetalKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint tile_start = 0u; tile_start < uint(LOGICAL_LENGTH); tile_start += threads_per_row) {
+        for (uint tile_start = 0u; tile_start < logical_length; tile_start += threads_per_row) {
             uint logical_token = tile_start + lane;
-            bool active = logical_token < uint(LOGICAL_LENGTH)
+            bool active = logical_token < logical_length
                 && (!DO_CAUSAL || logical_token <= causal_limit);
             float scaled_score = -INFINITY;
             uint physical_token = 0u;
             if (active) {
                 physical_token = tq_physical_token(
-                    logical_token, uint(CAPACITY), uint(RING_OFFSET), uint(PINNED_PREFIX_LENGTH));
+                    logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
                 float score = 0.0f;
                 for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
                     uint group_start = group * uint(GROUP_SIZE);
