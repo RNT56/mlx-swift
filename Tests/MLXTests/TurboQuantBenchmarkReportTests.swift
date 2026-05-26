@@ -119,6 +119,7 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
         XCTAssertEqual(audit.status, .pass)
         XCTAssertTrue(kernelNames.contains("layout V5 fp16 scales"))
         XCTAssertTrue(kernelNames.contains("block-parallel fused"))
+        XCTAssertTrue(kernelNames.contains("GQA block-parallel fused"))
         XCTAssertTrue(audit.notes.contains { $0.contains("Layout V5") })
     }
 

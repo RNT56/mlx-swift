@@ -215,6 +215,13 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
                 mitigation: "block partial kernels consume canonical compressed K/V arrays and emit bounded per-block partials, not decoded cache copies",
                 status: "guarded"
             ),
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "GQA block-parallel fused",
+                largeInput: "compressed K/V cache shared by grouped query heads",
+                copyRisk: "high",
+                mitigation: "Mac-gated grouped-query block partial kernels reuse compressed K/V reads across Qwen query-head pairs without materializing decoded cache copies",
+                status: "guarded"
+            ),
         ],
         notes: currentW3.notes + [
             "Layout V5 is the default write layout; V4 remains supported for compatibility comparisons.",
