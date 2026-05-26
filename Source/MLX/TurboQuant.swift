@@ -175,6 +175,7 @@ public enum TurboQuantKernelProfile: String, Codable, Sendable, CaseIterable {
     case portableA16A17
     case wideA18A19
     case sustainedA19Pro
+    case macAppleSilicon
     case mlxPackedFallback
 
     public var displayName: String {
@@ -185,6 +186,8 @@ public enum TurboQuantKernelProfile: String, Codable, Sendable, CaseIterable {
             "Wide A18/A19"
         case .sustainedA19Pro:
             "Sustained A19 Pro"
+        case .macAppleSilicon:
+            "Mac Apple Silicon"
         case .mlxPackedFallback:
             "MLX packed fallback"
         }
@@ -194,7 +197,18 @@ public enum TurboQuantKernelProfile: String, Codable, Sendable, CaseIterable {
         switch self {
         case .portableA16A17:
             128
-        case .wideA18A19, .sustainedA19Pro:
+        case .wideA18A19, .sustainedA19Pro, .macAppleSilicon:
+            256
+        case .mlxPackedFallback:
+            128
+        }
+    }
+
+    var blockParallelFusedTokenBlockSize: Int {
+        switch self {
+        case .macAppleSilicon:
+            512
+        case .portableA16A17, .wideA18A19, .sustainedA19Pro:
             256
         case .mlxPackedFallback:
             128
@@ -225,6 +239,15 @@ private func turboQuantOnlineFusedThreadgroupWidth(minimum: Int) -> Int {
     return width
 }
 
+private func turboQuantBlockParallelFusedThreadgroupWidth(minimum: Int) -> Int {
+    let target = max(1, min(512, minimum))
+    var width = 1
+    while width < target {
+        width <<= 1
+    }
+    return width
+}
+
 public enum TurboQuantRuntimeSelfTestStatus: String, Codable, Sendable, CaseIterable {
     case notRun
     case passed
@@ -239,7 +262,7 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         switch profile {
         case .portableA16A17:
             return [64, 80, 96, 128]
-        case .wideA18A19, .sustainedA19Pro:
+        case .wideA18A19, .sustainedA19Pro, .macAppleSilicon:
             return throughputOptimizedOnlineFusedHeadDimensions
         case .mlxPackedFallback:
             return []
@@ -2562,6 +2585,24 @@ private func turboQuantMetalOnlineFusedAttention(
         )
     }
 
+    if turboQuantShouldUseBlockParallelFusedAttention(
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        kernelProfile: kernelProfile
+    ) {
+        return try turboQuantMetalBlockParallelFusedAttention(
+            queries: queries,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: scale,
+            kernelProfile: kernelProfile,
+            outputDType: outputDType,
+            causal: causal,
+            stream: stream
+        )
+    }
+
     return TurboQuantMetalKernels.fusedAttention(
         [
             queries,
@@ -2606,6 +2647,120 @@ private func turboQuantMetalOnlineFusedAttention(
         ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed),
         grid: (rowCount * threadgroupWidth, 1, 1),
         threadGroup: (threadgroupWidth, 1, 1),
+        outputShapes: [outputShape],
+        outputDTypes: [outputDType],
+        stream: stream
+    )[0]
+}
+
+private func turboQuantShouldUseBlockParallelFusedAttention(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    kernelProfile: TurboQuantKernelProfile
+) -> Bool {
+    guard queries.dim(2) == 1 else { return false }
+    guard queries.dim(3) == keyCode.layout.headDimension else { return false }
+    guard keyCode.layout.headDimension == valueCode.layout.headDimension else { return false }
+    let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(
+        minimum: max(queries.dim(3), kernelProfile.blockParallelFusedTokenBlockSize)
+    )
+    let activeBlockCount = (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth
+    let capacityBlockCount = (keyCode.layout.capacity + blockWidth - 1) / blockWidth
+    guard activeBlockCount > 1, capacityBlockCount <= blockWidth else { return false }
+    return keyCode.layout.logicalLength >= 4_096
+}
+
+private func turboQuantMetalBlockParallelFusedAttention(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    scale: Float,
+    kernelProfile: TurboQuantKernelProfile,
+    outputDType: DType,
+    causal: Bool,
+    stream: StreamOrDevice
+) throws -> MLXArray {
+    let outputShape = [queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]
+    let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
+    let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(
+        minimum: max(queries.dim(3), kernelProfile.blockParallelFusedTokenBlockSize)
+    )
+    let activeBlockCount = (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth
+    let capacityBlockCount = (keyCode.layout.capacity + blockWidth - 1) / blockWidth
+    guard activeBlockCount > 1, capacityBlockCount <= blockWidth else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "block-parallel fused attention requires 2...\(blockWidth) active/capacity blocks, got \(activeBlockCount)/\(capacityBlockCount)"
+        )
+    }
+
+    let template = runtimeLayoutAttentionTemplate(
+        configuration: TurboQuantConfiguration(
+            preset: keyCode.preset,
+            role: .key,
+            groupSize: keyCode.groupSize,
+            backend: .metalPolarQJL,
+            seed: keyCode.seed,
+            valueBits: valueCode.valueBits,
+            attentionLayoutVersion: keyCode.layout.layoutVersion,
+            allowExperimentalLayoutV5: keyCode.layout.isLayoutV5,
+            attentionScaleStorage: turboQuantAttentionScaleStorage(for: keyCode)
+        ),
+        layout: keyCode.layout,
+        inputLength: keyCode.layout.logicalLength,
+        outputLength: keyCode.layout.logicalLength,
+        queryHeadCount: queries.dim(1),
+        queryLength: queries.dim(2),
+        outputDType: outputDType,
+        causal: causal
+    ) + [
+        ("VALUE_MAG_WORDS_PER_GROUP", valueCode.layout.magnitudeWordsPerGroup),
+        ("VALUE_SCALES_PER_GROUP", valueCode.scalesPerGroup),
+        ("THREADS_PER_BLOCK", blockWidth),
+        ("BLOCK_TOKENS", blockWidth),
+        ("BLOCK_COUNT", capacityBlockCount),
+    ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
+
+    let partials = TurboQuantMetalKernels.fusedAttentionBlockPartials(
+        [
+            queries,
+            keyCode.packedMagnitudes,
+            keyCode.signs,
+            keyCode.highPrecisionMask,
+            keyCode.residualSigns,
+            keyCode.scales,
+            valueCode.packedMagnitudes,
+            valueCode.signs,
+            valueCode.highPrecisionMask,
+            valueCode.residualSigns,
+            valueCode.scales,
+            Int32(keyCode.layout.logicalLength),
+            Int32(keyCode.layout.ringOffset),
+            Int32(keyCode.layout.pinnedPrefixLength),
+            scale,
+        ],
+        template: template,
+        grid: (rowCount * capacityBlockCount * blockWidth, 1, 1),
+        threadGroup: (blockWidth, 1, 1),
+        outputShapes: [
+            [rowCount, capacityBlockCount, 2],
+            [rowCount, capacityBlockCount, queries.dim(3)],
+        ],
+        outputDTypes: [.float32, .float32],
+        stream: stream
+    )
+
+    return TurboQuantMetalKernels.fusedAttentionBlockReduce(
+        partials,
+        template: [
+            ("ROW_COUNT", rowCount),
+            ("HEAD_DIM", queries.dim(3)),
+            ("BLOCK_COUNT", capacityBlockCount),
+            ("THREADS_PER_BLOCK", blockWidth),
+            ("OUTPUT_DTYPE", outputDType),
+        ],
+        grid: (rowCount * blockWidth, 1, 1),
+        threadGroup: (blockWidth, 1, 1),
         outputShapes: [outputShape],
         outputDTypes: [outputDType],
         stream: stream
@@ -3816,6 +3971,14 @@ private func selectTurboQuantKernelProfile(
         iPhoneGeneration <= 16
     {
         return .portableA16A17
+    }
+
+    if supportedGPUFamilies["mac2"] == true
+        || hardwareModel == "arm64"
+        || architecture.contains("applegpu_g")
+        || architecture.contains("mac")
+    {
+        return .macAppleSilicon
     }
 
     if workingSet >= 10_000_000_000
@@ -5068,6 +5231,32 @@ private enum TurboQuantMetalKernels {
         ],
         outputNames: ["out"],
         source: fusedAttentionSource,
+        header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
+    static let fusedAttentionBlockPartials = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_block_partials_runtime_layout",
+        inputNames: [
+            "q",
+            "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
+            "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
+        ],
+        outputNames: ["partial_stats", "partial_out"],
+        source: fusedAttentionBlockPartialsSource,
+        header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
+    static let fusedAttentionBlockReduce = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_block_reduce",
+        inputNames: ["partial_stats", "partial_out"],
+        outputNames: ["out"],
+        source: fusedAttentionBlockReduceSource,
         header: attentionHeader,
         ensureRowContiguous: false
     )
@@ -6771,6 +6960,183 @@ private enum TurboQuantMetalKernels {
             sum += float(weights[weight_index]) * value;
         }
         out[index] = static_cast<OUTPUT_DTYPE>(sum);
+        """
+
+    private static let fusedAttentionBlockPartialsSource = """
+        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint block_index = group_index % uint(BLOCK_COUNT);
+        uint row = group_index / uint(BLOCK_COUNT);
+        uint total_rows = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH);
+        if (row >= total_rows) {
+            return;
+        }
+
+        threadgroup float partial[512];
+        threadgroup float tile_scores[512];
+        threadgroup float tile_weights[512];
+        threadgroup uint tile_physical_tokens[512];
+        threadgroup float query_cache[HEAD_DIM];
+
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        float attention_scale = float(runtime_attention_scale);
+        uint q_token = row % uint(QUERY_LENGTH);
+        uint q_head = (row / uint(QUERY_LENGTH)) % uint(QUERY_HEADS);
+        uint batch = row / (uint(QUERY_LENGTH) * uint(QUERY_HEADS));
+        uint repeats = uint(QUERY_HEADS) / uint(KV_HEADS);
+        uint kv_head = q_head / repeats;
+        uint causal_limit = logical_length - uint(QUERY_LENGTH) + q_token;
+        uint block_start = block_index * uint(BLOCK_TOKENS);
+        ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
+
+        if (lane < uint(HEAD_DIM)) {
+            uint q_index =
+                (((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH) + q_token)
+                    * uint(HEAD_DIM)) + lane;
+            query_cache[lane] = float(q[q_index]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint logical_token = block_start + lane;
+        bool active = lane < uint(BLOCK_TOKENS)
+            && logical_token < logical_length
+            && (!DO_CAUSAL || logical_token <= causal_limit);
+        float scaled_score = -INFINITY;
+        uint physical_token = 0u;
+        if (active) {
+            physical_token = tq_physical_token(
+                logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+            float score = 0.0f;
+            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
+                uint group_start = group * uint(GROUP_SIZE);
+                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
+                thread float query_values[GROUP_SIZE];
+                for (uint local = 0u; local < count; local++) {
+                    query_values[local] = query_cache[group_start + local];
+                }
+                score += tq_product_attention_inner_product_group(
+                    k_packed, k_signs, k_high_mask, k_scales, query_values,
+                    batch, kv_head, physical_token, group, key_seed,
+                    uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                    uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                    uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM));
+            }
+            scaled_score = score * attention_scale;
+        }
+        tile_scores[lane] = scaled_score;
+        tile_physical_tokens[lane] = physical_token;
+        partial[lane] = scaled_score;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                partial[lane] = max(partial[lane], partial[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float tile_max = partial[0];
+        float tile_weight = active ? exp(tile_scores[lane] - tile_max) : 0.0f;
+        tile_weights[lane] = tile_weight;
+        partial[lane] = tile_weight;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                partial[lane] += partial[lane + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+            partial_stats[stat_index] = tile_max;
+            partial_stats[stat_index + 1u] = partial[0];
+        }
+
+        if (lane < uint(HEAD_DIM)) {
+            thread float decode_scratch[GROUP_SIZE];
+            float dimension_accum = 0.0f;
+            for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
+                float weight = tile_weights[tile_lane];
+                if (weight > 0.0f) {
+                    float value = tq_decode_attention_value(
+                        v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
+                        batch, kv_head, tile_physical_tokens[tile_lane], lane,
+                        tq_make_seed(
+                            uint(VALUE_SEED_3), uint(VALUE_SEED_2),
+                            uint(VALUE_SEED_1), uint(VALUE_SEED_0)), 1u,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
+                        uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(HEAD_DIM),
+                        decode_scratch);
+                    dimension_accum += weight * value;
+                }
+            }
+            uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+            partial_out[out_index] = dimension_accum;
+        }
+        """
+
+    private static let fusedAttentionBlockReduceSource = """
+        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        if (row >= uint(ROW_COUNT)) {
+            return;
+        }
+
+        threadgroup float partial[512];
+
+        if (lane < uint(BLOCK_COUNT)) {
+            partial[lane] = partial_stats[(row * uint(BLOCK_COUNT) + lane) * 2u];
+        } else {
+            partial[lane] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                partial[lane] = max(partial[lane], partial[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float row_max = partial[0];
+        if (lane < uint(BLOCK_COUNT)) {
+            uint stat_index = (row * uint(BLOCK_COUNT) + lane) * 2u;
+            float tile_sum = partial_stats[stat_index + 1u];
+            partial[lane] = tile_sum > 0.0f ? exp(partial_stats[stat_index] - row_max) * tile_sum : 0.0f;
+        } else {
+            partial[lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                partial[lane] += partial[lane + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float row_sum = partial[0];
+        if (lane < uint(HEAD_DIM)) {
+            float accum = 0.0f;
+            for (uint block = 0u; block < uint(BLOCK_COUNT); block++) {
+                uint stat_index = (row * uint(BLOCK_COUNT) + block) * 2u;
+                float tile_sum = partial_stats[stat_index + 1u];
+                if (tile_sum > 0.0f) {
+                    float tile_scale = exp(partial_stats[stat_index] - row_max);
+                    uint partial_index = ((row * uint(BLOCK_COUNT) + block) * uint(HEAD_DIM)) + lane;
+                    accum += tile_scale * partial_out[partial_index];
+                }
+            }
+            out[row * uint(HEAD_DIM) + lane] = static_cast<OUTPUT_DTYPE>(
+                accum / max(row_sum, 1.17549435e-38f));
+        }
         """
 
     private static let fusedAttentionSource = """

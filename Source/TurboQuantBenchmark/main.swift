@@ -214,6 +214,25 @@ private func timed(
     try timedValue(iterations: iterations, warmup: warmup, evaluate: { eval($0) }, body)
 }
 
+private struct TimingSummary {
+    var averageSeconds: Double
+    var p50Seconds: Double
+    var p95Seconds: Double
+}
+
+private struct TimedValueSummary<T> {
+    var timing: TimingSummary
+    var value: T
+}
+
+private func timedSampled(
+    iterations: Int,
+    warmup: Int = 1,
+    _ body: () throws -> MLXArray
+) throws -> TimedValueSummary<MLXArray> {
+    try timedValueSampled(iterations: iterations, warmup: warmup, evaluate: { eval($0) }, body)
+}
+
 private func timedValue<T>(
     iterations: Int,
     warmup: Int,
@@ -238,6 +257,52 @@ private func timedValue<T>(
     let elapsed = Date.timeIntervalSinceReferenceDate - start
 
     return (elapsed / Double(measuredIterations), last!)
+}
+
+private func timedValueSampled<T>(
+    iterations: Int,
+    warmup: Int,
+    evaluate: (T) -> Void,
+    _ body: () throws -> T
+) throws -> TimedValueSummary<T> {
+    let measuredIterations = max(1, iterations)
+    var last: T?
+    var samples: [Double] = []
+    samples.reserveCapacity(measuredIterations)
+
+    for _ in 0 ..< max(0, warmup) {
+        let value = try body()
+        evaluate(value)
+        last = value
+    }
+
+    for _ in 0 ..< measuredIterations {
+        let start = Date.timeIntervalSinceReferenceDate
+        let value = try body()
+        evaluate(value)
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
+        samples.append(elapsed)
+        last = value
+    }
+
+    let sorted = samples.sorted()
+    let average = samples.reduce(0, +) / Double(measuredIterations)
+    return TimedValueSummary(
+        timing: TimingSummary(
+            averageSeconds: average,
+            p50Seconds: percentile(sortedSamples: sorted, percentile: 0.50),
+            p95Seconds: percentile(sortedSamples: sorted, percentile: 0.95)
+        ),
+        value: last!
+    )
+}
+
+private func percentile(sortedSamples: [Double], percentile: Double) -> Double {
+    guard let first = sortedSamples.first else { return 0 }
+    guard sortedSamples.count > 1 else { return first }
+    let clamped = min(max(percentile, 0), 1)
+    let index = Int(ceil(clamped * Double(sortedSamples.count))) - 1
+    return sortedSamples[min(max(index, 0), sortedSamples.count - 1)]
 }
 
 private func skipped(_ name: String, reason: String) -> BenchmarkResult {
@@ -272,6 +337,8 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     var avMS: Double?
     var fusedMS: Double?
     var firstTokenLatencyMS: Double?
+    var attentionLatencyMSP50: Double?
+    var attentionLatencyMSP95: Double?
     var prefillTokensPerSecond: Double?
     var decodeTokensPerSecondP50: Double?
     var decodeTokensPerSecondP95: Double?
@@ -290,13 +357,20 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
                 prefillTokensPerSecond = Double(options.contextTokens) / encodeSeconds
             }
 
-            let attentionSeconds =
-                measurement.fusedSeconds ?? measurement.twoStageAttentionSeconds
-            if let attentionSeconds, attentionSeconds > 0 {
-                firstTokenLatencyMS = milliseconds(attentionSeconds)
-                let decodeTokensPerSecond = Double(options.queryLength) / attentionSeconds
-                decodeTokensPerSecondP50 = decodeTokensPerSecond
-                decodeTokensPerSecondP95 = decodeTokensPerSecond
+            if let attentionTiming = measurement.attentionTiming,
+                attentionTiming.averageSeconds > 0
+            {
+                firstTokenLatencyMS = milliseconds(attentionTiming.averageSeconds)
+                attentionLatencyMSP50 = milliseconds(attentionTiming.p50Seconds)
+                attentionLatencyMSP95 = milliseconds(attentionTiming.p95Seconds)
+                if attentionTiming.p50Seconds > 0 {
+                    decodeTokensPerSecondP50 =
+                        Double(options.queryLength) / attentionTiming.p50Seconds
+                }
+                if attentionTiming.p95Seconds > 0 {
+                    decodeTokensPerSecondP95 =
+                        Double(options.queryLength) / attentionTiming.p95Seconds
+                }
             }
         } catch {
             benchmarkError = String(describing: error)
@@ -347,6 +421,8 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         avMS: avMS,
         fusedMS: fusedMS,
         firstTokenLatencyMS: firstTokenLatencyMS,
+        attentionLatencyMSP50: attentionLatencyMSP50,
+        attentionLatencyMSP95: attentionLatencyMSP95,
         prefillTokensPerSecond: prefillTokensPerSecond,
         decodeTokensPerSecondP50: decodeTokensPerSecondP50,
         decodeTokensPerSecondP95: decodeTokensPerSecondP95,
@@ -378,6 +454,7 @@ private struct CoreAttentionMeasurement {
     var qkSeconds: Double?
     var avSeconds: Double?
     var fusedSeconds: Double?
+    var attentionTiming: TimingSummary?
 
     var twoStageAttentionSeconds: Double? {
         guard let qkSeconds, let avSeconds else { return nil }
@@ -484,8 +561,23 @@ private func measureCoreAttention(
         )
     }
 
+    let selectedPathUsesFused =
+        decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused
+    let selectedAttention = try timedSampled(iterations: options.iterations, warmup: options.warmup)
+    {
+        try turboQuantMetalScaledDotProductAttention(
+            queries: query,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: selectedPathUsesFused
+        )
+    }
     let fusedSeconds: Double?
-    if decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused {
+    if selectedPathUsesFused {
+        fusedSeconds = selectedAttention.timing.averageSeconds
+    } else if decision.selectedPath != .twoStageCompressed {
         fusedSeconds = try timed(iterations: options.iterations, warmup: options.warmup) {
             try turboQuantMetalScaledDotProductAttention(
                 queries: query,
@@ -506,7 +598,8 @@ private func measureCoreAttention(
         decodeSeconds: decodeSeconds,
         qkSeconds: qkSeconds,
         avSeconds: avSeconds,
-        fusedSeconds: fusedSeconds
+        fusedSeconds: fusedSeconds,
+        attentionTiming: selectedAttention.timing
     )
 }
 

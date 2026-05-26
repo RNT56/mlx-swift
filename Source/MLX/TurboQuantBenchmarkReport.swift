@@ -48,6 +48,8 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var avMS: Double?
     public var fusedMS: Double?
     public var firstTokenLatencyMS: Double?
+    public var attentionLatencyMSP50: Double?
+    public var attentionLatencyMSP95: Double?
     public var prefillTokensPerSecond: Double?
     public var decodeTokensPerSecondP50: Double?
     public var decodeTokensPerSecondP95: Double?
@@ -76,6 +78,8 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         avMS: Double? = nil,
         fusedMS: Double? = nil,
         firstTokenLatencyMS: Double? = nil,
+        attentionLatencyMSP50: Double? = nil,
+        attentionLatencyMSP95: Double? = nil,
         prefillTokensPerSecond: Double? = nil,
         decodeTokensPerSecondP50: Double? = nil,
         decodeTokensPerSecondP95: Double? = nil,
@@ -103,6 +107,8 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.avMS = avMS
         self.fusedMS = fusedMS
         self.firstTokenLatencyMS = firstTokenLatencyMS
+        self.attentionLatencyMSP50 = attentionLatencyMSP50
+        self.attentionLatencyMSP95 = attentionLatencyMSP95
         self.prefillTokensPerSecond = prefillTokensPerSecond
         self.decodeTokensPerSecondP50 = decodeTokensPerSecondP50
         self.decodeTokensPerSecondP95 = decodeTokensPerSecondP95
@@ -200,6 +206,13 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
                 largeInput: "compressed scale tables",
                 copyRisk: "medium",
                 mitigation: "V5 scale tables are emitted directly by the Metal encode kernel and validated as canonical float16/float32 storage before dispatch",
+                status: "guarded"
+            ),
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "block-parallel fused",
+                largeInput: "compressed K/V cache",
+                copyRisk: "high",
+                mitigation: "block partial kernels consume canonical compressed K/V arrays and emit bounded per-block partials, not decoded cache copies",
                 status: "guarded"
             ),
         ],

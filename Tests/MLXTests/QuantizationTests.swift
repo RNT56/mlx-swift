@@ -1972,6 +1972,88 @@ class QuantizationTests: XCTestCase {
         }
     }
 
+    func testTurboQuantBlockParallelFusedMatchesTwoStageForLongQwenLikeDecodeSchemes() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let headDimension = 256
+        let queryHeadCount = 16
+        let kvHeadCount = 4
+        let queryLength = 1
+        let keyLength = 4_096
+        let qValues: [Float] = (0 ..< (queryHeadCount * queryLength * headDimension)).map {
+            index in
+            let position = Double(index)
+            return Float(0.23 * sin(position * 0.013) + 0.17 * cos(position * 0.053))
+        }
+        let kValues: [Float] = (0 ..< (kvHeadCount * keyLength * headDimension)).map {
+            index in
+            let position = Double(index)
+            return Float(0.18 * cos(position * 0.007) - 0.11 * sin(position * 0.019))
+        }
+        let vValues: [Float] = (0 ..< (kvHeadCount * keyLength * headDimension)).map {
+            index in
+            let position = Double(index)
+            return Float(0.16 * sin(position * 0.011) + 0.09 * cos(position * 0.023))
+        }
+        let queries = MLXArray(qValues, [1, queryHeadCount, queryLength, headDimension])
+        let keys = MLXArray(kValues, [1, kvHeadCount, keyLength, headDimension])
+        let values = MLXArray(vValues, [1, kvHeadCount, keyLength, headDimension])
+        let scale = 1 / sqrt(Float(headDimension))
+
+        for (preset, valueBits) in [
+            (TurboQuantPreset.turbo8, 8),
+            (TurboQuantPreset.turbo4v2, 4),
+            (TurboQuantPreset.turbo3_5, 4),
+        ] {
+            let keyCode = try turboQuantMetalEncodeAttention(
+                keys,
+                configuration: TurboQuantConfiguration(
+                    preset: preset,
+                    role: .key,
+                    groupSize: 64,
+                    backend: .metalPolarQJL,
+                    seed: 351
+                )
+            )
+            let valueCode = try turboQuantMetalEncodeAttention(
+                values,
+                configuration: TurboQuantConfiguration(
+                    preset: preset,
+                    role: .value,
+                    groupSize: 64,
+                    backend: .metalPolarQJL,
+                    seed: 357,
+                    valueBits: valueBits
+                )
+            )
+
+            let twoStage = try turboQuantMetalScaledDotProductAttention(
+                queries: queries,
+                keyCode: keyCode,
+                valueCode: valueCode,
+                scale: scale,
+                mask: .causal,
+                preferOnlineFused: false
+            )
+            let fused = try turboQuantMetalScaledDotProductAttention(
+                queries: queries,
+                keyCode: keyCode,
+                valueCode: valueCode,
+                scale: scale,
+                mask: .causal,
+                preferOnlineFused: true
+            )
+
+            XCTAssertEqual(fused.shape, [1, queryHeadCount, queryLength, headDimension])
+            XCTAssertTrue(
+                allClose(fused, twoStage, rtol: 1e-4, atol: 1e-4).item(Bool.self),
+                "Expected block-parallel fused and two-stage compressed attention to match for \(preset.rawValue)"
+            )
+        }
+    }
+
     func testTurboQuantCompressedAttentionSupportsBatchedInputsWhenAvailable() throws {
         guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
             throw XCTSkip("Metal compressed attention unavailable")
@@ -2330,6 +2412,12 @@ class QuantizationTests: XCTestCase {
             )
             .contains(256)
         )
+        XCTAssertTrue(
+            TurboQuantRuntimeProbeResult.defaultOnlineFusedHeadDimensions(
+                for: .macAppleSilicon
+            )
+            .contains(256)
+        )
     }
 
     func testTurboQuantKernelProfileKeepsA17IPhoneOnPortableProfile() {
@@ -2350,6 +2438,15 @@ class QuantizationTests: XCTestCase {
                 recommendedWorkingSetBytes: 5_726_633_984
             ),
             .wideA18A19
+        )
+        XCTAssertEqual(
+            TurboQuantKernelProfile.selected(
+                architectureName: "applegpu_g14s",
+                hardwareModelIdentifier: "arm64",
+                supportedGPUFamilies: ["mac2": true],
+                recommendedWorkingSetBytes: 36_000_000_000
+            ),
+            .macAppleSilicon
         )
     }
 
