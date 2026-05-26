@@ -77,6 +77,7 @@ private struct BenchmarkOptions {
     var layoutVersion: Int
     var enableLayoutV5: Bool
     var scaleStorage: TurboQuantScaleStorage
+    var blockParallelTokenBlockSize: Int?
     var requestedPath: TurboQuantAttentionPath?
 
     var resolvedValueBits: Int {
@@ -116,6 +117,8 @@ private struct BenchmarkOptions {
             ),
             enableLayoutV5: arguments.contains("--enable-layout-v5"),
             scaleStorage: try scaleStorage(in: arguments),
+            blockParallelTokenBlockSize: try optionalIntValue(
+                "--block-tokens", in: arguments, minimum: 1),
             requestedPath: try requestedPath(in: arguments)
         )
     }
@@ -427,6 +430,7 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         groupSize: options.groupSize,
         layoutVersion: options.layoutVersion,
         scaleStorage: options.scaleStorage.rawValue,
+        blockParallelTokenBlockSize: options.blockParallelTokenBlockSize,
         warmupIterations: options.warmup,
         encodeMS: encodeMS,
         decodeMS: decodeMS,
@@ -584,7 +588,8 @@ private func measureCoreAttention(
             valueCode: valueCode,
             scale: scale,
             mask: .causal,
-            preferOnlineFused: selectedPathUsesFused
+            preferOnlineFused: selectedPathUsesFused,
+            blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
         )
     }
     let fusedSeconds: Double?
@@ -598,7 +603,8 @@ private func measureCoreAttention(
                 valueCode: valueCode,
                 scale: scale,
                 mask: .causal,
-                preferOnlineFused: true
+                preferOnlineFused: true,
+                blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
             )
         }.0
     } else {
@@ -743,7 +749,8 @@ private func runLegacyBenchmark(options: BenchmarkOptions) throws {
                     valueCode: valueCode,
                     scale: scale,
                     mask: .causal,
-                    preferOnlineFused: false
+                    preferOnlineFused: false,
+                    blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
                 )
             }
             let (fusedLatency, fused) = try timed(
@@ -756,7 +763,8 @@ private func runLegacyBenchmark(options: BenchmarkOptions) throws {
                     valueCode: valueCode,
                     scale: scale,
                     mask: .causal,
-                    preferOnlineFused: true
+                    preferOnlineFused: true,
+                    blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
                 )
             }
             results.append(

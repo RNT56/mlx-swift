@@ -41,6 +41,7 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var groupSize: Int
     public var layoutVersion: Int?
     public var scaleStorage: String?
+    public var blockParallelTokenBlockSize: Int?
     public var warmupIterations: Int?
     public var encodeMS: Double?
     public var decodeMS: Double?
@@ -71,6 +72,7 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         groupSize: Int,
         layoutVersion: Int? = nil,
         scaleStorage: String? = nil,
+        blockParallelTokenBlockSize: Int? = nil,
         warmupIterations: Int? = nil,
         encodeMS: Double? = nil,
         decodeMS: Double? = nil,
@@ -100,6 +102,7 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.groupSize = groupSize
         self.layoutVersion = layoutVersion
         self.scaleStorage = scaleStorage
+        self.blockParallelTokenBlockSize = blockParallelTokenBlockSize
         self.warmupIterations = warmupIterations
         self.encodeMS = encodeMS
         self.decodeMS = decodeMS
@@ -205,26 +208,29 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
                 kernelName: "layout V5 fp16 scales",
                 largeInput: "compressed scale tables",
                 copyRisk: "medium",
-                mitigation: "V5 scale tables are emitted directly by the Metal encode kernel and validated as canonical float16/float32 storage before dispatch",
+                mitigation:
+                    "V5 scale tables are emitted directly by the Metal encode kernel and validated as canonical float16/float32 storage before dispatch",
                 status: "guarded"
             ),
             TurboQuantHiddenCopyAuditEntry(
                 kernelName: "block-parallel fused",
                 largeInput: "compressed K/V cache",
                 copyRisk: "high",
-                mitigation: "block partial kernels consume canonical compressed K/V arrays and emit bounded per-block partials, not decoded cache copies",
+                mitigation:
+                    "block partial kernels consume canonical compressed K/V arrays and emit bounded per-block partials, not decoded cache copies",
                 status: "guarded"
             ),
             TurboQuantHiddenCopyAuditEntry(
                 kernelName: "GQA block-parallel fused",
                 largeInput: "compressed K/V cache shared by grouped query heads",
                 copyRisk: "high",
-                mitigation: "Mac-gated grouped-query block partial kernels reuse compressed K/V reads across Qwen query-head pairs without materializing decoded cache copies",
+                mitigation:
+                    "Mac-gated grouped-query block partial kernels reuse compressed K/V reads across Qwen query-head pairs without materializing decoded cache copies",
                 status: "guarded"
             ),
         ],
         notes: currentW3.notes + [
-            "Layout V5 is the default write layout; V4 remains supported for compatibility comparisons.",
+            "Layout V5 is the default write layout; V4 remains supported for compatibility comparisons."
         ]
     )
 }

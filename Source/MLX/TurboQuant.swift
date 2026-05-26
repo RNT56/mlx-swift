@@ -2359,6 +2359,7 @@ public func turboQuantMetalScaledDotProductAttention(
     memoryBudgetBytes: Int? = nil,
     fallbackState: TurboQuantAttentionFallbackState = .none,
     kernelProfile: TurboQuantKernelProfile? = nil,
+    blockParallelTokenBlockSize: Int? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
@@ -2410,6 +2411,7 @@ public func turboQuantMetalScaledDotProductAttention(
             mask: mask,
             kernelProfile: kernelProfile
                 ?? TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe(),
+            blockParallelTokenBlockSize: blockParallelTokenBlockSize,
             outputDType: decision.outputDType,
             stream: stream
         )
@@ -2613,6 +2615,7 @@ private func turboQuantMetalOnlineFusedAttention(
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode,
     kernelProfile: TurboQuantKernelProfile,
+    blockParallelTokenBlockSize: Int? = nil,
     outputDType: DType,
     stream: StreamOrDevice
 ) throws -> MLXArray {
@@ -2641,7 +2644,8 @@ private func turboQuantMetalOnlineFusedAttention(
         queries: queries,
         keyCode: keyCode,
         valueCode: valueCode,
-        kernelProfile: kernelProfile
+        kernelProfile: kernelProfile,
+        blockParallelTokenBlockSize: blockParallelTokenBlockSize
     ) {
         return try turboQuantMetalBlockParallelFusedAttention(
             queries: queries,
@@ -2649,6 +2653,7 @@ private func turboQuantMetalOnlineFusedAttention(
             valueCode: valueCode,
             scale: scale,
             kernelProfile: kernelProfile,
+            blockParallelTokenBlockSize: blockParallelTokenBlockSize,
             outputDType: outputDType,
             causal: causal,
             stream: stream
@@ -2709,13 +2714,17 @@ private func turboQuantShouldUseBlockParallelFusedAttention(
     queries: MLXArray,
     keyCode: TurboQuantAttentionCode,
     valueCode: TurboQuantAttentionCode,
-    kernelProfile: TurboQuantKernelProfile
+    kernelProfile: TurboQuantKernelProfile,
+    blockParallelTokenBlockSize: Int? = nil
 ) -> Bool {
     guard queries.dim(2) == 1 else { return false }
     guard queries.dim(3) == keyCode.layout.headDimension else { return false }
     guard keyCode.layout.headDimension == valueCode.layout.headDimension else { return false }
     let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(
-        minimum: max(queries.dim(3), kernelProfile.blockParallelFusedTokenBlockSize)
+        minimum: max(
+            queries.dim(3),
+            blockParallelTokenBlockSize ?? kernelProfile.blockParallelFusedTokenBlockSize
+        )
     )
     let activeBlockCount = (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth
     guard activeBlockCount > 1, activeBlockCount <= blockWidth else { return false }
@@ -2728,6 +2737,7 @@ private func turboQuantMetalBlockParallelFusedAttention(
     valueCode: TurboQuantAttentionCode,
     scale: Float,
     kernelProfile: TurboQuantKernelProfile,
+    blockParallelTokenBlockSize: Int? = nil,
     outputDType: DType,
     causal: Bool,
     stream: StreamOrDevice
@@ -2735,7 +2745,10 @@ private func turboQuantMetalBlockParallelFusedAttention(
     let outputShape = [queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]
     let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
     let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(
-        minimum: max(queries.dim(3), kernelProfile.blockParallelFusedTokenBlockSize)
+        minimum: max(
+            queries.dim(3),
+            blockParallelTokenBlockSize ?? kernelProfile.blockParallelFusedTokenBlockSize
+        )
     )
     let activeBlockCount = (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth
     guard activeBlockCount > 1, activeBlockCount <= blockWidth else {
