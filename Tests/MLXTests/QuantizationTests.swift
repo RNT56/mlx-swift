@@ -216,7 +216,7 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(configuration.preset, .turbo4v2)
         XCTAssertEqual(configuration.role, .key)
         XCTAssertEqual(configuration.attentionLayoutVersion, TurboQuantAttentionLayout.currentVersion)
-        XCTAssertEqual(configuration.attentionLayoutVersion, 5)
+        XCTAssertEqual(configuration.attentionLayoutVersion, 6)
         XCTAssertFalse(configuration.allowExperimentalLayoutV5)
         XCTAssertEqual(configuration.attentionScaleStorage, .float32)
         XCTAssertTrue(configuration.deterministicHighPrecisionMask)
@@ -866,8 +866,8 @@ class QuantizationTests: XCTestCase {
             seed: 0,
             packedMagnitudes: MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32),
             signs: MLXArray.zeros([1, 1, 1, 1, 2], dtype: .uint32),
-            highPrecisionMask: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            residualSigns: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
+            highPrecisionMask: MLXArray.zeros([1], dtype: .uint32),
+            residualSigns: MLXArray.zeros([1], dtype: .uint32),
             scales: MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float32)
         )
 
@@ -923,7 +923,7 @@ class QuantizationTests: XCTestCase {
                 seed: 0,
                 packedMagnitudes: MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32),
                 signs: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-                highPrecisionMask: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
+                highPrecisionMask: MLXArray.zeros([1], dtype: .uint32),
                 residualSigns: MLXArray.zeros([1], dtype: .uint32),
                 scales: MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float32)
             )
@@ -959,7 +959,7 @@ class QuantizationTests: XCTestCase {
             seed: 0,
             packedMagnitudes: nonContiguousPacked,
             signs: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            highPrecisionMask: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
+            highPrecisionMask: MLXArray.zeros([1], dtype: .uint32),
             residualSigns: MLXArray.zeros([1], dtype: .uint32),
             scales: MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float32)
         )
@@ -1017,8 +1017,8 @@ class QuantizationTests: XCTestCase {
             seed: 0,
             packedMagnitudes: MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32),
             signs: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            highPrecisionMask: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            residualSigns: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
+            highPrecisionMask: MLXArray.zeros([1], dtype: .uint32),
+            residualSigns: MLXArray.zeros([1], dtype: .uint32),
             scales: MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float32)
         )
         let mask = MLXArray.zeros([1, 1, 1, 2], dtype: .float32)
@@ -1054,8 +1054,8 @@ class QuantizationTests: XCTestCase {
             seed: 0,
             packedMagnitudes: MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32),
             signs: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            highPrecisionMask: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            residualSigns: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
+            highPrecisionMask: MLXArray.zeros([1], dtype: .uint32),
+            residualSigns: MLXArray.zeros([1], dtype: .uint32),
             scales: MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float32)
         )
 
@@ -1160,7 +1160,8 @@ class QuantizationTests: XCTestCase {
                 role: .key,
                 groupSize: headDimension,
                 backend: .metalPolarQJL,
-                seed: 0xA11C_E000_0000_0001
+                seed: 0xA11C_E000_0000_0001,
+                deterministicHighPrecisionMask: false
             )
             let keyCode = try turboQuantMetalEncodeAttention(keys, configuration: configuration)
             let referenceCode = try turboQuantReferenceEncode(keys, configuration: configuration)
@@ -1431,9 +1432,9 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(layout.bitsetWordsPerGroup, 2)
     }
 
-    func testTurboQuantAttentionLayoutV5IsDefaultAndV4RemainsSupported() throws {
+    func testTurboQuantAttentionLayoutV6IsDefaultAndOlderLayoutsRemainSupported() throws {
         XCTAssertEqual(TurboQuantAttentionLayout.legacyVersion, 4)
-        XCTAssertEqual(TurboQuantAttentionLayout.currentVersion, 5)
+        XCTAssertEqual(TurboQuantAttentionLayout.currentVersion, 6)
         XCTAssertEqual(TurboQuantAttentionLayout.nextVersion, TurboQuantAttentionLayout.currentVersion)
 
         let defaultLayout = try turboQuantAttentionLayout(shape: [1, 2, 3, 80], groupSize: 64)
@@ -1447,6 +1448,14 @@ class QuantizationTests: XCTestCase {
         )
         XCTAssertEqual(legacyLayout.layoutVersion, TurboQuantAttentionLayout.legacyVersion)
         XCTAssertFalse(legacyLayout.isLayoutV5)
+
+        let v5Layout = try turboQuantAttentionLayout(
+            shape: [1, 2, 3, 80],
+            groupSize: 64,
+            layoutVersion: 5
+        )
+        XCTAssertEqual(v5Layout.layoutVersion, 5)
+        XCTAssertTrue(v5Layout.isLayoutV5)
 
         let layout = try turboQuantAttentionLayout(
             shape: [1, 2, 3, 80],
@@ -1545,7 +1554,7 @@ class QuantizationTests: XCTestCase {
         )
 
         XCTAssertEqual(keyCode.signs.shape, [1, 1, 2, 1, 2])
-        XCTAssertEqual(keyCode.highPrecisionMask.shape, [1, 1, 2, 1, 2])
+        XCTAssertEqual(keyCode.highPrecisionMask.shape, [1])
         XCTAssertEqual(keyCode.residualSigns.shape, [1])
         XCTAssertEqual(valueCode.signs.shape, [1])
         XCTAssertEqual(valueCode.highPrecisionMask.shape, [1])

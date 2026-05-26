@@ -39,7 +39,8 @@ public func validateTurboQuantAttentionCode(
         groupSize: code.groupSize,
         preset: code.preset,
         role: code.role,
-        valueBits: code.valueBits
+        valueBits: code.valueBits,
+        layoutVersion: code.layout.layoutVersion
     )
     guard code.layout.magnitudeWordsPerGroup == expectedMagnitudeWords else {
         throw turboQuantAttentionValidationError(
@@ -76,6 +77,13 @@ public func validateTurboQuantAttentionCode(
         code.layout.groupsPerVector, code.scalesPerGroup,
     ]
     let compactUnusedBitsetShape = [1]
+    let storesHighPrecisionMask = turboQuantAttentionStoresHighPrecisionMask(
+        preset: code.preset,
+        role: code.role,
+        layoutVersion: code.layout.layoutVersion
+    )
+    let highPrecisionMaskShapes =
+        storesHighPrecisionMask ? [bitsetShape] : [compactUnusedBitsetShape, bitsetShape]
 
     try turboQuantValidateAttentionStorageArray(
         code.packedMagnitudes,
@@ -92,7 +100,7 @@ public func validateTurboQuantAttentionCode(
     try turboQuantValidateAttentionStorageArray(
         code.highPrecisionMask,
         name: "compressed attention high precision mask",
-        expectedShapes: code.role == .value ? [compactUnusedBitsetShape] : [bitsetShape],
+        expectedShapes: highPrecisionMaskShapes,
         expectedDType: .uint32
     )
     try turboQuantValidateAttentionStorageArray(
@@ -334,7 +342,7 @@ private func turboQuantValidateAttentionStorageArray(
 }
 
 private func turboQuantAttentionSupportedScaleDTypes(layoutVersion: Int) -> [DType] {
-    layoutVersion == TurboQuantAttentionLayout.currentVersion
+    layoutVersion >= 5
         ? [.float32, .float16]
         : [.float32]
 }
@@ -343,7 +351,8 @@ private func turboQuantAttentionMagnitudeWordsPerGroup(
     groupSize: Int,
     preset: TurboQuantPreset,
     role: TurboQuantTensorRole,
-    valueBits: Int
+    valueBits: Int,
+    layoutVersion: Int
 ) -> Int {
     if role == .value {
         return turboQuantAttentionCeilDivide(groupSize * Swift.max(1, valueBits), by: 32)
@@ -351,6 +360,24 @@ private func turboQuantAttentionMagnitudeWordsPerGroup(
 
     let baseBits = Swift.max(1, preset.baseMagnitudeBits - 1)
     let highBits = Swift.max(baseBits, preset.highMagnitudeBits - 1)
+    if turboQuantAttentionUsesSplitMagnitudePlane(
+        preset: preset,
+        role: role,
+        layoutVersion: layoutVersion,
+        baseBits: baseBits,
+        highBits: highBits
+    ) {
+        let highCount = turboQuantAttentionHighCount(
+            valueCount: groupSize,
+            baseBits: baseBits,
+            highBits: highBits,
+            targetBits: Swift.max(1, preset.targetMagnitudeBits - 1)
+        )
+        return turboQuantAttentionCeilDivide(
+            groupSize * baseBits + highCount * (highBits - baseBits),
+            by: 32
+        )
+    }
     let highCount = turboQuantAttentionHighCount(
         valueCount: groupSize,
         baseBits: baseBits,
@@ -359,6 +386,40 @@ private func turboQuantAttentionMagnitudeWordsPerGroup(
     )
     let bitCount = groupSize * baseBits + highCount * (highBits - baseBits)
     return turboQuantAttentionCeilDivide(bitCount, by: 32)
+}
+
+private func turboQuantAttentionUsesSplitMagnitudePlane(
+    preset: TurboQuantPreset,
+    role: TurboQuantTensorRole,
+    layoutVersion: Int,
+    baseBits: Int? = nil,
+    highBits: Int? = nil
+) -> Bool {
+    guard role == .key, layoutVersion >= TurboQuantAttentionLayout.splitMagnitudeVersion else {
+        return false
+    }
+    let resolvedBaseBits = baseBits ?? Swift.max(1, preset.baseMagnitudeBits - 1)
+    let resolvedHighBits =
+        highBits ?? Swift.max(resolvedBaseBits, preset.highMagnitudeBits - 1)
+    return resolvedHighBits == resolvedBaseBits + 1
+}
+
+private func turboQuantAttentionStoresHighPrecisionMask(
+    preset: TurboQuantPreset,
+    role: TurboQuantTensorRole,
+    layoutVersion: Int
+) -> Bool {
+    guard role == .key else { return false }
+    let baseBits = Swift.max(1, preset.baseMagnitudeBits - 1)
+    let highBits = Swift.max(baseBits, preset.highMagnitudeBits - 1)
+    guard highBits > baseBits else { return false }
+    return !turboQuantAttentionUsesSplitMagnitudePlane(
+        preset: preset,
+        role: role,
+        layoutVersion: layoutVersion,
+        baseBits: baseBits,
+        highBits: highBits
+    )
 }
 
 private func turboQuantAttentionHighCount(
