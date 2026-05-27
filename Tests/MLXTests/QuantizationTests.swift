@@ -969,6 +969,96 @@ class QuantizationTests: XCTestCase {
         }
     }
 
+    func testTurboQuantCompressedAttentionAcceptsStridedQKVInputs() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let qValues: [Float] = (0 ..< 512).map { index in
+            let position = Double(index)
+            return Float(0.17 * sin(position * 0.031) + 0.09 * cos(position * 0.047))
+        }
+        let kValues: [Float] = (0 ..< 640).map { index in
+            let position = Double(index)
+            return Float(0.19 * cos(position * 0.037) - 0.11 * sin(position * 0.071))
+        }
+        let vValues: [Float] = (0 ..< 640).map { index in
+            let position = Double(index)
+            return Float(0.15 * sin(position * 0.041) + 0.13 * cos(position * 0.083))
+        }
+        let queries = MLXArray(qValues, [1, 4, 2, 64])
+        let keys = MLXArray(kValues, [1, 2, 5, 64])
+        let values = MLXArray(vValues, [1, 2, 5, 64])
+        let stridedQueries = queries
+            .transposed(0, 2, 1, 3)
+            .contiguous(stream: .gpu)
+            .transposed(0, 2, 1, 3)
+        let stridedKeys = keys
+            .transposed(0, 2, 1, 3)
+            .contiguous(stream: .gpu)
+            .transposed(0, 2, 1, 3)
+        let stridedValues = values
+            .transposed(0, 2, 1, 3)
+            .contiguous(stream: .gpu)
+            .transposed(0, 2, 1, 3)
+
+        let keyConfig = TurboQuantConfiguration(
+            preset: .turbo4v2,
+            role: .key,
+            groupSize: 64,
+            backend: .metalPolarQJL,
+            seed: 71
+        )
+        let valueConfig = TurboQuantConfiguration(
+            preset: .turbo4v2,
+            role: .value,
+            groupSize: 64,
+            backend: .metalPolarQJL,
+            seed: 73
+        )
+        let contiguousKeyCode = try turboQuantMetalEncodeAttention(keys, configuration: keyConfig)
+        let contiguousValueCode = try turboQuantMetalEncodeAttention(
+            values, configuration: valueConfig)
+        let stridedKeyCode = try turboQuantMetalEncodeAttention(
+            stridedKeys, configuration: keyConfig)
+        let stridedValueCode = try turboQuantMetalEncodeAttention(
+            stridedValues, configuration: valueConfig)
+
+        let scale = 1 / sqrt(Float(64))
+        let contiguousScores = try turboQuantMetalQK(
+            queries: queries,
+            keyCode: contiguousKeyCode,
+            scale: scale,
+            mask: .causal
+        )
+        let stridedScores = try turboQuantMetalQK(
+            queries: stridedQueries,
+            keyCode: stridedKeyCode,
+            scale: scale,
+            mask: .causal
+        )
+        let contiguousOutput = try turboQuantMetalScaledDotProductAttention(
+            queries: queries,
+            keyCode: contiguousKeyCode,
+            valueCode: contiguousValueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: true
+        )
+        let stridedOutput = try turboQuantMetalScaledDotProductAttention(
+            queries: stridedQueries,
+            keyCode: stridedKeyCode,
+            valueCode: stridedValueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: true
+        )
+        eval(contiguousScores, stridedScores, contiguousOutput, stridedOutput)
+
+        XCTAssertTrue(allClose(stridedScores, contiguousScores, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        XCTAssertTrue(allClose(stridedOutput, contiguousOutput, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+    }
+
     func testTurboQuantAttentionRejectsRoleSpecificValueBitsetsBeforeLaunch() throws {
         let layout = TurboQuantAttentionLayout(
             batchSize: 1,
