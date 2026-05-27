@@ -2509,6 +2509,212 @@ public func turboQuantMetalScaledDotProductAttention(
     )
 }
 
+public func turboQuantMetalSegmentedScaledDotProductAttention(
+    queries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    coldSegments: [(key: TurboQuantAttentionCode, value: TurboQuantAttentionCode)],
+    scale: Float,
+    outputDType: DType = .float32,
+    kernelProfile: TurboQuantKernelProfile? = nil,
+    stream: StreamOrDevice = .gpu
+) throws -> MLXArray {
+    try requireTurboQuantMetalAttentionOutputDType(outputDType)
+    try requireTurboQuantMetalAttention()
+    try validateAttentionShape(queries.shape, dtype: queries.dtype, groupSize: 32)
+    try validateAttentionShape(rawKeys.shape, dtype: rawKeys.dtype, groupSize: 32)
+    try validateAttentionShape(rawValues.shape, dtype: rawValues.dtype, groupSize: 32)
+    guard queries.dim(2) == 1 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "segmented TurboQuant attention currently supports decode query length 1"
+        )
+    }
+    guard rawKeys.dim(2) > 0 || !coldSegments.isEmpty else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "segmented TurboQuant attention requires a raw or compressed segment"
+        )
+    }
+    guard queries.dim(0) == rawKeys.dim(0), rawKeys.shape == rawValues.shape else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "raw segmented attention keys and values must share batch, heads, tokens, and dimensions"
+        )
+    }
+    guard queries.dim(3) == rawKeys.dim(3), queries.dim(3) == rawValues.dim(3) else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "raw segmented attention head dimension must match query head dimension"
+        )
+    }
+    guard queries.dim(1) % rawKeys.dim(1) == 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "query heads must be a multiple of raw KV heads"
+        )
+    }
+
+    let profile =
+        kernelProfile
+        ?? TurboQuantRuntimeProbe.shared.selectedKernelProfileWithoutRunningProbe()
+    let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
+    var partialStats: [MLXArray] = []
+    var partialOut: [MLXArray] = []
+    var totalBlocks = 0
+
+    if rawKeys.dim(2) > 0 {
+        let rawWidth = turboQuantBlockParallelFusedThreadgroupWidth(
+            minimum: max(queries.dim(3), min(rawKeys.dim(2), 512))
+        )
+        let rawPartials = TurboQuantMetalKernels.segmentedRawAttentionStats(
+            [queries, rawKeys, rawValues, scale],
+            template: [
+                ("BATCH_SIZE", queries.dim(0)),
+                ("QUERY_HEADS", queries.dim(1)),
+                ("KV_HEADS", rawKeys.dim(1)),
+                ("QUERY_LENGTH", queries.dim(2)),
+                ("RAW_LENGTH", rawKeys.dim(2)),
+                ("HEAD_DIM", queries.dim(3)),
+                ("THREADS_PER_BLOCK", rawWidth),
+            ],
+            grid: (rowCount * rawWidth, 1, 1),
+            threadGroup: (rawWidth, 1, 1),
+            outputShapes: [
+                [rowCount, 1, 2],
+                [rowCount, 1, queries.dim(3)],
+            ],
+            outputDTypes: [.float32, .float32],
+            stream: stream
+        )
+        partialStats.append(rawPartials[0])
+        partialOut.append(rawPartials[1])
+        totalBlocks += 1
+    }
+
+    for (keyCode, valueCode) in coldSegments {
+        try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
+        try validateAttentionQuery(queries, code: keyCode)
+        try validateAttentionCodeStorage(keyCode)
+        try validateAttentionCodeStorage(valueCode)
+        guard keyCode.layout.headDimension == queries.dim(3),
+            valueCode.layout.headDimension == queries.dim(3)
+        else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "compressed segmented attention head dimension must match query head dimension"
+            )
+        }
+
+        let blockWidth =
+            turboQuantResolvedBlockParallelTokenBlockSize(
+                logicalLength: keyCode.layout.logicalLength,
+                headDimension: queries.dim(3),
+                queryLength: queries.dim(2),
+                kernelProfile: profile,
+                requestedBlockParallelTokenBlockSize: nil
+            )
+            ?? turboQuantBlockParallelFusedThreadgroupWidth(
+                minimum: max(queries.dim(3), min(keyCode.layout.logicalLength, 512))
+            )
+        let activeBlockCount = max(1, (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth)
+        guard activeBlockCount <= blockWidth else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "segmented compressed attention active block count \(activeBlockCount) exceeds block width \(blockWidth)"
+            )
+        }
+        let queryHeadRepeats = queries.dim(1) / keyCode.layout.kvHeadCount
+        let useGroupedQueryKernel =
+            profile == .macAppleSilicon
+            && queries.dim(1) % keyCode.layout.kvHeadCount == 0
+            && queryHeadRepeats > 1
+            && queryHeadRepeats <= 4
+        let partialRows =
+            useGroupedQueryKernel
+            ? queries.dim(0) * keyCode.layout.kvHeadCount * queries.dim(2)
+            : rowCount
+        let partialKernel =
+            useGroupedQueryKernel
+            ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
+            : TurboQuantMetalKernels.fusedAttentionBlockPartials
+        let template =
+            runtimeLayoutAttentionTemplate(
+                configuration: TurboQuantConfiguration(
+                    preset: keyCode.preset,
+                    role: .key,
+                    groupSize: keyCode.groupSize,
+                    backend: .metalPolarQJL,
+                    seed: keyCode.seed,
+                    valueBits: valueCode.valueBits,
+                    attentionLayoutVersion: keyCode.layout.layoutVersion,
+                    allowExperimentalLayoutV5: keyCode.layout.isLayoutV5,
+                    attentionScaleStorage: turboQuantAttentionScaleStorage(for: keyCode)
+                ),
+                layout: keyCode.layout,
+                inputLength: keyCode.layout.logicalLength,
+                outputLength: keyCode.layout.logicalLength,
+                queryHeadCount: queries.dim(1),
+                queryLength: queries.dim(2),
+                outputDType: .float32,
+                causal: false
+            ) + [
+                ("VALUE_MAG_WORDS_PER_GROUP", valueCode.layout.magnitudeWordsPerGroup),
+                ("VALUE_SCALES_PER_GROUP", valueCode.scalesPerGroup),
+                ("THREADS_PER_BLOCK", blockWidth),
+                ("BLOCK_TOKENS", blockWidth),
+                ("BLOCK_COUNT", activeBlockCount),
+                ("GQA_REPEATS", useGroupedQueryKernel ? queryHeadRepeats : 1),
+            ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
+
+        let compressedPartials = partialKernel(
+            [
+                queries,
+                keyCode.packedMagnitudes,
+                keyCode.signs,
+                keyCode.highPrecisionMask,
+                keyCode.residualSigns,
+                keyCode.scales,
+                valueCode.packedMagnitudes,
+                valueCode.signs,
+                valueCode.highPrecisionMask,
+                valueCode.residualSigns,
+                valueCode.scales,
+                Int32(keyCode.layout.logicalLength),
+                Int32(keyCode.layout.ringOffset),
+                Int32(keyCode.layout.pinnedPrefixLength),
+                scale,
+            ],
+            template: template,
+            grid: (partialRows * activeBlockCount * blockWidth, 1, 1),
+            threadGroup: (blockWidth, 1, 1),
+            outputShapes: [
+                [rowCount, activeBlockCount, 2],
+                [rowCount, activeBlockCount, queries.dim(3)],
+            ],
+            outputDTypes: [.float32, .float32],
+            stream: stream
+        )
+        partialStats.append(compressedPartials[0])
+        partialOut.append(compressedPartials[1])
+        totalBlocks += activeBlockCount
+    }
+
+    let stats = partialStats.count == 1 ? partialStats[0] : concatenated(partialStats, axis: 1)
+    let values = partialOut.count == 1 ? partialOut[0] : concatenated(partialOut, axis: 1)
+    let reduceWidth = turboQuantBlockParallelFusedThreadgroupWidth(
+        minimum: max(totalBlocks, queries.dim(3))
+    )
+    return TurboQuantMetalKernels.fusedAttentionBlockReduce(
+        [stats, values],
+        template: [
+            ("ROW_COUNT", rowCount),
+            ("HEAD_DIM", queries.dim(3)),
+            ("BLOCK_COUNT", totalBlocks),
+            ("THREADS_PER_BLOCK", reduceWidth),
+            ("OUTPUT_DTYPE", outputDType),
+        ],
+        grid: (rowCount * reduceWidth, 1, 1),
+        threadGroup: (reduceWidth, 1, 1),
+        outputShapes: [[queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]],
+        outputDTypes: [outputDType],
+        stream: stream
+    )[0]
+}
+
 public func turboQuantMetalSupportsOnlineFusedAttention(
     queries: MLXArray,
     keyCode: TurboQuantAttentionCode,
@@ -5537,6 +5743,15 @@ private enum TurboQuantMetalKernels {
         ensureRowContiguous: false
     )
 
+    static let segmentedRawAttentionStats = MLXFast.metalKernel(
+        name: "turboquant_segmented_raw_attention_stats",
+        inputNames: ["q", "k", "v", "runtime_attention_scale"],
+        outputNames: ["partial_stats", "partial_out"],
+        source: segmentedRawAttentionStatsSource,
+        header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
     private static let vectorHeader = """
         inline ulong tq_vector_mix_index(ulong seed, ulong index) {
             ulong mixed = seed + index * 0x9E3779B97F4A7C15ul;
@@ -8086,6 +8301,117 @@ private enum TurboQuantMetalKernels {
             }
             out[row * uint(HEAD_DIM) + lane] = static_cast<OUTPUT_DTYPE>(
                 accum / max(row_sum, 1.17549435e-38f));
+        }
+        """
+
+    private static let segmentedRawAttentionStatsSource = """
+        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        uint row_count = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH);
+        if (row >= row_count) {
+            return;
+        }
+
+        threadgroup float partial[512];
+        threadgroup float tile_scores[512];
+        threadgroup float query_cache[HEAD_DIM];
+        threadgroup float output_accum[HEAD_DIM];
+
+        uint q_token = row % uint(QUERY_LENGTH);
+        uint q_head = (row / uint(QUERY_LENGTH)) % uint(QUERY_HEADS);
+        uint batch = row / (uint(QUERY_LENGTH) * uint(QUERY_HEADS));
+        uint repeats = uint(QUERY_HEADS) / uint(KV_HEADS);
+        uint kv_head = q_head / repeats;
+        float attention_scale = float(runtime_attention_scale);
+
+        float row_max = -INFINITY;
+        float row_sum = 0.0f;
+        if (lane < uint(HEAD_DIM)) {
+            long q_index =
+                long(batch) * q_strides[0]
+                + long(q_head) * q_strides[1]
+                + long(q_token) * q_strides[2]
+                + long(lane) * q_strides[3];
+            query_cache[lane] = float(q[q_index]);
+            output_accum[lane] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint tile_start = 0u; tile_start < uint(RAW_LENGTH); tile_start += threads_per_block) {
+            uint token = tile_start + lane;
+            bool active = token < uint(RAW_LENGTH);
+            float scaled_score = -INFINITY;
+            if (active) {
+                float score = 0.0f;
+                for (uint dim = 0u; dim < uint(HEAD_DIM); dim++) {
+                    long k_index =
+                        long(batch) * k_strides[0]
+                        + long(kv_head) * k_strides[1]
+                        + long(token) * k_strides[2]
+                        + long(dim) * k_strides[3];
+                    score += query_cache[dim] * float(k[k_index]);
+                }
+                scaled_score = score * attention_scale;
+            }
+            tile_scores[lane] = scaled_score;
+            partial[lane] = scaled_score;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+                if (lane < stride) {
+                    partial[lane] = max(partial[lane], partial[lane + stride]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            float tile_max = partial[0];
+            float tile_weight = active ? exp(tile_scores[lane] - tile_max) : 0.0f;
+            tile_scores[lane] = tile_weight;
+            partial[lane] = tile_weight;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+                if (lane < stride) {
+                    partial[lane] += partial[lane + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            float tile_sum = partial[0];
+            float new_max = max(row_max, tile_max);
+            float previous_scale = row_sum > 0.0f ? exp(row_max - new_max) : 0.0f;
+            float tile_scale = tile_sum > 0.0f ? exp(tile_max - new_max) : 0.0f;
+
+            if (lane < uint(HEAD_DIM)) {
+                output_accum[lane] *= previous_scale;
+                float dimension_accum = 0.0f;
+                for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
+                    float weight = tile_scores[tile_lane];
+                    if (weight > 0.0f) {
+                        uint value_token = tile_start + tile_lane;
+                        long v_index =
+                            long(batch) * v_strides[0]
+                            + long(kv_head) * v_strides[1]
+                            + long(value_token) * v_strides[2]
+                            + long(lane) * v_strides[3];
+                        dimension_accum += weight * float(v[v_index]);
+                    }
+                }
+                output_accum[lane] += tile_scale * dimension_accum;
+            }
+            row_sum = row_sum * previous_scale + tile_sum * tile_scale;
+            row_max = new_max;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            uint stat_index = row * 2u;
+            partial_stats[stat_index] = row_max;
+            partial_stats[stat_index + 1u] = row_sum;
+        }
+        if (lane < uint(HEAD_DIM)) {
+            partial_out[row * uint(HEAD_DIM) + lane] = output_accum[lane];
         }
         """
 

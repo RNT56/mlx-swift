@@ -1737,6 +1737,91 @@ class QuantizationTests: XCTestCase {
         )
     }
 
+    func testTurboQuantSegmentedAttentionMergesRawAndCompressedStatsWhenAvailable() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let qValues: [Float] = (0 ..< (1 * 2 * 1 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.27 * sin(position * 0.031) + 0.11 * cos(position * 0.079))
+        }
+        let coldKeyValues: [Float] = (0 ..< (1 * 2 * 5 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.19 * cos(position * 0.043) - 0.08 * sin(position * 0.067))
+        }
+        let coldValueValues: [Float] = (0 ..< (1 * 2 * 5 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.16 * sin(position * 0.053) + 0.12 * cos(position * 0.097))
+        }
+        let rawKeyValues: [Float] = (0 ..< (1 * 2 * 3 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.21 * sin(position * 0.037) - 0.09 * cos(position * 0.083))
+        }
+        let rawValueValues: [Float] = (0 ..< (1 * 2 * 3 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.14 * cos(position * 0.047) + 0.10 * sin(position * 0.071))
+        }
+        let queries = MLXArray(qValues, [1, 2, 1, 64])
+        let coldKeys = MLXArray(coldKeyValues, [1, 2, 5, 64])
+        let coldValues = MLXArray(coldValueValues, [1, 2, 5, 64])
+        let rawKeys = MLXArray(rawKeyValues, [1, 2, 3, 64])
+        let rawValues = MLXArray(rawValueValues, [1, 2, 3, 64])
+        let keyCode = try turboQuantMetalEncodeAttention(
+            coldKeys,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 81
+            )
+        )
+        let valueCode = try turboQuantMetalEncodeAttention(
+            coldValues,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .value,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 83,
+                valueBits: 4
+            )
+        )
+
+        let scale = 1 / sqrt(Float(64))
+        let segmented = try turboQuantMetalSegmentedScaledDotProductAttention(
+            queries: queries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            coldSegments: [(key: keyCode, value: valueCode)],
+            scale: scale,
+            outputDType: .float32
+        )
+
+        let coldScores = try turboQuantMetalQK(
+            queries: queries,
+            keyCode: keyCode,
+            scale: scale,
+            mask: .none
+        )
+        let rawScores = (queries * scale).matmul(rawKeys.transposed(0, 1, 3, 2))
+        let scores = concatenated([coldScores.asType(.float32), rawScores.asType(.float32)], axis: -1)
+        let weights = softmax(scores, axis: -1)
+        let coldWeights = weights[.ellipsis, 0 ..< coldKeys.dim(2)].contiguous()
+        let rawWeights = weights[.ellipsis, coldKeys.dim(2)...].contiguous()
+        let coldOutput = try turboQuantMetalAV(
+            attentionWeights: coldWeights,
+            valueCode: valueCode,
+            outputDType: .float32
+        )
+        let rawOutput = rawWeights.matmul(rawValues)
+        let reference = coldOutput.asType(.float32) + rawOutput.asType(.float32)
+
+        XCTAssertEqual(segmented.shape, [1, 2, 1, 64])
+        XCTAssertTrue(allClose(segmented, reference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+    }
+
     func testTurboQuantCompressedAttentionUsesOnlineFusedForLargeHeadsWhenAvailable() throws {
         guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
             throw XCTSkip("Metal compressed attention unavailable")
