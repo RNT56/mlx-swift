@@ -2459,6 +2459,52 @@ class QuantizationTests: XCTestCase {
         )
     }
 
+    func testTurboQuantRecommendedBlockParallelTokenBlockSizeScalesLongContexts() {
+        XCTAssertNil(
+            turboQuantRecommendedBlockParallelTokenBlockSize(
+                logicalLength: 2_048,
+                headDimension: 256,
+                queryLength: 1,
+                kernelProfile: .macAppleSilicon
+            )
+        )
+        XCTAssertEqual(
+            turboQuantRecommendedBlockParallelTokenBlockSize(
+                logicalLength: 32_768,
+                headDimension: 256,
+                queryLength: 1,
+                kernelProfile: .macAppleSilicon
+            ),
+            512
+        )
+        XCTAssertEqual(
+            turboQuantRecommendedBlockParallelTokenBlockSize(
+                logicalLength: 131_072,
+                headDimension: 256,
+                queryLength: 1,
+                kernelProfile: .portableA16A17
+            ),
+            512
+        )
+        XCTAssertEqual(
+            turboQuantRecommendedBlockParallelTokenBlockSize(
+                logicalLength: 262_144,
+                headDimension: 256,
+                queryLength: 1,
+                kernelProfile: .wideA18A19
+            ),
+            512
+        )
+        XCTAssertNil(
+            turboQuantRecommendedBlockParallelTokenBlockSize(
+                logicalLength: 32_768,
+                headDimension: 256,
+                queryLength: 4,
+                kernelProfile: .macAppleSilicon
+            )
+        )
+    }
+
     func testTurboQuantProbeWithFailedFusedSelfTestDoesNotAdvertiseFusedHeads() {
         let probe = TurboQuantRuntimeProbeResult(
             status: .passed,

@@ -42,6 +42,7 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var layoutVersion: Int?
     public var scaleStorage: String?
     public var blockParallelTokenBlockSize: Int?
+    public var recommendedBlockParallelTokenBlockSize: Int?
     public var warmupIterations: Int?
     public var encodeMS: Double?
     public var decodeMS: Double?
@@ -73,6 +74,7 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         layoutVersion: Int? = nil,
         scaleStorage: String? = nil,
         blockParallelTokenBlockSize: Int? = nil,
+        recommendedBlockParallelTokenBlockSize: Int? = nil,
         warmupIterations: Int? = nil,
         encodeMS: Double? = nil,
         decodeMS: Double? = nil,
@@ -103,6 +105,7 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.layoutVersion = layoutVersion
         self.scaleStorage = scaleStorage
         self.blockParallelTokenBlockSize = blockParallelTokenBlockSize
+        self.recommendedBlockParallelTokenBlockSize = recommendedBlockParallelTokenBlockSize
         self.warmupIterations = warmupIterations
         self.encodeMS = encodeMS
         self.decodeMS = decodeMS

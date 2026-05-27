@@ -248,6 +248,46 @@ private func turboQuantBlockParallelFusedThreadgroupWidth(minimum: Int) -> Int {
     return width
 }
 
+public func turboQuantRecommendedBlockParallelTokenBlockSize(
+    logicalLength: Int,
+    headDimension: Int,
+    queryLength: Int,
+    kernelProfile: TurboQuantKernelProfile
+) -> Int? {
+    guard queryLength == 1, logicalLength >= 4_096 else { return nil }
+    let profileDefault = kernelProfile.blockParallelFusedTokenBlockSize
+    var minimum = max(1, headDimension, profileDefault)
+
+    if logicalLength > profileDefault * profileDefault {
+        minimum = max(minimum, Int(ceil(sqrt(Double(logicalLength)))))
+    }
+
+    let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(minimum: minimum)
+    let activeBlockCount = (logicalLength + blockWidth - 1) / blockWidth
+    guard activeBlockCount > 1, activeBlockCount <= blockWidth else { return nil }
+    return blockWidth
+}
+
+private func turboQuantResolvedBlockParallelTokenBlockSize(
+    logicalLength: Int,
+    headDimension: Int,
+    queryLength: Int,
+    kernelProfile: TurboQuantKernelProfile,
+    requestedBlockParallelTokenBlockSize: Int?
+) -> Int? {
+    if let requestedBlockParallelTokenBlockSize {
+        return turboQuantBlockParallelFusedThreadgroupWidth(
+            minimum: max(1, headDimension, requestedBlockParallelTokenBlockSize)
+        )
+    }
+    return turboQuantRecommendedBlockParallelTokenBlockSize(
+        logicalLength: logicalLength,
+        headDimension: headDimension,
+        queryLength: queryLength,
+        kernelProfile: kernelProfile
+    )
+}
+
 public enum TurboQuantRuntimeSelfTestStatus: String, Codable, Sendable, CaseIterable {
     case notRun
     case passed
@@ -2738,15 +2778,18 @@ private func turboQuantShouldUseBlockParallelFusedAttention(
     guard queries.dim(2) == 1 else { return false }
     guard queries.dim(3) == keyCode.layout.headDimension else { return false }
     guard keyCode.layout.headDimension == valueCode.layout.headDimension else { return false }
-    let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(
-        minimum: max(
-            queries.dim(3),
-            blockParallelTokenBlockSize ?? kernelProfile.blockParallelFusedTokenBlockSize
+    guard
+        let blockWidth = turboQuantResolvedBlockParallelTokenBlockSize(
+            logicalLength: keyCode.layout.logicalLength,
+            headDimension: queries.dim(3),
+            queryLength: queries.dim(2),
+            kernelProfile: kernelProfile,
+            requestedBlockParallelTokenBlockSize: blockParallelTokenBlockSize
         )
-    )
+    else { return false }
     let activeBlockCount = (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth
     guard activeBlockCount > 1, activeBlockCount <= blockWidth else { return false }
-    return keyCode.layout.logicalLength >= 4_096
+    return true
 }
 
 private func turboQuantMetalBlockParallelFusedAttention(
@@ -2762,12 +2805,19 @@ private func turboQuantMetalBlockParallelFusedAttention(
 ) throws -> MLXArray {
     let outputShape = [queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]
     let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
-    let blockWidth = turboQuantBlockParallelFusedThreadgroupWidth(
-        minimum: max(
-            queries.dim(3),
-            blockParallelTokenBlockSize ?? kernelProfile.blockParallelFusedTokenBlockSize
+    guard
+        let blockWidth = turboQuantResolvedBlockParallelTokenBlockSize(
+            logicalLength: keyCode.layout.logicalLength,
+            headDimension: queries.dim(3),
+            queryLength: queries.dim(2),
+            kernelProfile: kernelProfile,
+            requestedBlockParallelTokenBlockSize: blockParallelTokenBlockSize
         )
-    )
+    else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "block-parallel fused attention is not recommended for logical length \(keyCode.layout.logicalLength), query length \(queries.dim(2)), head dimension \(queries.dim(3)), and profile \(kernelProfile.rawValue)"
+        )
+    }
     let activeBlockCount = (keyCode.layout.logicalLength + blockWidth - 1) / blockWidth
     guard activeBlockCount > 1, activeBlockCount <= blockWidth else {
         throw TurboQuantError.invalidMetalConfiguration(
@@ -2820,6 +2870,7 @@ private func turboQuantMetalBlockParallelFusedAttention(
         useGroupedQueryKernel
         ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
         : TurboQuantMetalKernels.fusedAttentionBlockPartials
+    let partialOutputDType = outputDType == .float32 ? DType.float32 : outputDType
     let partials = partialKernel(
         [
             queries,
@@ -2845,7 +2896,7 @@ private func turboQuantMetalBlockParallelFusedAttention(
             [rowCount, activeBlockCount, 2],
             [rowCount, activeBlockCount, queries.dim(3)],
         ],
-        outputDTypes: [.float32, .float32],
+        outputDTypes: [.float32, partialOutputDType],
         stream: stream
     )
 

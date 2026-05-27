@@ -431,6 +431,12 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         layoutVersion: options.layoutVersion,
         scaleStorage: options.scaleStorage.rawValue,
         blockParallelTokenBlockSize: options.blockParallelTokenBlockSize,
+        recommendedBlockParallelTokenBlockSize: turboQuantRecommendedBlockParallelTokenBlockSize(
+            logicalLength: options.contextTokens,
+            headDimension: options.headDimension,
+            queryLength: options.queryLength,
+            kernelProfile: pathDecision.kernelProfile
+        ),
         warmupIterations: options.warmup,
         encodeMS: encodeMS,
         decodeMS: decodeMS,
