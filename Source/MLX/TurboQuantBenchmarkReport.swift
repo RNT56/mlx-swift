@@ -41,6 +41,12 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var groupSize: Int
     public var layoutVersion: Int?
     public var scaleStorage: String?
+    public var hotTokens: Int?
+    public var coldBlockCount: Int?
+    public var selectedColdTokens: Int?
+    public var coldBudgetTokens: Int?
+    public var selectorConfidence: Double?
+    public var fullScanFallbackCount: Int?
     public var blockParallelTokenBlockSize: Int?
     public var recommendedBlockParallelTokenBlockSize: Int?
     public var warmupIterations: Int?
@@ -73,6 +79,12 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         groupSize: Int,
         layoutVersion: Int? = nil,
         scaleStorage: String? = nil,
+        hotTokens: Int? = nil,
+        coldBlockCount: Int? = nil,
+        selectedColdTokens: Int? = nil,
+        coldBudgetTokens: Int? = nil,
+        selectorConfidence: Double? = nil,
+        fullScanFallbackCount: Int? = nil,
         blockParallelTokenBlockSize: Int? = nil,
         recommendedBlockParallelTokenBlockSize: Int? = nil,
         warmupIterations: Int? = nil,
@@ -104,6 +116,12 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.groupSize = groupSize
         self.layoutVersion = layoutVersion
         self.scaleStorage = scaleStorage
+        self.hotTokens = hotTokens
+        self.coldBlockCount = coldBlockCount
+        self.selectedColdTokens = selectedColdTokens
+        self.coldBudgetTokens = coldBudgetTokens
+        self.selectorConfidence = selectorConfidence
+        self.fullScanFallbackCount = fullScanFallbackCount
         self.blockParallelTokenBlockSize = blockParallelTokenBlockSize
         self.recommendedBlockParallelTokenBlockSize = recommendedBlockParallelTokenBlockSize
         self.warmupIterations = warmupIterations
@@ -229,6 +247,14 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
                 copyRisk: "high",
                 mitigation:
                     "Mac-gated grouped-query block partial kernels reuse compressed K/V reads across Qwen query-head pairs without materializing decoded cache copies",
+                status: "guarded"
+            ),
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "segmented hybrid attention",
+                largeInput: "selected compressed cold blocks plus raw hot tail",
+                copyRisk: "high",
+                mitigation:
+                    "raw and compressed segment partials are merged by online softmax statistics while selected cold blocks remain compressed",
                 status: "guarded"
             ),
         ],
