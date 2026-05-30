@@ -41,6 +41,14 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var groupSize: Int
     public var layoutVersion: Int?
     public var scaleStorage: String?
+    public var hotTokens: Int?
+    public var coldBlockCount: Int?
+    public var selectedColdTokens: Int?
+    public var coldBudgetTokens: Int?
+    public var selectorConfidence: Double?
+    public var fullScanFallbackCount: Int?
+    public var blockParallelTokenBlockSize: Int?
+    public var recommendedBlockParallelTokenBlockSize: Int?
     public var warmupIterations: Int?
     public var encodeMS: Double?
     public var decodeMS: Double?
@@ -48,6 +56,8 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var avMS: Double?
     public var fusedMS: Double?
     public var firstTokenLatencyMS: Double?
+    public var attentionLatencyMSP50: Double?
+    public var attentionLatencyMSP95: Double?
     public var prefillTokensPerSecond: Double?
     public var decodeTokensPerSecondP50: Double?
     public var decodeTokensPerSecondP95: Double?
@@ -69,6 +79,14 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         groupSize: Int,
         layoutVersion: Int? = nil,
         scaleStorage: String? = nil,
+        hotTokens: Int? = nil,
+        coldBlockCount: Int? = nil,
+        selectedColdTokens: Int? = nil,
+        coldBudgetTokens: Int? = nil,
+        selectorConfidence: Double? = nil,
+        fullScanFallbackCount: Int? = nil,
+        blockParallelTokenBlockSize: Int? = nil,
+        recommendedBlockParallelTokenBlockSize: Int? = nil,
         warmupIterations: Int? = nil,
         encodeMS: Double? = nil,
         decodeMS: Double? = nil,
@@ -76,6 +94,8 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         avMS: Double? = nil,
         fusedMS: Double? = nil,
         firstTokenLatencyMS: Double? = nil,
+        attentionLatencyMSP50: Double? = nil,
+        attentionLatencyMSP95: Double? = nil,
         prefillTokensPerSecond: Double? = nil,
         decodeTokensPerSecondP50: Double? = nil,
         decodeTokensPerSecondP95: Double? = nil,
@@ -96,6 +116,14 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.groupSize = groupSize
         self.layoutVersion = layoutVersion
         self.scaleStorage = scaleStorage
+        self.hotTokens = hotTokens
+        self.coldBlockCount = coldBlockCount
+        self.selectedColdTokens = selectedColdTokens
+        self.coldBudgetTokens = coldBudgetTokens
+        self.selectorConfidence = selectorConfidence
+        self.fullScanFallbackCount = fullScanFallbackCount
+        self.blockParallelTokenBlockSize = blockParallelTokenBlockSize
+        self.recommendedBlockParallelTokenBlockSize = recommendedBlockParallelTokenBlockSize
         self.warmupIterations = warmupIterations
         self.encodeMS = encodeMS
         self.decodeMS = decodeMS
@@ -103,6 +131,8 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.avMS = avMS
         self.fusedMS = fusedMS
         self.firstTokenLatencyMS = firstTokenLatencyMS
+        self.attentionLatencyMSP50 = attentionLatencyMSP50
+        self.attentionLatencyMSP95 = attentionLatencyMSP95
         self.prefillTokensPerSecond = prefillTokensPerSecond
         self.decodeTokensPerSecondP50 = decodeTokensPerSecondP50
         self.decodeTokensPerSecondP95 = decodeTokensPerSecondP95
@@ -199,12 +229,37 @@ public struct TurboQuantHiddenCopyAudit: Codable, Sendable {
                 kernelName: "layout V5 fp16 scales",
                 largeInput: "compressed scale tables",
                 copyRisk: "medium",
-                mitigation: "V5 scale tables are emitted directly by the Metal encode kernel and validated as canonical float16/float32 storage before dispatch",
+                mitigation:
+                    "V5 scale tables are emitted directly by the Metal encode kernel and validated as canonical float16/float32 storage before dispatch",
+                status: "guarded"
+            ),
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "block-parallel fused",
+                largeInput: "compressed K/V cache",
+                copyRisk: "high",
+                mitigation:
+                    "block partial kernels consume canonical compressed K/V arrays and emit bounded per-block partials, not decoded cache copies",
+                status: "guarded"
+            ),
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "GQA block-parallel fused",
+                largeInput: "compressed K/V cache shared by grouped query heads",
+                copyRisk: "high",
+                mitigation:
+                    "Mac-gated grouped-query block partial kernels reuse compressed K/V reads across Qwen query-head pairs without materializing decoded cache copies",
+                status: "guarded"
+            ),
+            TurboQuantHiddenCopyAuditEntry(
+                kernelName: "segmented hybrid attention",
+                largeInput: "selected compressed cold blocks plus raw hot tail",
+                copyRisk: "high",
+                mitigation:
+                    "raw and compressed segment partials are merged by online softmax statistics while selected cold blocks remain compressed",
                 status: "guarded"
             ),
         ],
         notes: currentW3.notes + [
-            "Layout V5 is feature-gated and off by default; V4 remains the default write layout.",
+            "Layout V5 is the default write layout; V4 remains supported for compatibility comparisons."
         ]
     )
 }

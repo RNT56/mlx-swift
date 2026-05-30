@@ -31,6 +31,10 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
         XCTAssertEqual(decoded.metrics.contextTokens, 256)
         XCTAssertEqual(decoded.metrics.layoutVersion, TurboQuantAttentionLayout.currentVersion)
         XCTAssertEqual(decoded.metrics.scaleStorage, TurboQuantScaleStorage.float32.rawValue)
+        XCTAssertEqual(decoded.metrics.hotTokens, 128)
+        XCTAssertEqual(decoded.metrics.selectedColdTokens, 64)
+        XCTAssertEqual(decoded.metrics.coldBudgetTokens, 128)
+        XCTAssertEqual(decoded.metrics.selectorConfidence, 0.75)
         XCTAssertEqual(decoded.metrics.compressedKVBytes, decoded.metrics.totalBytes)
         XCTAssertEqual(decoded.hiddenCopyAudit.status, .pass)
     }
@@ -118,6 +122,9 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
 
         XCTAssertEqual(audit.status, .pass)
         XCTAssertTrue(kernelNames.contains("layout V5 fp16 scales"))
+        XCTAssertTrue(kernelNames.contains("block-parallel fused"))
+        XCTAssertTrue(kernelNames.contains("GQA block-parallel fused"))
+        XCTAssertTrue(kernelNames.contains("segmented hybrid attention"))
         XCTAssertTrue(audit.notes.contains { $0.contains("Layout V5") })
     }
 
@@ -158,6 +165,12 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
                 groupSize: 64,
                 layoutVersion: TurboQuantAttentionLayout.currentVersion,
                 scaleStorage: TurboQuantScaleStorage.float32.rawValue,
+                hotTokens: 128,
+                coldBlockCount: 2,
+                selectedColdTokens: 64,
+                coldBudgetTokens: 128,
+                selectorConfidence: 0.75,
+                fullScanFallbackCount: 0,
                 warmupIterations: 1,
                 qkMS: 0.4,
                 avMS: 0.5,

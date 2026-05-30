@@ -55,10 +55,10 @@ final class TurboQuantContractsTests: XCTestCase {
         )
 
         XCTAssertEqual(keyEstimate.packedBytes, 40)
-        XCTAssertEqual(keyEstimate.bitsetBytes, 48)
+        XCTAssertEqual(keyEstimate.bitsetBytes, 16)
         XCTAssertEqual(keyEstimate.scaleBytes, 24)
-        XCTAssertEqual(keyEstimate.totalBytes, 112)
-        XCTAssertEqual(keyEstimate.actualBitsPerValue, 7)
+        XCTAssertEqual(keyEstimate.totalBytes, 80)
+        XCTAssertEqual(keyEstimate.actualBitsPerValue, 5.0)
 
         XCTAssertEqual(valueEstimate.packedBytes, 64)
         XCTAssertEqual(valueEstimate.bitsetBytes, 0)
@@ -110,8 +110,8 @@ final class TurboQuantContractsTests: XCTestCase {
             seed: 0,
             packedMagnitudes: MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32),
             signs: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            highPrecisionMask: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
-            residualSigns: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32),
+            highPrecisionMask: MLXArray.zeros([1], dtype: .uint32),
+            residualSigns: MLXArray.zeros([1], dtype: .uint32),
             scales: MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float32)
         )
         let valueCode = TurboQuantAttentionCode(

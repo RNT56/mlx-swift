@@ -45,7 +45,7 @@ final class TurboQuantValidationTests: XCTestCase {
         }
     }
 
-    func testKeyResidualSignsUseCompactUnusedStorage() {
+    func testLayoutV6KeyResidualSignsUseSplitMagnitudePlane() {
         var code = Self.makeCode(role: .key)
         code.residualSigns = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
 
@@ -58,7 +58,7 @@ final class TurboQuantValidationTests: XCTestCase {
 
     func testLayoutV5AcceptsFp16ScaleStorage() throws {
         var code = Self.makeCode(role: .key)
-        code.layout.layoutVersion = TurboQuantAttentionLayout.nextVersion
+        code.layout.layoutVersion = TurboQuantAttentionLayout.currentVersion
         code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
 
         try validateTurboQuantAttentionCode(code, expectedRole: .key)
@@ -66,6 +66,11 @@ final class TurboQuantValidationTests: XCTestCase {
 
     func testLayoutV4RejectsFp16ScaleStorage() {
         var code = Self.makeCode(role: .key)
+        code.layout.layoutVersion = TurboQuantAttentionLayout.legacyVersion
+        code.layout.magnitudeWordsPerGroup = 5
+        code.packedMagnitudes = MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32)
+        code.highPrecisionMask = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
+        code.residualSigns = MLXArray.zeros([1], dtype: .uint32)
         code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
 
         XCTAssertThrowsError(try validateTurboQuantAttentionCode(code, expectedRole: .key)) {
@@ -87,10 +92,10 @@ final class TurboQuantValidationTests: XCTestCase {
             magnitudeWordsPerGroup: role == .value ? 8 : 5,
             bitsetWordsPerGroup: 2
         )
-        let bitset = role == .value
+        let signs = role == .value
             ? MLXArray.zeros([1], dtype: .uint32)
             : MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
-        let compactUnusedBitset = MLXArray.zeros([1], dtype: .uint32)
+        let compact = MLXArray.zeros([1], dtype: .uint32)
         return TurboQuantAttentionCode(
             layout: layout,
             preset: role == .value ? .turbo4v2 : .turbo3_5,
@@ -102,9 +107,9 @@ final class TurboQuantValidationTests: XCTestCase {
                 [1, 1, 2, 1, role == .value ? 8 : 5],
                 dtype: .uint32
             ),
-            signs: bitset,
-            highPrecisionMask: bitset,
-            residualSigns: compactUnusedBitset,
+            signs: signs,
+            highPrecisionMask: compact,
+            residualSigns: compact,
             scales: MLXArray.zeros([1, 1, 2, 1, role == .value ? 2 : 3], dtype: .float32)
         )
     }

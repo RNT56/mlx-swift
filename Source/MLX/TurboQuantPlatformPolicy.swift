@@ -189,7 +189,7 @@ public struct TurboQuantPlatformCapabilityReport: Codable, Sendable, Hashable {
         },
         supportedOpenKVFormatVersions: [Int] = [],
         supportedAdaptivePrecisionPolicyVersions: [Int] = [],
-        supportedAttentionLayoutVersions: [Int] = [TurboQuantAttentionLayout.currentVersion],
+        supportedAttentionLayoutVersions: [Int] = TurboQuantAttentionLayout.supportedVersions,
         evidenceIDs: [String] = [],
         notes: [String] = []
     ) {

@@ -68,7 +68,17 @@ public func estimateTurboQuantStorage(
     let bitsetWords = ceilDivide(clampedGroupSize, by: 32)
     let scalesPerGroup = role == .value ? 2 : 3
     let packedBytes = groupCount * magnitudeWords * MemoryLayout<UInt32>.size
-    let bitsetBytes = role == .value ? 0 : groupCount * bitsetWords * 3 * MemoryLayout<UInt32>.size
+    let bitsetPlaneCount: Int
+    if role == .value {
+        bitsetPlaneCount = 0
+    } else {
+        let baseBits = Swift.max(1, preset.baseMagnitudeBits - 1)
+        let highBits = Swift.max(baseBits, preset.highMagnitudeBits - 1)
+        let usesSplitMagnitude = highBits == baseBits + 1
+        bitsetPlaneCount =
+            1 + (highBits > baseBits && !usesSplitMagnitude ? 1 : 0)
+    }
+    let bitsetBytes = groupCount * bitsetWords * bitsetPlaneCount * MemoryLayout<UInt32>.size
     let scaleBytes = groupCount * scalesPerGroup * scaleStorage.dtype.size
 
     return TurboQuantStorageEstimate(

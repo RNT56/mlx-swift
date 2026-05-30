@@ -1,9 +1,9 @@
 import Foundation
 import MLX
 
-private let benchmarkBatchSize = 1
-private let benchmarkQueryHeadCount = 4
-private let benchmarkKVHeadCount = 2
+private let defaultBenchmarkBatchSize = 1
+private let defaultBenchmarkQueryHeadCount = 4
+private let defaultBenchmarkKVHeadCount = 2
 
 struct QualityMetrics: Codable {
     var relativeMSE: Float
@@ -65,6 +65,9 @@ private struct BenchmarkOptions {
     var includeTimestamp: Bool
     var iterations: Int
     var warmup: Int
+    var batchSize: Int
+    var queryHeadCount: Int
+    var kvHeadCount: Int
     var headDimension: Int
     var contextTokens: Int
     var queryLength: Int
@@ -74,6 +77,7 @@ private struct BenchmarkOptions {
     var layoutVersion: Int
     var enableLayoutV5: Bool
     var scaleStorage: TurboQuantScaleStorage
+    var blockParallelTokenBlockSize: Int?
     var requestedPath: TurboQuantAttentionPath?
 
     var resolvedValueBits: Int {
@@ -81,7 +85,8 @@ private struct BenchmarkOptions {
     }
 
     static func parse(_ arguments: [String] = CommandLine.arguments) throws -> BenchmarkOptions {
-        let presetName = stringValue("--preset", in: arguments) ?? TurboQuantPreset.turbo4v2.rawValue
+        let presetName =
+            stringValue("--preset", in: arguments) ?? TurboQuantPreset.turbo4v2.rawValue
         guard let preset = TurboQuantPreset(rawValue: presetName) else {
             throw BenchmarkCLIError.invalidPreset(presetName)
         }
@@ -91,6 +96,13 @@ private struct BenchmarkOptions {
             includeTimestamp: arguments.contains("--include-timestamp"),
             iterations: try intValue("--iterations", in: arguments, default: 10, minimum: 1),
             warmup: try intValue("--warmup", in: arguments, default: 1, minimum: 0),
+            batchSize: try intValue(
+                "--batch-size", in: arguments, default: defaultBenchmarkBatchSize, minimum: 1),
+            queryHeadCount: try intValue(
+                "--query-heads", in: arguments, default: defaultBenchmarkQueryHeadCount,
+                minimum: 1),
+            kvHeadCount: try intValue(
+                "--kv-heads", in: arguments, default: defaultBenchmarkKVHeadCount, minimum: 1),
             headDimension: try intValue("--head-dim", in: arguments, default: 128, minimum: 1),
             contextTokens: try intValue("--context", in: arguments, default: 256, minimum: 1),
             queryLength: try intValue("--query-length", in: arguments, default: 1, minimum: 1),
@@ -105,6 +117,8 @@ private struct BenchmarkOptions {
             ),
             enableLayoutV5: arguments.contains("--enable-layout-v5"),
             scaleStorage: try scaleStorage(in: arguments),
+            blockParallelTokenBlockSize: try optionalIntValue(
+                "--block-tokens", in: arguments, minimum: 1),
             requestedPath: try requestedPath(in: arguments)
         )
     }
@@ -156,7 +170,8 @@ private struct BenchmarkOptions {
             return .onlineFused
         case TurboQuantAttentionPath.tiledOnlineFused.rawValue, "tiled-online-fused":
             return .tiledOnlineFused
-        case TurboQuantAttentionPath.twoStageCompressed.rawValue, "two-stage", "two-stage-compressed":
+        case TurboQuantAttentionPath.twoStageCompressed.rawValue, "two-stage",
+            "two-stage-compressed":
             return .twoStageCompressed
         case TurboQuantAttentionPath.mlxPackedFallback.rawValue, "mlx-packed-fallback":
             return .mlxPackedFallback
@@ -214,6 +229,25 @@ private func timed(
     try timedValue(iterations: iterations, warmup: warmup, evaluate: { eval($0) }, body)
 }
 
+private struct TimingSummary {
+    var averageSeconds: Double
+    var p50Seconds: Double
+    var p95Seconds: Double
+}
+
+private struct TimedValueSummary<T> {
+    var timing: TimingSummary
+    var value: T
+}
+
+private func timedSampled(
+    iterations: Int,
+    warmup: Int = 1,
+    _ body: () throws -> MLXArray
+) throws -> TimedValueSummary<MLXArray> {
+    try timedValueSampled(iterations: iterations, warmup: warmup, evaluate: { eval($0) }, body)
+}
+
 private func timedValue<T>(
     iterations: Int,
     warmup: Int,
@@ -238,6 +272,52 @@ private func timedValue<T>(
     let elapsed = Date.timeIntervalSinceReferenceDate - start
 
     return (elapsed / Double(measuredIterations), last!)
+}
+
+private func timedValueSampled<T>(
+    iterations: Int,
+    warmup: Int,
+    evaluate: (T) -> Void,
+    _ body: () throws -> T
+) throws -> TimedValueSummary<T> {
+    let measuredIterations = max(1, iterations)
+    var last: T?
+    var samples: [Double] = []
+    samples.reserveCapacity(measuredIterations)
+
+    for _ in 0 ..< max(0, warmup) {
+        let value = try body()
+        evaluate(value)
+        last = value
+    }
+
+    for _ in 0 ..< measuredIterations {
+        let start = Date.timeIntervalSinceReferenceDate
+        let value = try body()
+        evaluate(value)
+        let elapsed = Date.timeIntervalSinceReferenceDate - start
+        samples.append(elapsed)
+        last = value
+    }
+
+    let sorted = samples.sorted()
+    let average = samples.reduce(0, +) / Double(measuredIterations)
+    return TimedValueSummary(
+        timing: TimingSummary(
+            averageSeconds: average,
+            p50Seconds: percentile(sortedSamples: sorted, percentile: 0.50),
+            p95Seconds: percentile(sortedSamples: sorted, percentile: 0.95)
+        ),
+        value: last!
+    )
+}
+
+private func percentile(sortedSamples: [Double], percentile: Double) -> Double {
+    guard let first = sortedSamples.first else { return 0 }
+    guard sortedSamples.count > 1 else { return first }
+    let clamped = min(max(percentile, 0), 1)
+    let index = Int(ceil(clamped * Double(sortedSamples.count))) - 1
+    return sortedSamples[min(max(index, 0), sortedSamples.count - 1)]
 }
 
 private func skipped(_ name: String, reason: String) -> BenchmarkResult {
@@ -272,11 +352,14 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     var avMS: Double?
     var fusedMS: Double?
     var firstTokenLatencyMS: Double?
+    var attentionLatencyMSP50: Double?
+    var attentionLatencyMSP95: Double?
     var prefillTokensPerSecond: Double?
     var decodeTokensPerSecondP50: Double?
     var decodeTokensPerSecondP95: Double?
 
-    if availability.supportsMetalPolarQJLAttention && pathDecision.selectedPath.usesCompressedMetal {
+    if availability.supportsMetalPolarQJLAttention && pathDecision.selectedPath.usesCompressedMetal
+    {
         do {
             let measurement = try measureCoreAttention(options: options, decision: pathDecision)
             storageEstimate = measurement.storageEstimate
@@ -290,13 +373,20 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
                 prefillTokensPerSecond = Double(options.contextTokens) / encodeSeconds
             }
 
-            let attentionSeconds =
-                measurement.fusedSeconds ?? measurement.twoStageAttentionSeconds
-            if let attentionSeconds, attentionSeconds > 0 {
-                firstTokenLatencyMS = milliseconds(attentionSeconds)
-                let decodeTokensPerSecond = Double(options.queryLength) / attentionSeconds
-                decodeTokensPerSecondP50 = decodeTokensPerSecond
-                decodeTokensPerSecondP95 = decodeTokensPerSecond
+            if let attentionTiming = measurement.attentionTiming,
+                attentionTiming.averageSeconds > 0
+            {
+                firstTokenLatencyMS = milliseconds(attentionTiming.averageSeconds)
+                attentionLatencyMSP50 = milliseconds(attentionTiming.p50Seconds)
+                attentionLatencyMSP95 = milliseconds(attentionTiming.p95Seconds)
+                if attentionTiming.p50Seconds > 0 {
+                    decodeTokensPerSecondP50 =
+                        Double(options.queryLength) / attentionTiming.p50Seconds
+                }
+                if attentionTiming.p95Seconds > 0 {
+                    decodeTokensPerSecondP95 =
+                        Double(options.queryLength) / attentionTiming.p95Seconds
+                }
             }
         } catch {
             benchmarkError = String(describing: error)
@@ -340,6 +430,13 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         groupSize: options.groupSize,
         layoutVersion: options.layoutVersion,
         scaleStorage: options.scaleStorage.rawValue,
+        blockParallelTokenBlockSize: options.blockParallelTokenBlockSize,
+        recommendedBlockParallelTokenBlockSize: turboQuantRecommendedBlockParallelTokenBlockSize(
+            logicalLength: options.contextTokens,
+            headDimension: options.headDimension,
+            queryLength: options.queryLength,
+            kernelProfile: pathDecision.kernelProfile
+        ),
         warmupIterations: options.warmup,
         encodeMS: encodeMS,
         decodeMS: decodeMS,
@@ -347,6 +444,8 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         avMS: avMS,
         fusedMS: fusedMS,
         firstTokenLatencyMS: firstTokenLatencyMS,
+        attentionLatencyMSP50: attentionLatencyMSP50,
+        attentionLatencyMSP95: attentionLatencyMSP95,
         prefillTokensPerSecond: prefillTokensPerSecond,
         decodeTokensPerSecondP50: decodeTokensPerSecondP50,
         decodeTokensPerSecondP95: decodeTokensPerSecondP95,
@@ -378,6 +477,7 @@ private struct CoreAttentionMeasurement {
     var qkSeconds: Double?
     var avSeconds: Double?
     var fusedSeconds: Double?
+    var attentionTiming: TimingSummary?
 
     var twoStageAttentionSeconds: Double? {
         guard let qkSeconds, let avSeconds else { return nil }
@@ -391,29 +491,29 @@ private func measureCoreAttention(
 ) throws -> CoreAttentionMeasurement {
     let query = MLXArray(
         values(
-            count: benchmarkBatchSize * benchmarkQueryHeadCount * options.queryLength
+            count: options.batchSize * options.queryHeadCount * options.queryLength
                 * options.headDimension,
             scale: 0.019
         ),
-        [benchmarkBatchSize, benchmarkQueryHeadCount, options.queryLength, options.headDimension]
+        [options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension]
     )
     let keys = MLXArray(
         values(
-            count: benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
+            count: options.batchSize * options.kvHeadCount * options.contextTokens
                 * options.headDimension,
             scale: 0.007,
             phase: 0.1
         ),
-        [benchmarkBatchSize, benchmarkKVHeadCount, options.contextTokens, options.headDimension]
+        [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
     )
     let valuesArray = MLXArray(
         values(
-            count: benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
+            count: options.batchSize * options.kvHeadCount * options.contextTokens
                 * options.headDimension,
             scale: 0.009,
             phase: 0.2
         ),
-        [benchmarkBatchSize, benchmarkKVHeadCount, options.contextTokens, options.headDimension]
+        [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
     )
 
     let (encodeSeconds, codes) = try timedValue(
@@ -484,8 +584,24 @@ private func measureCoreAttention(
         )
     }
 
+    let selectedPathUsesFused =
+        decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused
+    let selectedAttention = try timedSampled(iterations: options.iterations, warmup: options.warmup)
+    {
+        try turboQuantMetalScaledDotProductAttention(
+            queries: query,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: selectedPathUsesFused,
+            blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
+        )
+    }
     let fusedSeconds: Double?
-    if decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused {
+    if selectedPathUsesFused {
+        fusedSeconds = selectedAttention.timing.averageSeconds
+    } else if decision.selectedPath != .twoStageCompressed {
         fusedSeconds = try timed(iterations: options.iterations, warmup: options.warmup) {
             try turboQuantMetalScaledDotProductAttention(
                 queries: query,
@@ -493,7 +609,8 @@ private func measureCoreAttention(
                 valueCode: valueCode,
                 scale: scale,
                 mask: .causal,
-                preferOnlineFused: true
+                preferOnlineFused: true,
+                blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
             )
         }.0
     } else {
@@ -506,7 +623,8 @@ private func measureCoreAttention(
         decodeSeconds: decodeSeconds,
         qkSeconds: qkSeconds,
         avSeconds: avSeconds,
-        fusedSeconds: fusedSeconds
+        fusedSeconds: fusedSeconds,
+        attentionTiming: selectedAttention.timing
     )
 }
 
@@ -637,7 +755,8 @@ private func runLegacyBenchmark(options: BenchmarkOptions) throws {
                     valueCode: valueCode,
                     scale: scale,
                     mask: .causal,
-                    preferOnlineFused: false
+                    preferOnlineFused: false,
+                    blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
                 )
             }
             let (fusedLatency, fused) = try timed(
@@ -650,7 +769,8 @@ private func runLegacyBenchmark(options: BenchmarkOptions) throws {
                     valueCode: valueCode,
                     scale: scale,
                     mask: .causal,
-                    preferOnlineFused: true
+                    preferOnlineFused: true,
+                    blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
                 )
             }
             results.append(
@@ -714,7 +834,7 @@ private func corePathDecision(
 ) -> TurboQuantAttentionDecision {
     let request = TurboQuantAttentionRequest(
         queryShape: [
-            benchmarkBatchSize, benchmarkQueryHeadCount, options.queryLength, options.headDimension,
+            options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension,
         ],
         keyLayout: symbolicAttentionLayout(options: options, role: .key),
         valueLayout: symbolicAttentionLayout(options: options, role: .value),
@@ -756,12 +876,15 @@ private func corePathDecision(
 }
 
 private func validateCoreBenchmarkOptions(_ options: BenchmarkOptions) throws {
+    guard options.queryHeadCount % options.kvHeadCount == 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "query heads must be a multiple of KV heads")
+    }
     if options.scaleStorage == .float16 {
-        guard options.layoutVersion == TurboQuantAttentionLayout.nextVersion,
-              options.enableLayoutV5
+        guard options.layoutVersion == TurboQuantAttentionLayout.currentVersion
         else {
             throw TurboQuantError.invalidMetalConfiguration(
-                "float16 attention scale storage requires --layout-version \(TurboQuantAttentionLayout.nextVersion) and --enable-layout-v5"
+                "float16 attention scale storage requires Layout V\(TurboQuantAttentionLayout.currentVersion)"
             )
         }
     }
@@ -789,7 +912,7 @@ private func symbolicAttentionLayout(
 ) -> TurboQuantAttentionLayout {
     let groupsPerVector = ceilDivide(options.headDimension, by: options.groupSize)
     let logicalValues =
-        benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens * options.headDimension
+        options.batchSize * options.kvHeadCount * options.contextTokens * options.headDimension
     let estimate = estimateTurboQuantStorage(
         role: role,
         logicalValues: logicalValues,
@@ -799,7 +922,8 @@ private func symbolicAttentionLayout(
         dtype: .float32,
         scaleStorage: options.scaleStorage
     )
-    let groupCount = benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens
+    let groupCount =
+        options.batchSize * options.kvHeadCount * options.contextTokens
         * groupsPerVector
     let magnitudeWordsPerGroup = max(
         1,
@@ -808,8 +932,8 @@ private func symbolicAttentionLayout(
 
     return TurboQuantAttentionLayout(
         layoutVersion: options.layoutVersion,
-        batchSize: benchmarkBatchSize,
-        kvHeadCount: benchmarkKVHeadCount,
+        batchSize: options.batchSize,
+        kvHeadCount: options.kvHeadCount,
         capacity: options.contextTokens,
         logicalLength: options.contextTokens,
         headDimension: options.headDimension,
@@ -819,9 +943,11 @@ private func symbolicAttentionLayout(
     )
 }
 
-private func symbolicAggregateStorageEstimate(options: BenchmarkOptions) -> TurboQuantStorageEstimate {
+private func symbolicAggregateStorageEstimate(options: BenchmarkOptions)
+    -> TurboQuantStorageEstimate
+{
     let logicalValues =
-        benchmarkBatchSize * benchmarkKVHeadCount * options.contextTokens * options.headDimension
+        options.batchSize * options.kvHeadCount * options.contextTokens * options.headDimension
     let keyEstimate = estimateTurboQuantStorage(
         role: .key,
         logicalValues: logicalValues,
@@ -917,9 +1043,9 @@ private func currentGitCommit() -> String? {
     return commit?.isEmpty == false ? commit : nil
 }
 
-private extension TurboQuantAttentionPath {
-    var usesCompressedMetal: Bool {
-    switch self {
+extension TurboQuantAttentionPath {
+    fileprivate var usesCompressedMetal: Bool {
+        switch self {
         case .onlineFused, .tiledOnlineFused, .twoStageCompressed:
             return true
         case .mlxPackedFallback, .baseline, .unavailable:

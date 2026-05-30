@@ -24,10 +24,11 @@ Do not modify admission or Pines evidence code from this repo.
 
 ## Feature flag
 
-Layout V5 must be behind a flag:
+Layout V5 was implemented behind a flag and is now the default write layout for
+real-device evidence collection:
 
 ```text
-turboQuantLayoutV5 = off by default
+turboQuantLayoutV5 = on by default
 ```
 
 V4 compatibility is required.
@@ -97,8 +98,8 @@ Layout V5 cannot be product-enabled unless:
 
 ## Acceptance
 
-- V4 loads and remains default.
-- V5 can be selected only behind flag.
+- V4 loads for compatibility comparisons.
+- V5 is the default write layout.
 - V5 improves speed or actual bits/value in benchmark.
 - Fused path beats two-stage for Q=1 on supported dimensions.
 - Unsupported dimensions fall back with typed reason.
