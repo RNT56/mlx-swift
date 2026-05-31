@@ -156,6 +156,7 @@ final class TurboQuantContractsTests: XCTestCase {
             nativeSparseVSupport: true,
             nativeDiagnosticsSupport: true,
             nativeBackendVersion: TurboQuantNativeAttentionOptions.backendVersion,
+            nativeSegmentedAttentionBackend: .experimentalJIT,
             flatEncodeDecode: false,
             linearMatmul: false,
             attentionEncode: true,
@@ -196,6 +197,11 @@ final class TurboQuantContractsTests: XCTestCase {
         XCTAssertFalse(capabilities.tiledFused)
         XCTAssertEqual(capabilities.nativeCompressedAttention, true)
         XCTAssertEqual(capabilities.nativeBackendVersion, TurboQuantNativeAttentionOptions.backendVersion)
+        XCTAssertEqual(capabilities.nativeSegmentedAttentionBackend, .experimentalJIT)
+        XCTAssertEqual(
+            capabilities.attentionCapabilities.nativeSegmentedAttentionBackend,
+            .experimentalJIT
+        )
         XCTAssertEqual(
             capabilities.supportedHeadDimensions,
             TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
@@ -226,6 +232,7 @@ final class TurboQuantContractsTests: XCTestCase {
         XCTAssertNil(decoded.nativeSparseVSupport)
         XCTAssertNil(decoded.nativeDiagnosticsSupport)
         XCTAssertNil(decoded.nativeBackendVersion)
+        XCTAssertNil(decoded.nativeSegmentedAttentionBackend)
         XCTAssertNil(decoded.nativeFallbackReason)
         XCTAssertTrue(decoded.attentionQK)
         XCTAssertFalse(decoded.attentionFusedDecode)

@@ -22,11 +22,15 @@ final class TurboQuantNativeAttentionTests: XCTestCase {
             throw XCTSkip("native MLX TurboQuant attention gate is disabled")
         }
 
+        let backend = turboQuantNativeSegmentedAttentionBackend(allowExperimentalJIT: true)
+        XCTAssertNotEqual(backend, .unavailable)
+
         let capabilities = TurboQuantKernelAvailability.current.attentionCapabilities
         XCTAssertEqual(capabilities.nativeCompressedAttention, true)
         XCTAssertEqual(capabilities.nativeSparseVSupport, true)
         XCTAssertEqual(capabilities.nativeDiagnosticsSupport, true)
         XCTAssertEqual(capabilities.nativeBackendVersion, TurboQuantNativeAttentionOptions.backendVersion)
+        XCTAssertEqual(capabilities.nativeSegmentedAttentionBackend, backend)
     }
 
     func testNativeFusedAttentionMatchesSwiftMetalWhenEnabled() throws {

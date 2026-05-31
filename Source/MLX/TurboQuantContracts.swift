@@ -7,6 +7,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
     public var nativeSparseVSupport: Bool?
     public var nativeDiagnosticsSupport: Bool?
     public var nativeBackendVersion: Int?
+    public var nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
     public var nativeFallbackReason: String?
     public var flatEncodeDecode: Bool
     public var linearMatmul: Bool
@@ -26,6 +27,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         nativeSparseVSupport: Bool? = nil,
         nativeDiagnosticsSupport: Bool? = nil,
         nativeBackendVersion: Int? = nil,
+        nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
         nativeFallbackReason: String? = nil,
         flatEncodeDecode: Bool = false,
         linearMatmul: Bool = false,
@@ -45,6 +47,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         self.nativeSparseVSupport = nativeSparseVSupport
         self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
         self.nativeBackendVersion = nativeBackendVersion
+        self.nativeSegmentedAttentionBackend = nativeSegmentedAttentionBackend
         self.nativeFallbackReason = nativeFallbackReason
         self.flatEncodeDecode = flatEncodeDecode
         self.linearMatmul = linearMatmul
@@ -71,6 +74,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
             nativeSparseVSupport: nativeSparseVSupport,
             nativeDiagnosticsSupport: nativeDiagnosticsSupport,
             nativeBackendVersion: nativeBackendVersion,
+            nativeSegmentedAttentionBackend: nativeSegmentedAttentionBackend,
             nativeFallbackReason: nativeFallbackReason,
             encode: attentionEncode,
             decode: attentionDecode,
@@ -88,6 +92,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         case nativeSparseVSupport
         case nativeDiagnosticsSupport
         case nativeBackendVersion
+        case nativeSegmentedAttentionBackend
         case nativeFallbackReason
         case flatEncodeDecode
         case linearMatmul
@@ -116,6 +121,10 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
                 Bool.self, forKey: .nativeDiagnosticsSupport),
             nativeBackendVersion: try container.decodeIfPresent(
                 Int.self, forKey: .nativeBackendVersion),
+            nativeSegmentedAttentionBackend: try container.decodeIfPresent(
+                TurboQuantNativeSegmentedAttentionBackend.self,
+                forKey: .nativeSegmentedAttentionBackend
+            ),
             nativeFallbackReason: try container.decodeIfPresent(
                 String.self, forKey: .nativeFallbackReason),
             flatEncodeDecode: try container.decodeIfPresent(Bool.self, forKey: .flatEncodeDecode) ?? false,
@@ -148,6 +157,10 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         try container.encodeIfPresent(nativeSparseVSupport, forKey: .nativeSparseVSupport)
         try container.encodeIfPresent(nativeDiagnosticsSupport, forKey: .nativeDiagnosticsSupport)
         try container.encodeIfPresent(nativeBackendVersion, forKey: .nativeBackendVersion)
+        try container.encodeIfPresent(
+            nativeSegmentedAttentionBackend,
+            forKey: .nativeSegmentedAttentionBackend
+        )
         try container.encodeIfPresent(nativeFallbackReason, forKey: .nativeFallbackReason)
         try container.encode(flatEncodeDecode, forKey: .flatEncodeDecode)
         try container.encode(linearMatmul, forKey: .linearMatmul)

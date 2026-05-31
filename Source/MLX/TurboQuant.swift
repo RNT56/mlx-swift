@@ -558,6 +558,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public var nativeSparseVSupport: Bool?
     public var nativeDiagnosticsSupport: Bool?
     public var nativeBackendVersion: Int?
+    public var nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
     public var nativeFallbackReason: String?
     public var selectedKernelProfile: TurboQuantKernelProfile
     public var selfTestStatus: TurboQuantRuntimeSelfTestStatus
@@ -571,6 +572,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
             nativeSparseVSupport: nativeSparseVSupport,
             nativeDiagnosticsSupport: nativeDiagnosticsSupport,
             nativeBackendVersion: nativeBackendVersion,
+            nativeSegmentedAttentionBackend: nativeSegmentedAttentionBackend,
             nativeFallbackReason: nativeFallbackReason,
             flatEncodeDecode: supportsMetalPolarQJLCodec && probeCapabilities.flatEncodeDecode,
             linearMatmul: supportsMetalPolarQJLCodec
@@ -613,6 +615,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         nativeSparseVSupport: Bool? = nil,
         nativeDiagnosticsSupport: Bool? = nil,
         nativeBackendVersion: Int? = nil,
+        nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
         nativeFallbackReason: String? = nil,
         selectedKernelProfile: TurboQuantKernelProfile = .mlxPackedFallback,
         selfTestStatus: TurboQuantRuntimeSelfTestStatus = .notRun,
@@ -629,6 +632,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         self.nativeSparseVSupport = nativeSparseVSupport
         self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
         self.nativeBackendVersion = nativeBackendVersion
+        self.nativeSegmentedAttentionBackend = nativeSegmentedAttentionBackend
         self.nativeFallbackReason = nativeFallbackReason
         self.selectedKernelProfile = selectedKernelProfile
         self.selfTestStatus = selfTestStatus
@@ -652,6 +656,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
                 nativeSparseVSupport: false,
                 nativeDiagnosticsSupport: false,
                 nativeBackendVersion: nil,
+                nativeSegmentedAttentionBackend: .unavailable,
                 nativeFallbackReason: nativeEnabled
                     ? "native MLX compressed attention prerequisites have not passed"
                     : "native MLX compressed attention is disabled by rollout gate"
@@ -664,6 +669,7 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
             nativeSparseVSupport: nativeProbe.nativeSparseVSupport,
             nativeDiagnosticsSupport: nativeProbe.nativeDiagnosticsSupport,
             nativeBackendVersion: nativeProbe.nativeBackendVersion,
+            nativeSegmentedAttentionBackend: nativeProbe.nativeSegmentedAttentionBackend,
             nativeFallbackReason: nativeProbe.nativeFallbackReason,
             selectedKernelProfile: probe.selectedKernelProfile,
             selfTestStatus: probe.status,
@@ -1354,6 +1360,7 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
     public var nativeSparseVSupport: Bool?
     public var nativeDiagnosticsSupport: Bool?
     public var nativeBackendVersion: Int?
+    public var nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
     public var nativeFallbackReason: String?
     public var encode: Bool
     public var decode: Bool
@@ -1375,6 +1382,7 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
         nativeSparseVSupport: Bool? = nil,
         nativeDiagnosticsSupport: Bool? = nil,
         nativeBackendVersion: Int? = nil,
+        nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
         nativeFallbackReason: String? = nil,
         encode: Bool = false,
         decode: Bool = false,
@@ -1396,6 +1404,7 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
         self.nativeSparseVSupport = nativeSparseVSupport
         self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
         self.nativeBackendVersion = nativeBackendVersion
+        self.nativeSegmentedAttentionBackend = nativeSegmentedAttentionBackend
         self.nativeFallbackReason = nativeFallbackReason
         self.encode = encode
         self.decode = decode
@@ -1422,6 +1431,7 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
         case nativeSparseVSupport
         case nativeDiagnosticsSupport
         case nativeBackendVersion
+        case nativeSegmentedAttentionBackend
         case nativeFallbackReason
         case encode
         case decode
@@ -1452,6 +1462,10 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
                 Bool.self, forKey: .nativeDiagnosticsSupport),
             nativeBackendVersion: try container.decodeIfPresent(
                 Int.self, forKey: .nativeBackendVersion),
+            nativeSegmentedAttentionBackend: try container.decodeIfPresent(
+                TurboQuantNativeSegmentedAttentionBackend.self,
+                forKey: .nativeSegmentedAttentionBackend
+            ),
             nativeFallbackReason: try container.decodeIfPresent(
                 String.self, forKey: .nativeFallbackReason),
             encode: try container.decodeIfPresent(Bool.self, forKey: .encode) ?? false,
@@ -2800,7 +2814,25 @@ private struct TurboQuantNativeAttentionSelfTestResult: Sendable {
     var nativeSparseVSupport: Bool
     var nativeDiagnosticsSupport: Bool
     var nativeBackendVersion: Int?
+    var nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend
     var nativeFallbackReason: String?
+}
+
+public func turboQuantNativeSegmentedAttentionBackend(
+    allowExperimentalJIT: Bool = turboQuantNativeMLXAttentionEnabled(),
+    stream: StreamOrDevice = .gpu
+) -> TurboQuantNativeSegmentedAttentionBackend {
+    var backend = MLX_FAST_TURBO_QUANT_SEGMENTED_ATTENTION_UNAVAILABLE
+    let status = mlx_fast_turbo_quant_segmented_attention_get_backend(
+        &backend,
+        allowExperimentalJIT,
+        stream.ctx
+    )
+    guard status == MLX_STATUS_SUCCESS else {
+        return .unavailable
+    }
+    return TurboQuantNativeSegmentedAttentionBackend(rawValue: Int32(backend.rawValue))
+        ?? .unavailable
 }
 
 private final class TurboQuantNativeAttentionSelfTest: @unchecked Sendable {
@@ -2838,11 +2870,16 @@ private final class TurboQuantNativeAttentionSelfTest: @unchecked Sendable {
                 nativeSparseVSupport: false,
                 nativeDiagnosticsSupport: false,
                 nativeBackendVersion: nil,
+                nativeSegmentedAttentionBackend: .unavailable,
                 nativeFallbackReason: reason
             )
         }
 
         do {
+            let backend = turboQuantNativeSegmentedAttentionBackend(allowExperimentalJIT: true)
+            guard backend != .unavailable else {
+                return failed("native MLX compressed attention backend probe is unavailable")
+            }
             let tokenCount = 16
             let headDimension = 64
             let queryHeadCount = 4
@@ -2944,6 +2981,7 @@ private final class TurboQuantNativeAttentionSelfTest: @unchecked Sendable {
                 nativeSparseVSupport: sparseAvailable,
                 nativeDiagnosticsSupport: true,
                 nativeBackendVersion: diagnostics.backendVersion,
+                nativeSegmentedAttentionBackend: backend,
                 nativeFallbackReason: nil
             )
         } catch {
