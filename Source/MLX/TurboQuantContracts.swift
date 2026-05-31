@@ -3,6 +3,11 @@
 import Foundation
 
 public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
+    public var nativeCompressedAttention: Bool?
+    public var nativeSparseVSupport: Bool?
+    public var nativeDiagnosticsSupport: Bool?
+    public var nativeBackendVersion: Int?
+    public var nativeFallbackReason: String?
     public var flatEncodeDecode: Bool
     public var linearMatmul: Bool
     public var attentionEncode: Bool
@@ -17,6 +22,11 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
     public var failureReasons: [String]
 
     public init(
+        nativeCompressedAttention: Bool? = nil,
+        nativeSparseVSupport: Bool? = nil,
+        nativeDiagnosticsSupport: Bool? = nil,
+        nativeBackendVersion: Int? = nil,
+        nativeFallbackReason: String? = nil,
         flatEncodeDecode: Bool = false,
         linearMatmul: Bool = false,
         attentionEncode: Bool = false,
@@ -31,6 +41,11 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         selectedKernelProfile: TurboQuantKernelProfile = .mlxPackedFallback,
         failureReasons: [String] = []
     ) {
+        self.nativeCompressedAttention = nativeCompressedAttention
+        self.nativeSparseVSupport = nativeSparseVSupport
+        self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
+        self.nativeBackendVersion = nativeBackendVersion
+        self.nativeFallbackReason = nativeFallbackReason
         self.flatEncodeDecode = flatEncodeDecode
         self.linearMatmul = linearMatmul
         self.attentionEncode = attentionEncode
@@ -52,6 +67,11 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
 
     public var attentionCapabilities: TurboQuantAttentionCapabilities {
         TurboQuantAttentionCapabilities(
+            nativeCompressedAttention: nativeCompressedAttention,
+            nativeSparseVSupport: nativeSparseVSupport,
+            nativeDiagnosticsSupport: nativeDiagnosticsSupport,
+            nativeBackendVersion: nativeBackendVersion,
+            nativeFallbackReason: nativeFallbackReason,
             encode: attentionEncode,
             decode: attentionDecode,
             qk: attentionQK,
@@ -64,6 +84,11 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case nativeCompressedAttention
+        case nativeSparseVSupport
+        case nativeDiagnosticsSupport
+        case nativeBackendVersion
+        case nativeFallbackReason
         case flatEncodeDecode
         case linearMatmul
         case attentionEncode
@@ -83,6 +108,16 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         let attentionFusedDecode =
             try container.decodeIfPresent(Bool.self, forKey: .attentionFusedDecode) ?? false
         self.init(
+            nativeCompressedAttention: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeCompressedAttention),
+            nativeSparseVSupport: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeSparseVSupport),
+            nativeDiagnosticsSupport: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeDiagnosticsSupport),
+            nativeBackendVersion: try container.decodeIfPresent(
+                Int.self, forKey: .nativeBackendVersion),
+            nativeFallbackReason: try container.decodeIfPresent(
+                String.self, forKey: .nativeFallbackReason),
             flatEncodeDecode: try container.decodeIfPresent(Bool.self, forKey: .flatEncodeDecode) ?? false,
             linearMatmul: try container.decodeIfPresent(Bool.self, forKey: .linearMatmul) ?? false,
             attentionEncode: try container.decodeIfPresent(Bool.self, forKey: .attentionEncode) ?? false,
@@ -109,6 +144,11 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(nativeCompressedAttention, forKey: .nativeCompressedAttention)
+        try container.encodeIfPresent(nativeSparseVSupport, forKey: .nativeSparseVSupport)
+        try container.encodeIfPresent(nativeDiagnosticsSupport, forKey: .nativeDiagnosticsSupport)
+        try container.encodeIfPresent(nativeBackendVersion, forKey: .nativeBackendVersion)
+        try container.encodeIfPresent(nativeFallbackReason, forKey: .nativeFallbackReason)
         try container.encode(flatEncodeDecode, forKey: .flatEncodeDecode)
         try container.encode(linearMatmul, forKey: .linearMatmul)
         try container.encode(attentionEncode, forKey: .attentionEncode)

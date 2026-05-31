@@ -4,6 +4,39 @@ import MLX
 import XCTest
 
 final class TurboQuantAttentionRouterTests: XCTestCase {
+    func testNativeCompressedSelectedWhenCapabilityPasses() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: true,
+                nativeDiagnosticsSupport: true,
+                nativeBackendVersion: TurboQuantNativeAttentionOptions.backendVersion
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .nativeMLXCompressed)
+        XCTAssertTrue(decision.rejectedPaths.isEmpty)
+    }
+
+    func testNativeCompressedRejectsUnsupportedMaskAndFallsBack() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(maskKind: .materializedArray),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                attentionEncode: true,
+                attentionDecode: true,
+                attentionQK: true,
+                attentionAV: true,
+                attentionFusedDecode: true,
+                bfloatOutput: true
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .twoStageCompressed)
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .nativeMLXCompressed })
+    }
+
     func testFusedUnavailableSelectsTwoStageWhenQKAndAVAreAvailable() {
         let decision = selectTurboQuantAttentionPath(
             request: Self.request(),
@@ -56,6 +89,7 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
     }
 
     private static func request(
+        queryLength: Int = 1,
         maskKind: TurboQuantAttentionMaskKind = .causal,
         fallbackState: TurboQuantAttentionFallbackState = .none
     ) -> TurboQuantAttentionRequest {
@@ -70,7 +104,7 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
             bitsetWordsPerGroup: 2
         )
         return TurboQuantAttentionRequest(
-            queryShape: [1, 1, 1, 64],
+            queryShape: [1, 1, queryLength, 64],
             keyLayout: layout,
             valueLayout: layout,
             queryDType: .float16,

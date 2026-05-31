@@ -152,6 +152,10 @@ final class TurboQuantContractsTests: XCTestCase {
 
     func testContractDTORoundTripsWithoutMetal() throws {
         let capabilities = TurboQuantKernelCapabilities(
+            nativeCompressedAttention: true,
+            nativeSparseVSupport: true,
+            nativeDiagnosticsSupport: true,
+            nativeBackendVersion: TurboQuantNativeAttentionOptions.backendVersion,
             flatEncodeDecode: false,
             linearMatmul: false,
             attentionEncode: true,
@@ -190,10 +194,41 @@ final class TurboQuantContractsTests: XCTestCase {
         XCTAssertTrue(capabilities.av)
         XCTAssertFalse(capabilities.onlineFused)
         XCTAssertFalse(capabilities.tiledFused)
+        XCTAssertEqual(capabilities.nativeCompressedAttention, true)
+        XCTAssertEqual(capabilities.nativeBackendVersion, TurboQuantNativeAttentionOptions.backendVersion)
         XCTAssertEqual(
             capabilities.supportedHeadDimensions,
             TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions
         )
+    }
+
+    func testOldKernelCapabilitySnapshotDecodesWithoutNativeFields() throws {
+        let oldSnapshot = Data(
+            """
+            {
+              "flatEncodeDecode": false,
+              "linearMatmul": false,
+              "attentionEncode": true,
+              "attentionDecode": true,
+              "attentionQK": true,
+              "attentionAV": true,
+              "attentionFusedDecode": false,
+              "bfloatOutput": false,
+              "supportedHeadDimensions": [64, 128, 256],
+              "selectedKernelProfile": "mlxPackedFallback",
+              "failureReasons": []
+            }
+            """.utf8)
+
+        let decoded = try JSONDecoder().decode(TurboQuantKernelCapabilities.self, from: oldSnapshot)
+
+        XCTAssertNil(decoded.nativeCompressedAttention)
+        XCTAssertNil(decoded.nativeSparseVSupport)
+        XCTAssertNil(decoded.nativeDiagnosticsSupport)
+        XCTAssertNil(decoded.nativeBackendVersion)
+        XCTAssertNil(decoded.nativeFallbackReason)
+        XCTAssertTrue(decoded.attentionQK)
+        XCTAssertFalse(decoded.attentionFusedDecode)
     }
 
     func testRejectedTurboQuantPathAliasMatchesRouterContract() {

@@ -554,6 +554,11 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public var supportsMetalPolarQJLCodec: Bool
     public var supportsMetalPolarQJLAttention: Bool
     public var supportsMetalPolarQJL: Bool
+    public var nativeCompressedAttention: Bool?
+    public var nativeSparseVSupport: Bool?
+    public var nativeDiagnosticsSupport: Bool?
+    public var nativeBackendVersion: Int?
+    public var nativeFallbackReason: String?
     public var selectedKernelProfile: TurboQuantKernelProfile
     public var selfTestStatus: TurboQuantRuntimeSelfTestStatus
     public var selfTestFailureReason: String?
@@ -562,6 +567,11 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public var kernelCapabilities: TurboQuantKernelCapabilities {
         let probeCapabilities = TurboQuantRuntimeProbe.shared.result().kernelCapabilities
         return TurboQuantKernelCapabilities(
+            nativeCompressedAttention: nativeCompressedAttention,
+            nativeSparseVSupport: nativeSparseVSupport,
+            nativeDiagnosticsSupport: nativeDiagnosticsSupport,
+            nativeBackendVersion: nativeBackendVersion,
+            nativeFallbackReason: nativeFallbackReason,
             flatEncodeDecode: supportsMetalPolarQJLCodec && probeCapabilities.flatEncodeDecode,
             linearMatmul: supportsMetalPolarQJLCodec
                 && probeCapabilities.linearMatmul
@@ -599,6 +609,11 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         supportsMetalPolarQJLCodec: Bool = false,
         supportsMetalPolarQJLAttention: Bool = false,
         supportsMetalPolarQJL: Bool = false,
+        nativeCompressedAttention: Bool? = nil,
+        nativeSparseVSupport: Bool? = nil,
+        nativeDiagnosticsSupport: Bool? = nil,
+        nativeBackendVersion: Int? = nil,
+        nativeFallbackReason: String? = nil,
         selectedKernelProfile: TurboQuantKernelProfile = .mlxPackedFallback,
         selfTestStatus: TurboQuantRuntimeSelfTestStatus = .notRun,
         selfTestFailureReason: String? = nil,
@@ -610,6 +625,11 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         self.supportsMetalPolarQJLCodec = supportsMetalPolarQJLCodec
         self.supportsMetalPolarQJLAttention = supportsMetalPolarQJLAttention
         self.supportsMetalPolarQJL = supportsMetalPolarQJL
+        self.nativeCompressedAttention = nativeCompressedAttention
+        self.nativeSparseVSupport = nativeSparseVSupport
+        self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
+        self.nativeBackendVersion = nativeBackendVersion
+        self.nativeFallbackReason = nativeFallbackReason
         self.selectedKernelProfile = selectedKernelProfile
         self.selfTestStatus = selfTestStatus
         self.selfTestFailureReason = selfTestFailureReason
@@ -623,10 +643,28 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
         let codecAvailable = metalAvailable && probeCapabilities.flatEncodeDecode
         let attentionAvailable =
             metalAvailable && probeCapabilities.attentionQK && probeCapabilities.attentionAV
+        let nativeEnabled = turboQuantNativeMLXAttentionEnabled()
+        let nativeProbe =
+            nativeEnabled && metalAvailable && attentionAvailable
+            ? TurboQuantNativeAttentionSelfTest.result
+            : TurboQuantNativeAttentionSelfTestResult(
+                nativeCompressedAttention: false,
+                nativeSparseVSupport: false,
+                nativeDiagnosticsSupport: false,
+                nativeBackendVersion: nil,
+                nativeFallbackReason: nativeEnabled
+                    ? "native MLX compressed attention prerequisites have not passed"
+                    : "native MLX compressed attention is disabled by rollout gate"
+            )
         return TurboQuantKernelAvailability(
             supportsMetalPolarQJLCodec: codecAvailable,
             supportsMetalPolarQJLAttention: attentionAvailable,
             supportsMetalPolarQJL: codecAvailable || attentionAvailable,
+            nativeCompressedAttention: nativeProbe.nativeCompressedAttention,
+            nativeSparseVSupport: nativeProbe.nativeSparseVSupport,
+            nativeDiagnosticsSupport: nativeProbe.nativeDiagnosticsSupport,
+            nativeBackendVersion: nativeProbe.nativeBackendVersion,
+            nativeFallbackReason: nativeProbe.nativeFallbackReason,
             selectedKernelProfile: probe.selectedKernelProfile,
             selfTestStatus: probe.status,
             selfTestFailureReason: probe.failureReason,
@@ -1001,13 +1039,127 @@ public struct TurboQuantMetalCode {
 }
 
 public enum TurboQuantAttentionPath: String, Codable, Sendable, CaseIterable {
+    case nativeMLXCompressed
     case onlineFused
     case tiledOnlineFused
+    case sparseValueTwoStageCompressed
     case twoStageCompressed
+    case affineInt4Native
     case mlxPackedFallback
     case baseline
     case unavailable
 }
+
+public struct TurboQuantSparseValueDiagnostics: Equatable, Codable, Sendable {
+    public var enabled: Bool
+    public var threshold: Float?
+    public var skipped: Int
+    public var considered: Int
+
+    public init(
+        enabled: Bool,
+        threshold: Float? = nil,
+        skipped: Int = 0,
+        considered: Int = 0
+    ) {
+        self.enabled = enabled
+        self.threshold = threshold
+        self.skipped = max(0, skipped)
+        self.considered = max(0, considered)
+    }
+
+    public var skipRatio: Double {
+        guard considered > 0 else { return 0 }
+        return Double(skipped) / Double(considered)
+    }
+}
+
+public struct TurboQuantScaledDotProductAttentionResult {
+    public var output: MLXArray
+    public var sparseValueDiagnostics: TurboQuantSparseValueDiagnostics?
+
+    public init(
+        output: MLXArray,
+        sparseValueDiagnostics: TurboQuantSparseValueDiagnostics? = nil
+    ) {
+        self.output = output
+        self.sparseValueDiagnostics = sparseValueDiagnostics
+    }
+}
+
+public struct TurboQuantNativeAttentionOptions: Equatable, Sendable {
+    public static let backendVersion = 3
+
+    public var scale: Float
+    public var causal: Bool
+    public var splitKBlockCount: Int
+    public var sparseVThreshold: Float
+    public var diagnostics: Bool
+    public var backendVersion: Int
+
+    public init(
+        scale: Float,
+        causal: Bool = false,
+        splitKBlockCount: Int = 0,
+        sparseVThreshold: Float = 0,
+        diagnostics: Bool = false,
+        backendVersion: Int = Self.backendVersion
+    ) {
+        self.scale = scale
+        self.causal = causal
+        self.splitKBlockCount = max(0, splitKBlockCount)
+        self.sparseVThreshold = max(0, sparseVThreshold)
+        self.diagnostics = diagnostics
+        self.backendVersion = backendVersion
+    }
+}
+
+public enum TurboQuantNativeSegmentedAttentionBackend: Int32, Codable, Sendable, CaseIterable {
+    case unavailable = 0
+    case experimentalJIT = 1
+    case nativeFused = 2
+}
+
+public struct TurboQuantNativeAttentionDiagnostics: Equatable, Sendable {
+    public var backendVersion: Int
+    public var kernelKind: Int
+    public var activeBlocks: Int
+    public var blockTokens: Int
+    public var sparseSkippedTokens: Int
+    public var sparseTotalTokens: Int
+    public var fallbackCode: Int
+    public var flags: Int
+
+    public init(values: [Int32]) {
+        let padded = values + Array(repeating: 0, count: max(0, 8 - values.count))
+        backendVersion = Int(padded[0])
+        kernelKind = Int(padded[1])
+        activeBlocks = Int(padded[2])
+        blockTokens = Int(padded[3])
+        sparseSkippedTokens = Int(padded[4])
+        sparseTotalTokens = Int(padded[5])
+        fallbackCode = Int(padded[6])
+        flags = Int(padded[7])
+    }
+
+    public var sparseSkipRatio: Double {
+        guard sparseTotalTokens > 0 else { return 0 }
+        return Double(sparseSkippedTokens) / Double(sparseTotalTokens)
+    }
+}
+
+public struct TurboQuantNativeScaledDotProductAttentionResult {
+    public var output: MLXArray
+    public var diagnostics: TurboQuantNativeAttentionDiagnostics?
+
+    public init(output: MLXArray, diagnostics: TurboQuantNativeAttentionDiagnostics? = nil) {
+        self.output = output
+        self.diagnostics = diagnostics
+    }
+}
+
+public typealias TurboQuantNativeSegmentedAttentionResult =
+    TurboQuantNativeScaledDotProductAttentionResult
 
 public struct RejectedPath: Hashable, Codable, Sendable {
     public var path: TurboQuantAttentionPath
@@ -1198,6 +1350,11 @@ public struct TurboQuantAttentionFallbackState: Equatable, Codable, Sendable {
 }
 
 public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
+    public var nativeCompressedAttention: Bool?
+    public var nativeSparseVSupport: Bool?
+    public var nativeDiagnosticsSupport: Bool?
+    public var nativeBackendVersion: Int?
+    public var nativeFallbackReason: String?
     public var encode: Bool
     public var decode: Bool
     public var qk: Bool
@@ -1214,6 +1371,11 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
     public var supportedDeviceFamilies: [String]
 
     public init(
+        nativeCompressedAttention: Bool? = nil,
+        nativeSparseVSupport: Bool? = nil,
+        nativeDiagnosticsSupport: Bool? = nil,
+        nativeBackendVersion: Int? = nil,
+        nativeFallbackReason: String? = nil,
         encode: Bool = false,
         decode: Bool = false,
         qk: Bool = false,
@@ -1230,6 +1392,11 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
         supportedMasks: [TurboQuantAttentionMaskKind] = [.none, .causal, .materializedArray],
         supportedDeviceFamilies: [String] = []
     ) {
+        self.nativeCompressedAttention = nativeCompressedAttention
+        self.nativeSparseVSupport = nativeSparseVSupport
+        self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
+        self.nativeBackendVersion = nativeBackendVersion
+        self.nativeFallbackReason = nativeFallbackReason
         self.encode = encode
         self.decode = decode
         self.qk = qk
@@ -1249,6 +1416,84 @@ public struct TurboQuantAttentionCapabilities: Equatable, Codable, Sendable {
     public var twoStageCompressed: Bool {
         qk && av
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case nativeCompressedAttention
+        case nativeSparseVSupport
+        case nativeDiagnosticsSupport
+        case nativeBackendVersion
+        case nativeFallbackReason
+        case encode
+        case decode
+        case qk
+        case av
+        case onlineFused
+        case tiledOnlineFused
+        case bfloatOutput
+        case supportedOnlineFusedHeadDimensions
+        case maxOnlineFusedQueryLength
+        case maxTiledOnlineFusedQueryLength
+        case materializedMaskTwoStage
+        case supportedDTypes
+        case supportedMasks
+        case supportedDeviceFamilies
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let onlineFused =
+            try container.decodeIfPresent(Bool.self, forKey: .onlineFused) ?? false
+        self.init(
+            nativeCompressedAttention: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeCompressedAttention),
+            nativeSparseVSupport: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeSparseVSupport),
+            nativeDiagnosticsSupport: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeDiagnosticsSupport),
+            nativeBackendVersion: try container.decodeIfPresent(
+                Int.self, forKey: .nativeBackendVersion),
+            nativeFallbackReason: try container.decodeIfPresent(
+                String.self, forKey: .nativeFallbackReason),
+            encode: try container.decodeIfPresent(Bool.self, forKey: .encode) ?? false,
+            decode: try container.decodeIfPresent(Bool.self, forKey: .decode) ?? false,
+            qk: try container.decodeIfPresent(Bool.self, forKey: .qk) ?? false,
+            av: try container.decodeIfPresent(Bool.self, forKey: .av) ?? false,
+            onlineFused: onlineFused,
+            tiledOnlineFused: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .tiledOnlineFused
+            ) ?? onlineFused,
+            bfloatOutput: try container.decodeIfPresent(Bool.self, forKey: .bfloatOutput) ?? false,
+            supportedOnlineFusedHeadDimensions: try container.decodeIfPresent(
+                [Int].self,
+                forKey: .supportedOnlineFusedHeadDimensions
+            ) ?? TurboQuantRuntimeProbeResult.throughputOptimizedOnlineFusedHeadDimensions,
+            maxOnlineFusedQueryLength: try container.decodeIfPresent(
+                Int.self,
+                forKey: .maxOnlineFusedQueryLength
+            ) ?? 1,
+            maxTiledOnlineFusedQueryLength: try container.decodeIfPresent(
+                Int.self,
+                forKey: .maxTiledOnlineFusedQueryLength
+            ) ?? 8,
+            materializedMaskTwoStage: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .materializedMaskTwoStage
+            ) ?? true,
+            supportedDTypes: try container.decodeIfPresent(
+                [TurboQuantDTypeKind].self,
+                forKey: .supportedDTypes
+            ) ?? [.float16, .bfloat16, .float32],
+            supportedMasks: try container.decodeIfPresent(
+                [TurboQuantAttentionMaskKind].self,
+                forKey: .supportedMasks
+            ) ?? [.none, .causal, .materializedArray],
+            supportedDeviceFamilies: try container.decodeIfPresent(
+                [String].self,
+                forKey: .supportedDeviceFamilies
+            ) ?? []
+        )
+    }
 }
 
 public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
@@ -1263,6 +1508,7 @@ public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
     public var memoryBudgetBytes: Int?
     public var fallbackState: TurboQuantAttentionFallbackState
     public var deviceFamily: String?
+    public var sparseVThreshold: Float?
 
     public init(
         queryShape: [Int],
@@ -1275,7 +1521,8 @@ public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
         preferOnlineFused: Bool = true,
         memoryBudgetBytes: Int? = nil,
         fallbackState: TurboQuantAttentionFallbackState = .none,
-        deviceFamily: String? = nil
+        deviceFamily: String? = nil,
+        sparseVThreshold: Float? = nil
     ) {
         self.queryShape = queryShape
         self.keyLayout = keyLayout
@@ -1288,6 +1535,7 @@ public struct TurboQuantAttentionRequest: Equatable, Codable, Sendable {
         self.memoryBudgetBytes = memoryBudgetBytes
         self.fallbackState = fallbackState
         self.deviceFamily = deviceFamily
+        self.sparseVThreshold = sparseVThreshold
     }
 }
 
@@ -1483,6 +1731,60 @@ public func turboQuantAttentionDecision(
             return false
         }
         return true
+    }
+
+    let nativeDTypesSupported = supportsRequestDTypes(.nativeMLXCompressed)
+    let nativeMaskSupported = supportsRequestMask(.nativeMLXCompressed)
+    let nativeDeviceSupported = supportsRequestDevice(.nativeMLXCompressed)
+    if capabilities.nativeCompressedAttention != true {
+        reject(
+            .nativeMLXCompressed,
+            capabilities.nativeFallbackReason
+                ?? "native MLX compressed attention capability is unavailable"
+        )
+    } else if !nativeDTypesSupported || !nativeMaskSupported || !nativeDeviceSupported {
+        // Rejection was recorded by the capability helper.
+    } else if requiresBFloatOutput {
+        reject(.nativeMLXCompressed, "bfloat16 native compressed attention output is gated off")
+    } else if request.hasSinks {
+        reject(.nativeMLXCompressed, "native MLX compressed attention does not support sinks")
+    } else if let sparseVThreshold = request.sparseVThreshold,
+        sparseVThreshold > 0,
+        capabilities.nativeSparseVSupport != true
+    {
+        reject(
+            .nativeMLXCompressed,
+            "native MLX compressed attention Sparse V has not passed capability probing"
+        )
+    } else if request.maskKind == .materializedArray
+        || request.maskKind == .unsupportedMaterializedArrays
+    {
+        reject(.nativeMLXCompressed, "native MLX compressed attention supports only none/causal masks")
+    } else if request.queryShape[2] > 8 {
+        reject(.nativeMLXCompressed, "query length \(request.queryShape[2]) exceeds native limit 8")
+    } else if ![64, 128, 256].contains(request.queryShape[3]) {
+        reject(.nativeMLXCompressed, "head dimension \(request.queryShape[3]) is not native-certified")
+    } else if request.keyLayout.layoutVersion < 4 || request.keyLayout.layoutVersion > 6 {
+        reject(
+            .nativeMLXCompressed,
+            "layout version \(request.keyLayout.layoutVersion) is not supported natively"
+        )
+    } else if request.keyLayout.layoutVersion != request.valueLayout.layoutVersion
+        || request.keyLayout.batchSize != request.valueLayout.batchSize
+        || request.keyLayout.kvHeadCount != request.valueLayout.kvHeadCount
+        || request.keyLayout.capacity != request.valueLayout.capacity
+        || request.keyLayout.logicalLength != request.valueLayout.logicalLength
+        || request.keyLayout.ringOffset != request.valueLayout.ringOffset
+        || request.keyLayout.pinnedPrefixLength != request.valueLayout.pinnedPrefixLength
+        || request.keyLayout.headDimension != request.valueLayout.headDimension
+        || request.keyLayout.groupsPerVector != request.valueLayout.groupsPerVector
+        || request.keyLayout.bitsetWordsPerGroup != request.valueLayout.bitsetWordsPerGroup
+    {
+        reject(.nativeMLXCompressed, "native MLX compressed attention requires aligned K/V layouts")
+    } else if request.queryShape[3] != request.keyLayout.headDimension {
+        reject(.nativeMLXCompressed, "query and key head dimensions differ")
+    } else {
+        return decision(.nativeMLXCompressed)
     }
 
     if request.preferOnlineFused {
@@ -2459,6 +2761,438 @@ public func turboQuantMetalAV(
     )[0]
 }
 
+private func turboQuantResolvedSparseValueThreshold(
+    requestedThreshold: Float?,
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    sinks: MLXArray?
+) -> Float? {
+    guard let threshold = requestedThreshold, threshold > 0 else { return nil }
+    guard queries.dim(2) == 1, sinks == nil else { return nil }
+    guard keyCode.layout.headDimension == valueCode.layout.headDimension,
+        keyCode.layout.logicalLength == valueCode.layout.logicalLength
+    else {
+        return nil
+    }
+    switch mask {
+    case .none, .causal:
+        return threshold
+    case .array, .arrays:
+        return nil
+    }
+}
+
+public func turboQuantNativeMLXAttentionEnabled() -> Bool {
+    let environment = ProcessInfo.processInfo.environment
+    for name in ["MLX_TURBOQUANT_NATIVE_ATTENTION", "TURBOQUANT_NATIVE_MLX_ATTENTION"] {
+        guard let value = environment[name]?.lowercased() else { continue }
+        if ["1", "true", "yes", "on"].contains(value) {
+            return true
+        }
+    }
+    return false
+}
+
+private struct TurboQuantNativeAttentionSelfTestResult: Sendable {
+    var nativeCompressedAttention: Bool
+    var nativeSparseVSupport: Bool
+    var nativeDiagnosticsSupport: Bool
+    var nativeBackendVersion: Int?
+    var nativeFallbackReason: String?
+}
+
+private final class TurboQuantNativeAttentionSelfTest: @unchecked Sendable {
+    static var result: TurboQuantNativeAttentionSelfTestResult {
+        shared.result()
+    }
+
+    private static let shared = TurboQuantNativeAttentionSelfTest()
+
+    private let lock = NSLock()
+    private var cachedResult: TurboQuantNativeAttentionSelfTestResult?
+
+    private init() {}
+
+    private func result() -> TurboQuantNativeAttentionSelfTestResult {
+        lock.lock()
+        if let cachedResult {
+            lock.unlock()
+            return cachedResult
+        }
+        lock.unlock()
+
+        let result = run()
+
+        lock.lock()
+        cachedResult = result
+        lock.unlock()
+        return result
+    }
+
+    private func run() -> TurboQuantNativeAttentionSelfTestResult {
+        func failed(_ reason: String) -> TurboQuantNativeAttentionSelfTestResult {
+            TurboQuantNativeAttentionSelfTestResult(
+                nativeCompressedAttention: false,
+                nativeSparseVSupport: false,
+                nativeDiagnosticsSupport: false,
+                nativeBackendVersion: nil,
+                nativeFallbackReason: reason
+            )
+        }
+
+        do {
+            let tokenCount = 16
+            let headDimension = 64
+            let queryHeadCount = 4
+            let keys = MLXArray(
+                makeProbeValues(
+                    count: tokenCount * headDimension,
+                    sinScale: 0.031,
+                    sinWeight: 0.2,
+                    cosScale: 0.017,
+                    cosWeight: 0.1
+                ),
+                [1, 1, tokenCount, headDimension]
+            )
+            let values = MLXArray(
+                makeProbeValues(
+                    count: tokenCount * headDimension,
+                    sinScale: 0.041,
+                    sinWeight: -0.07,
+                    cosScale: 0.023,
+                    cosWeight: 0.3
+                ),
+                [1, 1, tokenCount, headDimension]
+            )
+            let queries = MLXArray(
+                makeProbeValues(
+                    count: queryHeadCount * headDimension,
+                    sinScale: 0.071,
+                    sinWeight: 0.15,
+                    cosScale: 0,
+                    cosWeight: 0
+                ),
+                [1, queryHeadCount, 1, headDimension]
+            )
+            let keyCode = try turboQuantMetalEncodeAttention(
+                keys,
+                configuration: TurboQuantConfiguration(
+                    preset: .turbo3_5,
+                    role: .key,
+                    groupSize: 64,
+                    backend: .metalPolarQJL,
+                    seed: 0xA77E_0000_0000_0101
+                )
+            )
+            let valueCode = try turboQuantMetalEncodeAttention(
+                values,
+                configuration: TurboQuantConfiguration(
+                    preset: .turbo3_5,
+                    role: .value,
+                    groupSize: 64,
+                    backend: .metalPolarQJL,
+                    seed: 0xA77E_0000_0000_0102,
+                    valueBits: 4
+                )
+            )
+            let scale = 1 / sqrt(Float(headDimension))
+            let exact = try turboQuantNativeScaledDotProductAttentionWithDiagnostics(
+                queries: queries,
+                keyCode: keyCode,
+                valueCode: valueCode,
+                options: TurboQuantNativeAttentionOptions(
+                    scale: scale,
+                    causal: true,
+                    diagnostics: true
+                )
+            )
+            eval(exact.output)
+            guard exact.output.shape == [1, queryHeadCount, 1, headDimension],
+                isFinite(exact.output).all().item(Bool.self),
+                let diagnostics = exact.diagnostics,
+                diagnostics.fallbackCode == 0
+            else {
+                return failed(
+                    "native MLX compressed attention self-test returned invalid output")
+            }
+
+            let sparseAvailable: Bool
+            do {
+                let sparse = try turboQuantNativeScaledDotProductAttentionWithDiagnostics(
+                    queries: queries,
+                    keyCode: keyCode,
+                    valueCode: valueCode,
+                    options: TurboQuantNativeAttentionOptions(
+                        scale: scale,
+                        causal: true,
+                        sparseVThreshold: 1e-6,
+                        diagnostics: true
+                    )
+                )
+                eval(sparse.output)
+                sparseAvailable = sparse.output.shape == exact.output.shape
+                    && isFinite(sparse.output).all().item(Bool.self)
+                    && (sparse.diagnostics?.fallbackCode ?? 1) == 0
+            } catch {
+                sparseAvailable = false
+            }
+
+            return TurboQuantNativeAttentionSelfTestResult(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: sparseAvailable,
+                nativeDiagnosticsSupport: true,
+                nativeBackendVersion: diagnostics.backendVersion,
+                nativeFallbackReason: nil
+            )
+        } catch {
+            return failed("native MLX compressed attention self-test failed: \(error)")
+        }
+    }
+
+    private func makeProbeValues(
+        count: Int,
+        sinScale: Double,
+        sinWeight: Double,
+        cosScale: Double,
+        cosWeight: Double
+    ) -> [Float] {
+        var values: [Float] = []
+        values.reserveCapacity(count)
+        for index in 0 ..< count {
+            let position = Double(index)
+            let sinPart = Foundation.sin(position * sinScale) * sinWeight
+            let cosPart = cosScale == 0 ? 0 : Foundation.cos(position * cosScale) * cosWeight
+            values.append(Float(sinPart + cosPart))
+        }
+        return values
+    }
+}
+
+private func turboQuantNativePresetCode(_ preset: TurboQuantPreset) -> Int32 {
+    switch preset {
+    case .turbo2_5:
+        25
+    case .turbo3_5:
+        35
+    case .turbo4:
+        40
+    case .turbo4v2:
+        42
+    case .turbo8:
+        80
+    }
+}
+
+private func turboQuantNativeLayoutDescriptor(
+    _ layout: TurboQuantAttentionLayout
+) -> mlx_fast_turbo_quant_attention_layout_descriptor {
+    mlx_fast_turbo_quant_attention_layout_descriptor(
+        layout_version: Int32(layout.layoutVersion),
+        batch_size: Int32(layout.batchSize),
+        kv_head_count: Int32(layout.kvHeadCount),
+        capacity: Int32(layout.capacity),
+        logical_length: Int32(layout.logicalLength),
+        ring_offset: Int32(layout.ringOffset),
+        pinned_prefix_length: Int32(layout.pinnedPrefixLength),
+        head_dimension: Int32(layout.headDimension),
+        groups_per_vector: Int32(layout.groupsPerVector),
+        magnitude_words_per_group: Int32(layout.magnitudeWordsPerGroup),
+        bitset_words_per_group: Int32(layout.bitsetWordsPerGroup)
+    )
+}
+
+private func turboQuantNativePrecisionDescriptor(
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode
+) -> mlx_fast_turbo_quant_precision_policy_descriptor {
+    let keyBaseBits = max(1, keyCode.preset.baseMagnitudeBits - 1)
+    let keyHighBits = max(keyBaseBits, keyCode.preset.highMagnitudeBits - 1)
+    let highFraction = mixedPrecisionHighFraction(preset: keyCode.preset)
+    return mlx_fast_turbo_quant_precision_policy_descriptor(
+        preset: turboQuantNativePresetCode(keyCode.preset),
+        group_size: Int32(keyCode.groupSize),
+        key_base_bits: Int32(keyBaseBits),
+        key_high_bits: Int32(keyHighBits),
+        high_precision_numerator: Int32(highFraction.numerator),
+        high_precision_denominator: Int32(highFraction.denominator),
+        value_bits: Int32(valueCode.valueBits),
+        key_scales_per_group: Int32(keyCode.scalesPerGroup),
+        value_scales_per_group: Int32(valueCode.scalesPerGroup),
+        value_magnitude_words_per_group: Int32(valueCode.layout.magnitudeWordsPerGroup),
+        key_seed: keyCode.seed,
+        value_seed: valueCode.seed
+    )
+}
+
+private func turboQuantNativeCOptions(
+    _ options: TurboQuantNativeAttentionOptions
+) -> mlx_fast_turbo_quant_attention_options {
+    mlx_fast_turbo_quant_attention_options(
+        scale: options.scale,
+        causal: options.causal,
+        split_k_blocks: Int32(options.splitKBlockCount),
+        sparse_v_threshold: options.sparseVThreshold,
+        diagnostics: options.diagnostics,
+        backend_version: Int32(options.backendVersion)
+    )
+}
+
+public func turboQuantNativeScaledDotProductAttention(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    options: TurboQuantNativeAttentionOptions,
+    stream: StreamOrDevice = .gpu
+) throws -> MLXArray {
+    let result = try turboQuantNativeSegmentedAttentionWithDiagnostics(
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        options: options,
+        stream: stream
+    )
+    return result.output
+}
+
+public func turboQuantNativeScaledDotProductAttentionWithDiagnostics(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    options: TurboQuantNativeAttentionOptions,
+    stream: StreamOrDevice = .gpu
+) throws -> TurboQuantNativeScaledDotProductAttentionResult {
+    try turboQuantNativeSegmentedAttentionWithDiagnostics(
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        options: options,
+        stream: stream
+    )
+}
+
+public func turboQuantNativeSegmentedAttention(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    options: TurboQuantNativeAttentionOptions,
+    stream: StreamOrDevice = .gpu
+) throws -> MLXArray {
+    let result = try turboQuantNativeSegmentedAttentionWithDiagnostics(
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        options: options,
+        stream: stream
+    )
+    return result.output
+}
+
+public func turboQuantNativeSegmentedAttentionWithDiagnostics(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    options: TurboQuantNativeAttentionOptions,
+    stream: StreamOrDevice = .gpu
+) throws -> TurboQuantNativeSegmentedAttentionResult {
+    try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
+    try validateAttentionQuery(queries, code: keyCode)
+    try validateTurboQuantAttentionCode(keyCode, expectedRole: .key)
+    try validateTurboQuantAttentionCode(valueCode, expectedRole: .value)
+    try validateAttentionCodeStorage(keyCode)
+    try validateAttentionCodeStorage(valueCode)
+    guard keyCode.layout.layoutVersion == valueCode.layout.layoutVersion,
+        keyCode.layout.batchSize == valueCode.layout.batchSize,
+        keyCode.layout.kvHeadCount == valueCode.layout.kvHeadCount,
+        keyCode.layout.capacity == valueCode.layout.capacity,
+        keyCode.layout.logicalLength == valueCode.layout.logicalLength,
+        keyCode.layout.ringOffset == valueCode.layout.ringOffset,
+        keyCode.layout.pinnedPrefixLength == valueCode.layout.pinnedPrefixLength,
+        keyCode.layout.headDimension == valueCode.layout.headDimension,
+        keyCode.layout.groupsPerVector == valueCode.layout.groupsPerVector,
+        keyCode.layout.bitsetWordsPerGroup == valueCode.layout.bitsetWordsPerGroup
+    else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "native MLX compressed attention requires aligned K/V layouts")
+    }
+
+    let layout = turboQuantNativeLayoutDescriptor(keyCode.layout)
+    let precision = turboQuantNativePrecisionDescriptor(keyCode: keyCode, valueCode: valueCode)
+    var cOptions = turboQuantNativeCOptions(options)
+    cOptions.diagnostics = options.diagnostics
+
+    return try withError { error in
+        if options.diagnostics {
+            var vector = mlx_vector_array_new()
+            defer { mlx_vector_array_free(vector) }
+            let status = mlx_fast_turbo_quant_segmented_attention_with_diagnostics(
+                &vector,
+                queries.ctx,
+                keyCode.packedMagnitudes.ctx,
+                keyCode.signs.ctx,
+                keyCode.highPrecisionMask.ctx,
+                keyCode.residualSigns.ctx,
+                keyCode.scales.ctx,
+                valueCode.packedMagnitudes.ctx,
+                valueCode.signs.ctx,
+                valueCode.highPrecisionMask.ctx,
+                valueCode.residualSigns.ctx,
+                valueCode.scales.ctx,
+                layout,
+                precision,
+                cOptions,
+                stream.ctx
+            )
+            if status != MLX_STATUS_SUCCESS {
+                try error.check()
+                throw TurboQuantError.unsupportedBackend(
+                    .metalPolarQJL,
+                    "native MLX compressed attention failed")
+            }
+            var output = mlx_array_new()
+            var diagnostics = mlx_array_new()
+            mlx_vector_array_get(&output, vector, 0)
+            mlx_vector_array_get(&diagnostics, vector, 1)
+            let diagnosticsArray = MLXArray(diagnostics)
+            eval(diagnosticsArray)
+            return TurboQuantNativeScaledDotProductAttentionResult(
+                output: MLXArray(output),
+                diagnostics: TurboQuantNativeAttentionDiagnostics(
+                    values: diagnosticsArray.asArray(Int32.self)
+                )
+            )
+        }
+
+        var output = mlx_array_new()
+        let status = mlx_fast_turbo_quant_segmented_attention(
+            &output,
+            queries.ctx,
+            keyCode.packedMagnitudes.ctx,
+            keyCode.signs.ctx,
+            keyCode.highPrecisionMask.ctx,
+            keyCode.residualSigns.ctx,
+            keyCode.scales.ctx,
+            valueCode.packedMagnitudes.ctx,
+            valueCode.signs.ctx,
+            valueCode.highPrecisionMask.ctx,
+            valueCode.residualSigns.ctx,
+            valueCode.scales.ctx,
+            layout,
+            precision,
+            cOptions,
+            stream.ctx
+        )
+        if status != MLX_STATUS_SUCCESS {
+            try error.check()
+            throw TurboQuantError.unsupportedBackend(
+                .metalPolarQJL,
+                "native MLX compressed attention failed")
+        }
+        return TurboQuantNativeScaledDotProductAttentionResult(output: MLXArray(output))
+    }
+}
+
 public func turboQuantMetalScaledDotProductAttention(
     queries: MLXArray,
     keyCode: TurboQuantAttentionCode,
@@ -2471,6 +3205,7 @@ public func turboQuantMetalScaledDotProductAttention(
     fallbackState: TurboQuantAttentionFallbackState = .none,
     kernelProfile: TurboQuantKernelProfile? = nil,
     blockParallelTokenBlockSize: Int? = nil,
+    sparseVThreshold: Float? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
@@ -2497,6 +3232,14 @@ public func turboQuantMetalScaledDotProductAttention(
             bfloatOutput: true
         )
         : TurboQuantKernelAvailability.current.attentionCapabilities
+    let resolvedSparseVThreshold = turboQuantResolvedSparseValueThreshold(
+        requestedThreshold: sparseVThreshold,
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        mask: mask,
+        sinks: sinks
+    )
     let decision = try turboQuantAttentionDecision(
         request: TurboQuantAttentionRequest(
             queryShape: queries.shape,
@@ -2506,12 +3249,30 @@ public func turboQuantMetalScaledDotProductAttention(
             outputDType: queries.dtype,
             maskKind: turboQuantAttentionMaskKind(mask),
             hasSinks: sinks != nil,
-            preferOnlineFused: preferOnlineFused,
+            preferOnlineFused: preferOnlineFused && resolvedSparseVThreshold == nil,
             memoryBudgetBytes: memoryBudgetBytes,
-            fallbackState: fallbackState
+            fallbackState: fallbackState,
+            sparseVThreshold: resolvedSparseVThreshold
         ),
         capabilities: attentionCapabilities
     )
+
+    if decision.selectedPath == .nativeMLXCompressed {
+        return try turboQuantNativeScaledDotProductAttention(
+            queries: queries,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            options: TurboQuantNativeAttentionOptions(
+                scale: scale,
+                causal: mask.isCausal,
+                sparseVThreshold: resolvedSparseVThreshold ?? 0,
+                diagnostics: false,
+                backendVersion: attentionCapabilities.nativeBackendVersion
+                    ?? TurboQuantNativeAttentionOptions.backendVersion
+            ),
+            stream: stream
+        )
+    }
 
     if decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused {
         return try turboQuantMetalOnlineFusedAttention(
@@ -2554,12 +3315,204 @@ public func turboQuantMetalScaledDotProductAttention(
     if sinks != nil {
         weights = weights[.ellipsis, 1...].contiguous(stream: stream)
     }
+    if let threshold = resolvedSparseVThreshold {
+        weights = MLX.where(
+            weights .>= threshold,
+            weights,
+            MLXArray.zeros(like: weights, stream: stream),
+            stream: stream
+        )
+    }
     return try turboQuantMetalAV(
         attentionWeights: weights,
         valueCode: valueCode,
         outputDType: queries.dtype,
         stream: stream
     )
+}
+
+public func turboQuantMetalScaledDotProductAttentionWithDiagnostics(
+    queries: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+    sinks: MLXArray? = nil,
+    preferOnlineFused: Bool = true,
+    memoryBudgetBytes: Int? = nil,
+    fallbackState: TurboQuantAttentionFallbackState = .none,
+    kernelProfile: TurboQuantKernelProfile? = nil,
+    blockParallelTokenBlockSize: Int? = nil,
+    sparseVThreshold: Float? = nil,
+    stream: StreamOrDevice = .gpu
+) throws -> TurboQuantScaledDotProductAttentionResult {
+    let output = try turboQuantMetalScaledDotProductAttention(
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        scale: scale,
+        mask: mask,
+        sinks: sinks,
+        preferOnlineFused: preferOnlineFused,
+        memoryBudgetBytes: memoryBudgetBytes,
+        fallbackState: fallbackState,
+        kernelProfile: kernelProfile,
+        blockParallelTokenBlockSize: blockParallelTokenBlockSize,
+        sparseVThreshold: sparseVThreshold,
+        stream: stream
+    )
+    guard let threshold = turboQuantResolvedSparseValueThreshold(
+        requestedThreshold: sparseVThreshold,
+        queries: queries,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        mask: mask,
+        sinks: sinks
+    ) else {
+        return TurboQuantScaledDotProductAttentionResult(
+            output: output,
+            sparseValueDiagnostics: TurboQuantSparseValueDiagnostics(enabled: false)
+        )
+    }
+    let scores = try turboQuantMetalQK(
+        queries: queries,
+        keyCode: keyCode,
+        scale: scale,
+        mask: mask,
+        stream: stream
+    )
+    let weights = softmax(scores.asType(.float32), axis: -1, stream: stream)
+    let skipped = (weights .< threshold).asType(.int32).sum().item(Int.self)
+    let diagnostics = TurboQuantSparseValueDiagnostics(
+        enabled: true,
+        threshold: threshold,
+        skipped: skipped,
+        considered: weights.size
+    )
+    return TurboQuantScaledDotProductAttentionResult(
+        output: output,
+        sparseValueDiagnostics: diagnostics
+    )
+}
+
+private func turboQuantRepeatKVHeadsForQueries(
+    _ array: MLXArray,
+    queryHeadCount: Int,
+    stream: StreamOrDevice
+) throws -> MLXArray {
+    let kvHeadCount = array.dim(1)
+    guard kvHeadCount > 0, queryHeadCount % kvHeadCount == 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "query heads must be a multiple of KV heads"
+        )
+    }
+    let repeats = queryHeadCount / kvHeadCount
+    guard repeats > 1 else { return array }
+    return repeated(array, count: repeats, axis: 1, stream: stream)
+}
+
+private func turboQuantMetalSparseSegmentedScaledDotProductAttention(
+    queries: MLXArray,
+    rawKeys: MLXArray,
+    rawValues: MLXArray,
+    coldSegments: [(key: TurboQuantAttentionCode, value: TurboQuantAttentionCode)],
+    scale: Float,
+    threshold: Float,
+    outputDType: DType,
+    stream: StreamOrDevice
+) throws -> MLXArray {
+    var scoreParts: [MLXArray] = []
+    var coldLengths: [Int] = []
+
+    for (keyCode, valueCode) in coldSegments {
+        try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
+        try validateAttentionQuery(queries, code: keyCode)
+        try validateAttentionCodeStorage(keyCode)
+        try validateAttentionCodeStorage(valueCode)
+        guard keyCode.layout.headDimension == queries.dim(3),
+            valueCode.layout.headDimension == queries.dim(3)
+        else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "compressed segmented attention head dimension must match query head dimension"
+            )
+        }
+        let scores = try turboQuantMetalQK(
+            queries: queries,
+            keyCode: keyCode,
+            scale: scale,
+            mask: .none,
+            stream: stream
+        )
+        scoreParts.append(scores.asType(.float32, stream: stream))
+        coldLengths.append(keyCode.layout.logicalLength)
+    }
+
+    if rawKeys.dim(2) > 0 {
+        let expandedRawKeys = try turboQuantRepeatKVHeadsForQueries(
+            rawKeys,
+            queryHeadCount: queries.dim(1),
+            stream: stream
+        )
+        let rawScores = matmul(
+            multiply(queries.asType(.float32, stream: stream), scale, stream: stream),
+            expandedRawKeys.asType(.float32, stream: stream).transposed(0, 1, 3, 2, stream: stream),
+            stream: stream
+        )
+        scoreParts.append(rawScores.asType(.float32, stream: stream))
+    }
+
+    guard !scoreParts.isEmpty else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "segmented TurboQuant attention requires a raw or compressed segment"
+        )
+    }
+
+    let scores = scoreParts.count == 1 ? scoreParts[0] : concatenated(scoreParts, axis: -1, stream: stream)
+    let weights = softmax(scores, axis: -1, stream: stream)
+    var outputs: [MLXArray] = []
+    var cursor = 0
+
+    for (segmentIndex, segment) in coldSegments.enumerated() {
+        let length = coldLengths[segmentIndex]
+        guard length > 0 else { continue }
+        let coldWeights = weights[.ellipsis, cursor ..< cursor + length]
+            .contiguous(stream: stream)
+        let sparseColdWeights = MLX.where(
+            coldWeights .>= threshold,
+            coldWeights,
+            MLXArray.zeros(like: coldWeights, stream: stream),
+            stream: stream
+        )
+        let coldOutput = try turboQuantMetalAV(
+            attentionWeights: sparseColdWeights,
+            valueCode: segment.value,
+            outputDType: .float32,
+            stream: stream
+        )
+        outputs.append(coldOutput.asType(.float32, stream: stream))
+        cursor += length
+    }
+
+    if rawKeys.dim(2) > 0 {
+        let expandedRawValues = try turboQuantRepeatKVHeadsForQueries(
+            rawValues,
+            queryHeadCount: queries.dim(1),
+            stream: stream
+        )
+        let rawWeights = weights[.ellipsis, cursor...].contiguous(stream: stream)
+        let rawOutput = matmul(rawWeights, expandedRawValues, stream: stream)
+        outputs.append(rawOutput.asType(.float32, stream: stream))
+    }
+
+    guard var output = outputs.first else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "sparse segmented TurboQuant attention produced no output segments"
+        )
+    }
+    for partial in outputs.dropFirst() {
+        output = output + partial
+    }
+    return output.asType(outputDType, stream: stream)
 }
 
 public func turboQuantMetalSegmentedScaledDotProductAttention(
@@ -2570,6 +3523,7 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
     scale: Float,
     outputDType: DType = .float32,
     kernelProfile: TurboQuantKernelProfile? = nil,
+    sparseVThreshold: Float? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
     try requireTurboQuantMetalAttentionOutputDType(outputDType)
@@ -2600,6 +3554,18 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
     guard queries.dim(1) % rawKeys.dim(1) == 0 else {
         throw TurboQuantError.invalidMetalConfiguration(
             "query heads must be a multiple of raw KV heads"
+        )
+    }
+    if let threshold = sparseVThreshold, threshold > 0, !coldSegments.isEmpty {
+        return try turboQuantMetalSparseSegmentedScaledDotProductAttention(
+            queries: queries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            coldSegments: coldSegments,
+            scale: scale,
+            threshold: threshold,
+            outputDType: outputDType,
+            stream: stream
         )
     }
 

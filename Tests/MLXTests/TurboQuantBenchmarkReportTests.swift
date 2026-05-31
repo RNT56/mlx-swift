@@ -28,6 +28,13 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
         XCTAssertEqual(decoded.mlxSwiftCommit, "abcdef123456")
         XCTAssertEqual(decoded.storageEstimate.totalBytes, 112)
         XCTAssertEqual(decoded.pathDecision?.selectedPath, .twoStageCompressed)
+        XCTAssertEqual(decoded.metrics.route, TurboQuantBenchmarkRoute.compressedFused.rawValue)
+        XCTAssertEqual(decoded.metrics.runtimeMode, "capacityTurboQuant")
+        XCTAssertEqual(decoded.metrics.backend, TurboQuantBenchmarkBackend.swiftMetalKernel.rawValue)
+        XCTAssertEqual(decoded.metrics.kernelFlags?.tqCoopEnabled, true)
+        XCTAssertEqual(decoded.metrics.kernelFlags?.blockTokenSize, 512)
+        XCTAssertEqual(decoded.metrics.kernelFlags?.gqaSpecialization, "gqa4")
+        XCTAssertEqual(decoded.metrics.kernelFlags?.outputDType, "float32")
         XCTAssertEqual(decoded.metrics.contextTokens, 256)
         XCTAssertEqual(decoded.metrics.layoutVersion, TurboQuantAttentionLayout.currentVersion)
         XCTAssertEqual(decoded.metrics.scaleStorage, TurboQuantScaleStorage.float32.rawValue)
@@ -35,7 +42,22 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
         XCTAssertEqual(decoded.metrics.selectedColdTokens, 64)
         XCTAssertEqual(decoded.metrics.coldBudgetTokens, 128)
         XCTAssertEqual(decoded.metrics.selectorConfidence, 0.75)
+        XCTAssertEqual(decoded.metrics.selectedBudgetedColdTokens, 32)
+        XCTAssertEqual(decoded.metrics.anchorColdTokens, 32)
+        XCTAssertEqual(decoded.metrics.anchorOverflowTokens, 0)
+        XCTAssertEqual(decoded.metrics.maxColdBudgetTokens, 256)
+        XCTAssertEqual(decoded.metrics.selectorInitialConfidence, 0.5)
+        XCTAssertEqual(decoded.metrics.selectorFinalConfidence, 0.75)
+        XCTAssertEqual(decoded.metrics.selectorEscalation, "maxBudget")
+        XCTAssertEqual(
+            decoded.metrics.selectorReasonFlags,
+            ["anchor", "nearest", "max_budget_escalation"]
+        )
         XCTAssertEqual(decoded.metrics.compressedKVBytes, decoded.metrics.totalBytes)
+        XCTAssertEqual(decoded.metrics.plainDecodeTokensPerSecondP50, 200)
+        XCTAssertEqual(decoded.metrics.plainDecodeTokensPerSecondP95, 180)
+        XCTAssertEqual(decoded.metrics.speedRatioToPlainP50, 0.5)
+        XCTAssertEqual(decoded.metrics.memoryReductionRatio, 4)
         XCTAssertEqual(decoded.hiddenCopyAudit.status, .pass)
     }
 
@@ -157,6 +179,15 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
                 ]
             ),
             metrics: TurboQuantCoreBenchmarkMetrics(
+                route: TurboQuantBenchmarkRoute.compressedFused.rawValue,
+                runtimeMode: "capacityTurboQuant",
+                backend: TurboQuantBenchmarkBackend.swiftMetalKernel.rawValue,
+                kernelFlags: TurboQuantBenchmarkKernelFlags(
+                    tqCoopEnabled: true,
+                    blockTokenSize: 512,
+                    gqaSpecialization: "gqa4",
+                    outputDType: "float32"
+                ),
                 contextTokens: 256,
                 headDimension: 128,
                 queryLength: 1,
@@ -170,11 +201,29 @@ final class TurboQuantBenchmarkReportTests: XCTestCase {
                 selectedColdTokens: 64,
                 coldBudgetTokens: 128,
                 selectorConfidence: 0.75,
+                selectedBudgetedColdTokens: 32,
+                anchorColdTokens: 32,
+                anchorOverflowTokens: 0,
+                maxColdBudgetTokens: 256,
+                selectorInitialConfidence: 0.5,
+                selectorFinalConfidence: 0.75,
+                selectorEscalation: "maxBudget",
+                selectorReasonFlags: ["anchor", "nearest", "max_budget_escalation"],
                 fullScanFallbackCount: 0,
                 warmupIterations: 1,
                 qkMS: 0.4,
                 avMS: 0.5,
+                decodeTokensPerSecondP50: 100,
+                decodeTokensPerSecondP95: 90,
+                plainAttentionLatencyMSP50: 5,
+                plainAttentionLatencyMSP95: 5.5,
+                plainDecodeTokensPerSecondP50: 200,
+                plainDecodeTokensPerSecondP95: 180,
+                speedRatioToPlainP50: 0.5,
+                speedRatioToPlainP95: 0.5,
                 totalBytes: 112,
+                plainKVBytes: 448,
+                memoryReductionRatio: 4,
                 actualBitsPerValue: 3.5
             ),
             hiddenCopyAudit: TurboQuantHiddenCopyAudit.currentW5

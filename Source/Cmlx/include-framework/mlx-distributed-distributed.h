@@ -4,12 +4,20 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 #include <Cmlx/mlx-api.h>
 #include <Cmlx/mlx-array.h>
 #include <Cmlx/mlx-utils.h>
 
 namespace mlx::core::distributed {
+
+class MLX_API UnsupportedBackendError : public std::runtime_error {
+ public:
+  explicit UnsupportedBackendError(const std::string& message)
+      : std::runtime_error(message) {}
+};
 
 // Forward declaration of the base group implementation.
 namespace detail {

@@ -199,6 +199,48 @@ class MLXFastKernelTests: XCTestCase {
         XCTAssertLessThan((output - reference).abs().max().item(Float.self), 0.08)
     }
 
+    func testQuantizedScaledDotProductAttentionAffineInt4DecodeGQAHead256() throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Quantized fast attention is only available on GPU")
+        }
+
+        for groupSize in [32, 64] {
+            MLXRandom.seed(UInt64(groupSize))
+            let queries = (MLXRandom.normal([1, 16, 1, 256]) * 0.1).asType(.float16)
+            let keys = (MLXRandom.normal([1, 4, 128, 256]) * 0.1).asType(.float16)
+            let values = (MLXRandom.normal([1, 4, 128, 256]) * 0.1).asType(.float16)
+            let (quantizedKeys, keyScales, keyBiases) = quantized(
+                keys, groupSize: groupSize, bits: 4, mode: .affine)
+            let (quantizedValues, valueScales, valueBiases) = quantized(
+                values, groupSize: groupSize, bits: 4, mode: .affine)
+
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: 1 / sqrt(Float(256)),
+                mask: .causal
+            )
+            let output = MLXFast.quantizedScaledDotProductAttention(
+                queries: queries,
+                keys: quantizedKeys,
+                keyScales: keyScales,
+                values: quantizedValues,
+                valueScales: valueScales,
+                scale: 1 / sqrt(Float(256)),
+                keyBiases: keyBiases,
+                valueBiases: valueBiases,
+                mask: .causal,
+                groupSize: groupSize,
+                bits: 4,
+                mode: .affine
+            )
+
+            XCTAssertEqual(output.shape, reference.shape)
+            XCTAssertLessThan((output - reference).abs().max().item(Float.self), 0.15)
+        }
+    }
+
     func testRoPEOutput() {
         // https://github.com/ml-explore/mlx-swift/issues/315
         MLXRandom.seed(0)

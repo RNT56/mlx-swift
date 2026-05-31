@@ -37,6 +37,7 @@ kernels=(
   "rms_norm"
   "rope"
   "scaled_dot_product_attention"
+  "turbo_quant_attention"
 )
 
 if (( metal_version >= 320 )); then

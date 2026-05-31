@@ -166,6 +166,9 @@ private struct BenchmarkOptions {
         }
 
         switch value {
+        case TurboQuantAttentionPath.nativeMLXCompressed.rawValue, "native-mlx",
+            "native-mlx-compressed":
+            return .nativeMLXCompressed
         case TurboQuantAttentionPath.onlineFused.rawValue, "online-fused":
             return .onlineFused
         case TurboQuantAttentionPath.tiledOnlineFused.rawValue, "tiled-online-fused":
@@ -357,6 +360,14 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     var prefillTokensPerSecond: Double?
     var decodeTokensPerSecondP50: Double?
     var decodeTokensPerSecondP95: Double?
+    var plainAttentionLatencyMSP50: Double?
+    var plainAttentionLatencyMSP95: Double?
+    var plainDecodeTokensPerSecondP50: Double?
+    var plainDecodeTokensPerSecondP95: Double?
+    var speedRatioToPlainP50: Double?
+    var speedRatioToPlainP95: Double?
+    var plainKVBytes: Int?
+    var memoryReductionRatio: Double?
 
     if availability.supportsMetalPolarQJLAttention && pathDecision.selectedPath.usesCompressedMetal
     {
@@ -368,6 +379,7 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
             qkMS = milliseconds(measurement.qkSeconds)
             avMS = milliseconds(measurement.avSeconds)
             fusedMS = milliseconds(measurement.fusedSeconds)
+            plainKVBytes = measurement.plainKVBytes
 
             if let encodeSeconds = measurement.encodeSeconds, encodeSeconds > 0 {
                 prefillTokensPerSecond = Double(options.contextTokens) / encodeSeconds
@@ -387,6 +399,35 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
                     decodeTokensPerSecondP95 =
                         Double(options.queryLength) / attentionTiming.p95Seconds
                 }
+            }
+
+            if let plainTiming = measurement.plainAttentionTiming {
+                plainAttentionLatencyMSP50 = milliseconds(plainTiming.p50Seconds)
+                plainAttentionLatencyMSP95 = milliseconds(plainTiming.p95Seconds)
+                if plainTiming.p50Seconds > 0 {
+                    plainDecodeTokensPerSecondP50 =
+                        Double(options.queryLength) / plainTiming.p50Seconds
+                }
+                if plainTiming.p95Seconds > 0 {
+                    plainDecodeTokensPerSecondP95 =
+                        Double(options.queryLength) / plainTiming.p95Seconds
+                }
+            }
+
+            if let decodeTokensPerSecondP50,
+                let plainDecodeTokensPerSecondP50,
+                plainDecodeTokensPerSecondP50 > 0
+            {
+                speedRatioToPlainP50 = decodeTokensPerSecondP50 / plainDecodeTokensPerSecondP50
+            }
+            if let decodeTokensPerSecondP95,
+                let plainDecodeTokensPerSecondP95,
+                plainDecodeTokensPerSecondP95 > 0
+            {
+                speedRatioToPlainP95 = decodeTokensPerSecondP95 / plainDecodeTokensPerSecondP95
+            }
+            if let plainKVBytes, storageEstimate.totalBytes > 0 {
+                memoryReductionRatio = Double(plainKVBytes) / Double(storageEstimate.totalBytes)
             }
         } catch {
             benchmarkError = String(describing: error)
@@ -422,6 +463,17 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
             : nil)
 
     let metrics = TurboQuantCoreBenchmarkMetrics(
+        route: benchmarkRoute(for: pathDecision.selectedPath).rawValue,
+        runtimeMode: "capacityTurboQuant",
+        backend: benchmarkBackend(for: pathDecision.selectedPath).rawValue,
+        kernelFlags: TurboQuantBenchmarkKernelFlags(
+            tqCoopEnabled: ProcessInfo.processInfo.environment["TQ_COOP"] == "1",
+            blockTokenSize: options.blockParallelTokenBlockSize,
+            gqaSpecialization: options.queryHeadCount % options.kvHeadCount == 0
+                && options.queryHeadCount / options.kvHeadCount > 1
+                ? "gqa\(options.queryHeadCount / options.kvHeadCount)" : nil,
+            outputDType: String(describing: pathDecision.outputDType)
+        ),
         contextTokens: options.contextTokens,
         headDimension: options.headDimension,
         queryLength: options.queryLength,
@@ -449,8 +501,16 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         prefillTokensPerSecond: prefillTokensPerSecond,
         decodeTokensPerSecondP50: decodeTokensPerSecondP50,
         decodeTokensPerSecondP95: decodeTokensPerSecondP95,
+        plainAttentionLatencyMSP50: plainAttentionLatencyMSP50,
+        plainAttentionLatencyMSP95: plainAttentionLatencyMSP95,
+        plainDecodeTokensPerSecondP50: plainDecodeTokensPerSecondP50,
+        plainDecodeTokensPerSecondP95: plainDecodeTokensPerSecondP95,
+        speedRatioToPlainP50: speedRatioToPlainP50,
+        speedRatioToPlainP95: speedRatioToPlainP95,
         totalBytes: storageEstimate.totalBytes,
         compressedKVBytes: storageEstimate.totalBytes,
+        plainKVBytes: plainKVBytes,
+        memoryReductionRatio: memoryReductionRatio,
         peakMemoryBytes: nil,
         actualBitsPerValue: storageEstimate.actualBitsPerValue,
         fallbackUsed: fallbackUsed,
@@ -470,6 +530,36 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     try writeJSON(report)
 }
 
+private func benchmarkRoute(for path: TurboQuantAttentionPath) -> TurboQuantBenchmarkRoute {
+    switch path {
+    case .baseline:
+        return .rawSDPA
+    case .nativeMLXCompressed:
+        return .compressedFused
+    case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed:
+        return .compressedFused
+    case .twoStageCompressed, .affineInt4Native, .mlxPackedFallback:
+        return .decodedFallback
+    case .unavailable:
+        return .unavailable
+    }
+}
+
+private func benchmarkBackend(for path: TurboQuantAttentionPath) -> TurboQuantBenchmarkBackend {
+    switch path {
+    case .baseline:
+        return .rawSDPA
+    case .nativeMLXCompressed:
+        return .nativeMLX
+    case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed, .twoStageCompressed:
+        return .swiftMetalKernel
+    case .affineInt4Native, .mlxPackedFallback:
+        return .decodedReference
+    case .unavailable:
+        return .unavailable
+    }
+}
+
 private struct CoreAttentionMeasurement {
     var storageEstimate: TurboQuantStorageEstimate
     var encodeSeconds: Double?
@@ -478,6 +568,8 @@ private struct CoreAttentionMeasurement {
     var avSeconds: Double?
     var fusedSeconds: Double?
     var attentionTiming: TimingSummary?
+    var plainAttentionTiming: TimingSummary?
+    var plainKVBytes: Int?
 
     var twoStageAttentionSeconds: Double? {
         guard let qkSeconds, let avSeconds else { return nil }
@@ -554,6 +646,19 @@ private func measureCoreAttention(
     let keyCode = codes.0
     let valueCode = codes.1
     let scale = 1 / sqrt(Float(options.headDimension))
+    let plainAttention = try timedSampled(
+        iterations: options.iterations,
+        warmup: options.warmup
+    ) {
+        MLXFast.scaledDotProductAttention(
+            queries: query,
+            keys: keys,
+            values: valuesArray,
+            scale: scale,
+            mask: .causal
+        )
+    }
+
     let (decodeSeconds, _) = try timedValue(
         iterations: options.iterations,
         warmup: options.warmup,
@@ -624,7 +729,9 @@ private func measureCoreAttention(
         qkSeconds: qkSeconds,
         avSeconds: avSeconds,
         fusedSeconds: fusedSeconds,
-        attentionTiming: selectedAttention.timing
+        attentionTiming: selectedAttention.timing,
+        plainAttentionTiming: plainAttention.timing,
+        plainKVBytes: keys.nbytes + valuesArray.nbytes
     )
 }
 
@@ -849,6 +956,12 @@ private func corePathDecision(
     )
 
     switch options.requestedPath {
+    case .nativeMLXCompressed:
+        return forcedFallbackDecision(
+            selectedPath: .nativeMLXCompressed,
+            outputDType: request.outputDType,
+            reason: "caller requested native MLX compressed attention path"
+        )
     case .unavailable:
         return forcedFallbackDecision(
             selectedPath: .unavailable,
@@ -860,6 +973,12 @@ private func corePathDecision(
             selectedPath: .baseline,
             outputDType: request.outputDType,
             reason: "caller requested baseline path"
+        )
+    case .affineInt4Native:
+        return forcedFallbackDecision(
+            selectedPath: .affineInt4Native,
+            outputDType: request.outputDType,
+            reason: "caller requested native affine int4 path"
         )
     case .mlxPackedFallback:
         return forcedFallbackDecision(
@@ -1046,9 +1165,11 @@ private func currentGitCommit() -> String? {
 extension TurboQuantAttentionPath {
     fileprivate var usesCompressedMetal: Bool {
         switch self {
-        case .onlineFused, .tiledOnlineFused, .twoStageCompressed:
+        case .nativeMLXCompressed:
+            return false
+        case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed, .twoStageCompressed:
             return true
-        case .mlxPackedFallback, .baseline, .unavailable:
+        case .affineInt4Native, .mlxPackedFallback, .baseline, .unavailable:
             return false
         }
     }

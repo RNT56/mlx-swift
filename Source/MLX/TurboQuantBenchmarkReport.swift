@@ -33,6 +33,23 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
 }
 
 public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
+    public var route: String?
+    public var runtimeMode: String?
+    public var backend: String?
+    public var kernelFlags: TurboQuantBenchmarkKernelFlags?
+    public var sparseVEnabled: Bool
+    public var sparseVThreshold: Float?
+    public var sparseVSkipRatio: Double
+    public var boundaryProtectedLayerCount: Int
+    public var boundaryProtectionReason: String?
+    public var selectedBudgetedColdTokens: Int?
+    public var anchorColdTokens: Int?
+    public var anchorOverflowTokens: Int?
+    public var maxColdBudgetTokens: Int?
+    public var selectorInitialConfidence: Double?
+    public var selectorFinalConfidence: Double?
+    public var selectorEscalation: String?
+    public var selectorReasonFlags: [String]?
     public var contextTokens: Int
     public var headDimension: Int
     public var queryLength: Int
@@ -61,8 +78,16 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var prefillTokensPerSecond: Double?
     public var decodeTokensPerSecondP50: Double?
     public var decodeTokensPerSecondP95: Double?
+    public var plainAttentionLatencyMSP50: Double?
+    public var plainAttentionLatencyMSP95: Double?
+    public var plainDecodeTokensPerSecondP50: Double?
+    public var plainDecodeTokensPerSecondP95: Double?
+    public var speedRatioToPlainP50: Double?
+    public var speedRatioToPlainP95: Double?
     public var totalBytes: Int
     public var compressedKVBytes: Int
+    public var plainKVBytes: Int?
+    public var memoryReductionRatio: Double?
     public var peakMemoryBytes: Int?
     public var actualBitsPerValue: Double
     public var fallbackUsed: Bool
@@ -71,6 +96,15 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var jetsamObserved: Bool
 
     public init(
+        route: String? = nil,
+        runtimeMode: String? = nil,
+        backend: String? = nil,
+        kernelFlags: TurboQuantBenchmarkKernelFlags? = nil,
+        sparseVEnabled: Bool = false,
+        sparseVThreshold: Float? = nil,
+        sparseVSkipRatio: Double = 0,
+        boundaryProtectedLayerCount: Int = 0,
+        boundaryProtectionReason: String? = nil,
         contextTokens: Int,
         headDimension: Int,
         queryLength: Int,
@@ -84,6 +118,14 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         selectedColdTokens: Int? = nil,
         coldBudgetTokens: Int? = nil,
         selectorConfidence: Double? = nil,
+        selectedBudgetedColdTokens: Int? = nil,
+        anchorColdTokens: Int? = nil,
+        anchorOverflowTokens: Int? = nil,
+        maxColdBudgetTokens: Int? = nil,
+        selectorInitialConfidence: Double? = nil,
+        selectorFinalConfidence: Double? = nil,
+        selectorEscalation: String? = nil,
+        selectorReasonFlags: [String]? = nil,
         fullScanFallbackCount: Int? = nil,
         blockParallelTokenBlockSize: Int? = nil,
         recommendedBlockParallelTokenBlockSize: Int? = nil,
@@ -99,8 +141,16 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         prefillTokensPerSecond: Double? = nil,
         decodeTokensPerSecondP50: Double? = nil,
         decodeTokensPerSecondP95: Double? = nil,
+        plainAttentionLatencyMSP50: Double? = nil,
+        plainAttentionLatencyMSP95: Double? = nil,
+        plainDecodeTokensPerSecondP50: Double? = nil,
+        plainDecodeTokensPerSecondP95: Double? = nil,
+        speedRatioToPlainP50: Double? = nil,
+        speedRatioToPlainP95: Double? = nil,
         totalBytes: Int,
         compressedKVBytes: Int? = nil,
+        plainKVBytes: Int? = nil,
+        memoryReductionRatio: Double? = nil,
         peakMemoryBytes: Int? = nil,
         actualBitsPerValue: Double,
         fallbackUsed: Bool = false,
@@ -108,6 +158,15 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         memoryWarningsSeen: Int = 0,
         jetsamObserved: Bool = false
     ) {
+        self.route = route
+        self.runtimeMode = runtimeMode
+        self.backend = backend
+        self.kernelFlags = kernelFlags
+        self.sparseVEnabled = sparseVEnabled
+        self.sparseVThreshold = sparseVThreshold
+        self.sparseVSkipRatio = Swift.max(0, Swift.min(1, sparseVSkipRatio))
+        self.boundaryProtectedLayerCount = Swift.max(0, boundaryProtectedLayerCount)
+        self.boundaryProtectionReason = boundaryProtectionReason
         self.contextTokens = contextTokens
         self.headDimension = headDimension
         self.queryLength = queryLength
@@ -121,6 +180,14 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.selectedColdTokens = selectedColdTokens
         self.coldBudgetTokens = coldBudgetTokens
         self.selectorConfidence = selectorConfidence
+        self.selectedBudgetedColdTokens = selectedBudgetedColdTokens.map { Swift.max(0, $0) }
+        self.anchorColdTokens = anchorColdTokens.map { Swift.max(0, $0) }
+        self.anchorOverflowTokens = anchorOverflowTokens.map { Swift.max(0, $0) }
+        self.maxColdBudgetTokens = maxColdBudgetTokens.map { Swift.max(0, $0) }
+        self.selectorInitialConfidence = selectorInitialConfidence
+        self.selectorFinalConfidence = selectorFinalConfidence
+        self.selectorEscalation = selectorEscalation
+        self.selectorReasonFlags = selectorReasonFlags
         self.fullScanFallbackCount = fullScanFallbackCount
         self.blockParallelTokenBlockSize = blockParallelTokenBlockSize
         self.recommendedBlockParallelTokenBlockSize = recommendedBlockParallelTokenBlockSize
@@ -136,14 +203,58 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
         self.prefillTokensPerSecond = prefillTokensPerSecond
         self.decodeTokensPerSecondP50 = decodeTokensPerSecondP50
         self.decodeTokensPerSecondP95 = decodeTokensPerSecondP95
+        self.plainAttentionLatencyMSP50 = plainAttentionLatencyMSP50
+        self.plainAttentionLatencyMSP95 = plainAttentionLatencyMSP95
+        self.plainDecodeTokensPerSecondP50 = plainDecodeTokensPerSecondP50
+        self.plainDecodeTokensPerSecondP95 = plainDecodeTokensPerSecondP95
+        self.speedRatioToPlainP50 = speedRatioToPlainP50
+        self.speedRatioToPlainP95 = speedRatioToPlainP95
         self.totalBytes = Swift.max(0, totalBytes)
         self.compressedKVBytes = Swift.max(0, compressedKVBytes ?? totalBytes)
+        self.plainKVBytes = plainKVBytes.map { Swift.max(0, $0) }
+        self.memoryReductionRatio = memoryReductionRatio
         self.peakMemoryBytes = peakMemoryBytes
         self.actualBitsPerValue = actualBitsPerValue
         self.fallbackUsed = fallbackUsed
         self.fallbackReason = fallbackReason
         self.memoryWarningsSeen = Swift.max(0, memoryWarningsSeen)
         self.jetsamObserved = jetsamObserved
+    }
+}
+
+public enum TurboQuantBenchmarkRoute: String, Codable, Sendable {
+    case rawSDPA
+    case adaptiveTurboQuant
+    case hybridTurboQuant
+    case compressedFused
+    case decodedFallback
+    case unavailable
+}
+
+public enum TurboQuantBenchmarkBackend: String, Codable, Sendable {
+    case swiftMetalKernel
+    case nativeMLX
+    case decodedReference
+    case rawSDPA
+    case unavailable
+}
+
+public struct TurboQuantBenchmarkKernelFlags: Codable, Sendable {
+    public var tqCoopEnabled: Bool
+    public var blockTokenSize: Int?
+    public var gqaSpecialization: String?
+    public var outputDType: String
+
+    public init(
+        tqCoopEnabled: Bool,
+        blockTokenSize: Int? = nil,
+        gqaSpecialization: String? = nil,
+        outputDType: String
+    ) {
+        self.tqCoopEnabled = tqCoopEnabled
+        self.blockTokenSize = blockTokenSize
+        self.gqaSpecialization = gqaSpecialization
+        self.outputDType = outputDType
     }
 }
 

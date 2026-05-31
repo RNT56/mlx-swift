@@ -45,15 +45,22 @@ struct MLX_API CommandEncoder {
   void dispatch(F&& f, Args&&... args) {
     num_ops_ = (num_ops_ + 1) % DISPATCHES_PER_TASK;
     auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+    auto guarded_task = [s = stream_, task = std::move(task)]() mutable {
+      try {
+        task();
+      } catch (...) {
+        scheduler::record_exception(s, std::current_exception());
+      }
+    };
     if (num_ops_ == 0) {
       scheduler::notify_new_task(stream_);
-      auto task_wrap = [s = stream_, task = std::move(task)]() mutable {
+      auto task_wrap = [s = stream_, task = std::move(guarded_task)]() mutable {
         task();
         scheduler::notify_task_completion(s);
       };
       scheduler::enqueue(stream_, std::move(task_wrap));
     } else {
-      scheduler::enqueue(stream_, std::move(task));
+      scheduler::enqueue(stream_, std::move(guarded_task));
     }
   }
 

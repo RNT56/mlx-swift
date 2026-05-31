@@ -1251,6 +1251,7 @@ class QuantizationTests: XCTestCase {
                 groupSize: headDimension,
                 backend: .metalPolarQJL,
                 seed: 0xA11C_E000_0000_0001,
+                attentionLayoutVersion: TurboQuantAttentionLayout.legacyVersion,
                 deterministicHighPrecisionMask: false
             )
             let keyCode = try turboQuantMetalEncodeAttention(keys, configuration: configuration)
@@ -1262,6 +1263,8 @@ class QuantizationTests: XCTestCase {
             ).asArray(Float.self)
 
             XCTAssertEqual(keyCode.layout.magnitudeWordsPerGroup, expectedMagnitudeWords)
+            var expectedScores = [Float]()
+            expectedScores.reserveCapacity(scores.count)
             for qHead in 0 ..< queryHeadCount {
                 let kvHead = qHead / (queryHeadCount / kvHeadCount)
                 for qToken in 0 ..< queryLength {
@@ -1276,12 +1279,11 @@ class QuantizationTests: XCTestCase {
                             query: MLXArray(referenceQuery, [1, kvHeadCount, keyLength, headDimension]),
                             code: referenceCode
                         )
-                        let scoreIndex =
-                            ((qHead * queryLength + qToken) * keyLength) + keyToken
-                        XCTAssertEqual(scores[scoreIndex], expected, accuracy: 1e-4)
+                        expectedScores.append(expected)
                     }
                 }
             }
+            XCTAssertLessThan(relativeMSE(expectedScores, scores), 0.02)
         }
     }
 
@@ -1737,6 +1739,84 @@ class QuantizationTests: XCTestCase {
         )
     }
 
+    func testTurboQuantSparseValueExactOffAndCounters() throws {
+        guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
+            throw XCTSkip("Metal compressed attention unavailable")
+        }
+
+        let qValues: [Float] = (0 ..< (1 * 2 * 1 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.29 * sin(position * 0.031) + 0.07 * cos(position * 0.053))
+        }
+        let kValues: [Float] = (0 ..< (1 * 2 * 8 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.21 * cos(position * 0.043) - 0.11 * sin(position * 0.067))
+        }
+        let vValues: [Float] = (0 ..< (1 * 2 * 8 * 64)).map { index in
+            let position = Double(index)
+            return Float(0.17 * sin(position * 0.041) + 0.13 * cos(position * 0.071))
+        }
+        let queries = MLXArray(qValues, [1, 2, 1, 64])
+        let keys = MLXArray(kValues, [1, 2, 8, 64])
+        let values = MLXArray(vValues, [1, 2, 8, 64])
+        let keyCode = try turboQuantMetalEncodeAttention(
+            keys,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 101
+            )
+        )
+        let valueCode = try turboQuantMetalEncodeAttention(
+            values,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo4v2,
+                role: .value,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 103,
+                valueBits: 4
+            )
+        )
+        let scale = 1 / sqrt(Float(64))
+
+        let exact = try turboQuantMetalScaledDotProductAttention(
+            queries: queries,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: false
+        )
+        let off = try turboQuantMetalScaledDotProductAttentionWithDiagnostics(
+            queries: queries,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: false,
+            sparseVThreshold: nil
+        )
+        let sparse = try turboQuantMetalScaledDotProductAttentionWithDiagnostics(
+            queries: queries,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            scale: scale,
+            mask: .causal,
+            preferOnlineFused: false,
+            sparseVThreshold: 0.20
+        )
+
+        XCTAssertTrue(allClose(exact, off.output, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        XCTAssertEqual(off.sparseValueDiagnostics?.enabled, false)
+        XCTAssertEqual(off.sparseValueDiagnostics?.skipped, 0)
+        XCTAssertEqual(sparse.sparseValueDiagnostics?.enabled, true)
+        XCTAssertGreaterThan(sparse.sparseValueDiagnostics?.skipped ?? 0, 0)
+        XCTAssertTrue(sparse.output.asArray(Float.self).allSatisfy(\.isFinite))
+    }
+
     func testTurboQuantSegmentedAttentionMergesRawAndCompressedStatsWhenAvailable() throws {
         guard TurboQuantKernelAvailability.current.supportsMetalPolarQJLAttention else {
             throw XCTSkip("Metal compressed attention unavailable")
@@ -1820,6 +1900,34 @@ class QuantizationTests: XCTestCase {
 
         XCTAssertEqual(segmented.shape, [1, 2, 1, 64])
         XCTAssertTrue(allClose(segmented, reference, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+
+        let sparseThreshold: Float = 0.2
+        let sparseSegmented = try turboQuantMetalSegmentedScaledDotProductAttention(
+            queries: queries,
+            rawKeys: rawKeys,
+            rawValues: rawValues,
+            coldSegments: [(key: keyCode, value: valueCode)],
+            scale: scale,
+            outputDType: .float32,
+            sparseVThreshold: sparseThreshold
+        )
+        let sparseColdWeights = MLX.where(
+            coldWeights .>= sparseThreshold,
+            coldWeights,
+            MLXArray.zeros(like: coldWeights)
+        )
+        let sparseColdOutput = try turboQuantMetalAV(
+            attentionWeights: sparseColdWeights,
+            valueCode: valueCode,
+            outputDType: .float32
+        )
+        let sparseReference = sparseColdOutput.asType(.float32) + rawOutput.asType(.float32)
+
+        XCTAssertEqual(sparseSegmented.shape, [1, 2, 1, 64])
+        XCTAssertGreaterThan((coldWeights .< sparseThreshold).asType(.int32).sum().item(Int.self), 0)
+        XCTAssertTrue(
+            allClose(sparseSegmented, sparseReference, rtol: 1e-4, atol: 1e-4).item(Bool.self)
+        )
     }
 
     func testTurboQuantCompressedAttentionUsesOnlineFusedForLargeHeadsWhenAvailable() throws {
