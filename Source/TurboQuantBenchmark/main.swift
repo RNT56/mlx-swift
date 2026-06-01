@@ -169,6 +169,9 @@ private struct BenchmarkOptions {
         case TurboQuantAttentionPath.nativeMLXCompressed.rawValue, "native-mlx",
             "native-mlx-compressed":
             return .nativeMLXCompressed
+        case TurboQuantAttentionPath.affineK8V4Native.rawValue, "affine-k8v4-native",
+            "native-affine-k8v4":
+            return .affineK8V4Native
         case TurboQuantAttentionPath.onlineFused.rawValue, "online-fused":
             return .onlineFused
         case TurboQuantAttentionPath.tiledOnlineFused.rawValue, "tiled-online-fused":
@@ -534,7 +537,7 @@ private func benchmarkRoute(for path: TurboQuantAttentionPath) -> TurboQuantBenc
     switch path {
     case .baseline:
         return .rawSDPA
-    case .nativeMLXCompressed:
+    case .nativeMLXCompressed, .affineK8V4Native:
         return .compressedFused
     case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed:
         return .compressedFused
@@ -549,7 +552,7 @@ private func benchmarkBackend(for path: TurboQuantAttentionPath) -> TurboQuantBe
     switch path {
     case .baseline:
         return .rawSDPA
-    case .nativeMLXCompressed:
+    case .nativeMLXCompressed, .affineK8V4Native:
         return .nativeMLX
     case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed, .twoStageCompressed:
         return .swiftMetalKernel
@@ -980,6 +983,12 @@ private func corePathDecision(
             outputDType: request.outputDType,
             reason: "caller requested native affine int4 path"
         )
+    case .affineK8V4Native:
+        return forcedFallbackDecision(
+            selectedPath: .affineK8V4Native,
+            outputDType: request.outputDType,
+            reason: "caller requested native affine K8/V4 path"
+        )
     case .mlxPackedFallback:
         return forcedFallbackDecision(
             selectedPath: .mlxPackedFallback,
@@ -1169,7 +1178,7 @@ extension TurboQuantAttentionPath {
             return false
         case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed, .twoStageCompressed:
             return true
-        case .affineInt4Native, .mlxPackedFallback, .baseline, .unavailable:
+        case .affineInt4Native, .affineK8V4Native, .mlxPackedFallback, .baseline, .unavailable:
             return false
         }
     }

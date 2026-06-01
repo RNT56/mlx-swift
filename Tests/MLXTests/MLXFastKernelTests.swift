@@ -241,6 +241,73 @@ class MLXFastKernelTests: XCTestCase {
         }
     }
 
+    func testMixedQuantizedScaledDotProductAttentionK8V4Output() throws {
+        guard Device.defaultDevice().deviceType == .gpu else {
+            throw XCTSkip("Mixed quantized fast attention is only available on GPU")
+        }
+
+        MLXRandom.seed(2)
+        let queries = (MLXRandom.normal([1, 4, 1, 128]) * 0.1).asType(.float16)
+        let keys = (MLXRandom.normal([1, 1, 128, 128]) * 0.1).asType(.float16)
+        let values = (MLXRandom.normal([1, 1, 128, 128]) * 0.1).asType(.float16)
+        let (quantizedKeys, keyScales, keyBiases) = quantized(
+            keys, groupSize: 64, bits: 8, mode: .affine)
+        let (quantizedValues, valueScales, valueBiases) = quantized(
+            values, groupSize: 32, bits: 4, mode: .affine)
+
+        let reference = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: 1 / sqrt(Float(128)),
+            mask: .causal
+        )
+        let output = MLXFast.mixedQuantizedScaledDotProductAttention(
+            queries: queries,
+            keys: quantizedKeys,
+            keyScales: keyScales,
+            values: quantizedValues,
+            valueScales: valueScales,
+            scale: 1 / sqrt(Float(128)),
+            keyBiases: try XCTUnwrap(keyBiases),
+            valueBiases: try XCTUnwrap(valueBiases),
+            mask: .causal,
+            keyGroupSize: 64,
+            keyBits: 8,
+            valueGroupSize: 32,
+            valueBits: 4,
+            stream: .gpu
+        )
+
+        XCTAssertEqual(output.shape, reference.shape)
+        XCTAssertLessThan((output - reference).abs().max().item(Float.self), 0.12)
+    }
+
+    func testMixedQuantizedScaledDotProductAttentionRejectsUnsupportedNativeShape() {
+        let queries = MLXArray.zeros([1, 1, 33, 64], dtype: .float16)
+        let keys = MLXArray.zeros([1, 1, 64, 16], dtype: .uint32)
+        let keyScales = MLXArray.zeros([1, 1, 64, 1], dtype: .float16)
+        let keyBiases = MLXArray.zeros([1, 1, 64, 1], dtype: .float16)
+        let values = MLXArray.zeros([1, 1, 64, 8], dtype: .uint32)
+        let valueScales = MLXArray.zeros([1, 1, 64, 2], dtype: .float16)
+        let valueBiases = MLXArray.zeros([1, 1, 64, 2], dtype: .float16)
+
+        XCTAssertThrowsError(
+            try withError {
+                _ = MLXFast.mixedQuantizedScaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    keyScales: keyScales,
+                    values: values,
+                    valueScales: valueScales,
+                    scale: 1,
+                    keyBiases: keyBiases,
+                    valueBiases: valueBiases,
+                    stream: .gpu
+                )
+            })
+    }
+
     func testRoPEOutput() {
         // https://github.com/ml-explore/mlx-swift/issues/315
         MLXRandom.seed(0)

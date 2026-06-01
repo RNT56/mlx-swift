@@ -1051,6 +1051,7 @@ public enum TurboQuantAttentionPath: String, Codable, Sendable, CaseIterable {
     case sparseValueTwoStageCompressed
     case twoStageCompressed
     case affineInt4Native
+    case affineK8V4Native
     case mlxPackedFallback
     case baseline
     case unavailable
@@ -2805,8 +2806,11 @@ public func turboQuantNativeMLXAttentionEnabled() -> Bool {
         if ["1", "true", "yes", "on"].contains(value) {
             return true
         }
+        if ["0", "false", "no", "off", "disabled"].contains(value) {
+            return false
+        }
     }
-    return false
+    return true
 }
 
 private struct TurboQuantNativeAttentionSelfTestResult: Sendable {

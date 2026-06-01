@@ -270,6 +270,47 @@ public enum MLXFast {
         return MLXArray(result)
     }
 
+    /// Computes scaled dot product attention where keys and values are affine
+    /// quantized with different bit widths and group sizes.
+    public static func mixedQuantizedScaledDotProductAttention(
+        queries: MLXArray,
+        keys: MLXArray,
+        keyScales: MLXArray,
+        values: MLXArray,
+        valueScales: MLXArray,
+        scale: Float,
+        keyBiases: MLXArray,
+        valueBiases: MLXArray,
+        mask: ScaledDotProductAttentionMaskMode = .none,
+        sinks: MLXArray? = nil,
+        keyGroupSize: Int = 64,
+        keyBits: Int = 8,
+        valueGroupSize: Int = 32,
+        valueBits: Int = 4,
+        stream: StreamOrDevice = .default
+    ) -> MLXArray {
+        var result = mlx_array_new()
+        mlx_fast_mixed_quantized_scaled_dot_product_attention(
+            &result,
+            queries.ctx,
+            keys.ctx,
+            keyScales.ctx,
+            keyBiases.ctx,
+            values.ctx,
+            valueScales.ctx,
+            valueBiases.ctx,
+            scale,
+            mask.mask?.ctx ?? MLXArray.mlxNone.ctx,
+            (sinks ?? .mlxNone).ctx,
+            Int32(keyGroupSize),
+            Int32(keyBits),
+            Int32(valueGroupSize),
+            Int32(valueBits),
+            mask.isCausal,
+            stream.ctx)
+        return MLXArray(result)
+    }
+
     /// Root Mean Square normalization (RMS norm).
     ///
     /// The normalization is with respect to the last axis of the input `x`.

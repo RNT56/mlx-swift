@@ -223,6 +223,24 @@ int mlx_fast_quantized_scaled_dot_product_attention(
     const char* mode,
     bool causal,
     const mlx_stream s);
+int mlx_fast_mixed_quantized_scaled_dot_product_attention(
+    mlx_array* res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array key_scales,
+    const mlx_array key_biases,
+    const mlx_array values,
+    const mlx_array value_scales,
+    const mlx_array value_biases,
+    float scale,
+    const mlx_array mask /* may be null */,
+    const mlx_array sinks /* may be null */,
+    int key_group_size,
+    int key_bits,
+    int value_group_size,
+    int value_bits,
+    bool causal,
+    const mlx_stream s);
 
 typedef struct mlx_fast_turbo_quant_attention_layout_descriptor_ {
   int layout_version;

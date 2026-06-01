@@ -5,6 +5,19 @@ import MLX
 import XCTest
 
 final class TurboQuantNativeAttentionTests: XCTestCase {
+    private func requireNativeBackend() throws -> TurboQuantNativeSegmentedAttentionBackend {
+        guard turboQuantNativeMLXAttentionEnabled() else {
+            throw XCTSkip("native MLX TurboQuant attention is explicitly disabled")
+        }
+
+        let backend = turboQuantNativeSegmentedAttentionBackend(allowExperimentalJIT: true)
+        guard backend == .nativeFused || backend == .experimentalJIT else {
+            throw XCTSkip(
+                "native MLX TurboQuant attention is unavailable: \(backend)"
+            )
+        }
+        return backend
+    }
 
     func testSegmentedSwiftSurfaceRetainsScaledCompatibilityNames() {
         XCTAssertEqual(TurboQuantNativeSegmentedAttentionBackend.unavailable.rawValue, 0)
@@ -17,13 +30,15 @@ final class TurboQuantNativeAttentionTests: XCTestCase {
         XCTAssertEqual(result.output.shape, [1])
     }
 
-    func testNativeCapabilityProbePassesWhenEnabled() throws {
-        guard ProcessInfo.processInfo.environment["MLX_TURBOQUANT_NATIVE_ATTENTION"] == "1" else {
-            throw XCTSkip("native MLX TurboQuant attention gate is disabled")
-        }
+    func testProductionNativeCapabilityReportsMetalBackend() {
+        XCTAssertEqual(
+            turboQuantNativeSegmentedAttentionBackend(allowExperimentalJIT: false),
+            .nativeFused
+        )
+    }
 
-        let backend = turboQuantNativeSegmentedAttentionBackend(allowExperimentalJIT: true)
-        XCTAssertNotEqual(backend, .unavailable)
+    func testNativeCapabilityProbePassesWhenEnabled() throws {
+        let backend = try requireNativeBackend()
 
         let capabilities = TurboQuantKernelAvailability.current.attentionCapabilities
         XCTAssertEqual(capabilities.nativeCompressedAttention, true)
@@ -34,9 +49,7 @@ final class TurboQuantNativeAttentionTests: XCTestCase {
     }
 
     func testNativeFusedAttentionMatchesSwiftMetalWhenEnabled() throws {
-        guard ProcessInfo.processInfo.environment["MLX_TURBOQUANT_NATIVE_ATTENTION"] == "1" else {
-            throw XCTSkip("native MLX TurboQuant attention gate is disabled")
-        }
+        _ = try requireNativeBackend()
 
         let tokenCount = 32
         let headDimension = 64
@@ -115,9 +128,7 @@ final class TurboQuantNativeAttentionTests: XCTestCase {
     }
 
     func testNativeBlockParallelGQAMatchesSwiftMetalWhenEnabled() throws {
-        guard ProcessInfo.processInfo.environment["MLX_TURBOQUANT_NATIVE_ATTENTION"] == "1" else {
-            throw XCTSkip("native MLX TurboQuant attention gate is disabled")
-        }
+        _ = try requireNativeBackend()
 
         let tokenCount = 1024
         let headDimension = 64
@@ -203,9 +214,7 @@ final class TurboQuantNativeAttentionTests: XCTestCase {
     }
 
     func testNativeSparseVMatchesSwiftMetalWhenEnabled() throws {
-        guard ProcessInfo.processInfo.environment["MLX_TURBOQUANT_NATIVE_ATTENTION"] == "1" else {
-            throw XCTSkip("native MLX TurboQuant attention gate is disabled")
-        }
+        _ = try requireNativeBackend()
 
         let tokenCount = 32
         let headDimension = 64

@@ -1,4 +1,3 @@
-#ifdef __cplusplus
 // Copyright © 2023-2024 Apple Inc.
 
 #pragma once
@@ -10,8 +9,8 @@
 #include <variant>
 #include <vector>
 
-#include <Cmlx/mlx-api.h>
-#include <Cmlx/mlx-utils.h>
+#include "mlx/api.h"
+#include "mlx/utils.h"
 
 namespace mlx::core::fast {
 
@@ -74,6 +73,26 @@ MLX_API array quantized_scaled_dot_product_attention(
     std::optional<int> group_size = std::nullopt,
     std::optional<int> bits = std::nullopt,
     const std::string& mode = "mxfp4",
+    bool causal = false,
+    StreamOrDevice s = {});
+
+/** Computes: `O = softmax(Q @ K.T) @ V` where K and V use affine quantization
+ * with independent bit widths and group sizes. **/
+MLX_API array mixed_quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const std::optional<array>& key_biases,
+    const array& values,
+    const array& value_scales,
+    const std::optional<array>& value_biases,
+    const float scale,
+    const std::optional<array>& mask = std::nullopt,
+    const std::optional<array>& sinks = std::nullopt,
+    int key_group_size = 64,
+    int key_bits = 8,
+    int value_group_size = 32,
+    int value_bits = 4,
     bool causal = false,
     StreamOrDevice s = {});
 
@@ -254,4 +273,3 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     StreamOrDevice s = {});
 
 } // namespace mlx::core::fast
-#endif
