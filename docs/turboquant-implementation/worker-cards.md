@@ -115,7 +115,7 @@ Branch: `tq/layout-v5-kernels`
 
 Tasks:
 
-- add Layout V5 flag;
+- add Layout V5 compatibility flag and V6 default contract;
 - add deterministic high mask;
 - add popcount offsets;
 - add fp16 scale option;
@@ -191,5 +191,5 @@ Acceptance:
 
 - contracts are `Codable` and `Sendable`;
 - validation works without Metal;
-- V5 remains opt-in/default-off;
+- V5 remains opt-in while V6 is the default/current layout;
 - no product activation.

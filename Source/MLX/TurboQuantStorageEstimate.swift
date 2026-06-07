@@ -114,6 +114,20 @@ public func estimateTurboQuantStorage(
     )
 }
 
+public func estimateTurboQuantStorage(
+    code: TurboQuantPolarWHTAttentionValueCode
+) -> TurboQuantStorageEstimate {
+    TurboQuantStorageEstimate(
+        role: .value,
+        logicalValues: code.logicalValueCount,
+        packedBytes: code.packedIndices.nbytes,
+        bitsetBytes: 0,
+        scaleBytes: code.norms.nbytes,
+        totalBytes: code.storageByteCount,
+        actualBitsPerValue: code.approximateBitsPerValue
+    )
+}
+
 private func ceilDivide(_ value: Int, by divisor: Int) -> Int {
     guard value > 0 else { return 0 }
     return (value + divisor - 1) / divisor

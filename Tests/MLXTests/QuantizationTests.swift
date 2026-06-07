@@ -1528,6 +1528,10 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(TurboQuantAttentionLayout.legacyVersion, 4)
         XCTAssertEqual(TurboQuantAttentionLayout.currentVersion, 6)
         XCTAssertEqual(TurboQuantAttentionLayout.nextVersion, TurboQuantAttentionLayout.currentVersion)
+        XCTAssertEqual(
+            TurboQuantAttentionLayout.productionDefaultVersion,
+            TurboQuantAttentionLayout.currentVersion
+        )
 
         let defaultLayout = try turboQuantAttentionLayout(shape: [1, 2, 3, 80], groupSize: 64)
         XCTAssertEqual(defaultLayout.layoutVersion, TurboQuantAttentionLayout.currentVersion)
@@ -1544,7 +1548,8 @@ class QuantizationTests: XCTestCase {
         let v5Layout = try turboQuantAttentionLayout(
             shape: [1, 2, 3, 80],
             groupSize: 64,
-            layoutVersion: 5
+            layoutVersion: 5,
+            allowExperimentalLayoutV5: true
         )
         XCTAssertEqual(v5Layout.layoutVersion, 5)
         XCTAssertTrue(v5Layout.isLayoutV5)
@@ -1814,6 +1819,8 @@ class QuantizationTests: XCTestCase {
         XCTAssertEqual(off.sparseValueDiagnostics?.skipped, 0)
         XCTAssertEqual(sparse.sparseValueDiagnostics?.enabled, true)
         XCTAssertGreaterThan(sparse.sparseValueDiagnostics?.skipped ?? 0, 0)
+        XCTAssertGreaterThanOrEqual(sparse.sparseValueDiagnostics?.retainedMass ?? -1, 0)
+        XCTAssertLessThanOrEqual(sparse.sparseValueDiagnostics?.retainedMass ?? 1, 1)
         XCTAssertTrue(sparse.output.asArray(Float.self).allSatisfy(\.isFinite))
     }
 

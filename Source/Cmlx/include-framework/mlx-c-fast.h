@@ -242,6 +242,47 @@ int mlx_fast_mixed_quantized_scaled_dot_product_attention(
     bool causal,
     const mlx_stream s);
 
+typedef struct mlx_fast_mixed_quantized_attention_options_ {
+  float scale;
+  bool causal;
+  int key_group_size;
+  int key_bits;
+  int value_group_size;
+  int value_bits;
+  float sparse_v_threshold;
+  int reserved[4];
+} mlx_fast_mixed_quantized_attention_options;
+
+mlx_status mlx_fast_mixed_quantized_scaled_dot_product_attention_with_options(
+    mlx_array* res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array key_scales,
+    const mlx_array key_biases,
+    const mlx_array values,
+    const mlx_array value_scales,
+    const mlx_array value_biases,
+    const mlx_array mask /* may be null */,
+    const mlx_array sinks /* may be null */,
+    mlx_fast_mixed_quantized_attention_options options,
+    const mlx_stream s);
+
+mlx_status
+mlx_fast_mixed_quantized_scaled_dot_product_attention_with_options_and_diagnostics(
+    mlx_array* res,
+    mlx_array* diagnostics,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array key_scales,
+    const mlx_array key_biases,
+    const mlx_array values,
+    const mlx_array value_scales,
+    const mlx_array value_biases,
+    const mlx_array mask /* may be null */,
+    const mlx_array sinks /* may be null */,
+    mlx_fast_mixed_quantized_attention_options options,
+    const mlx_stream s);
+
 typedef struct mlx_fast_turbo_quant_attention_layout_descriptor_ {
   int layout_version;
   int batch_size;
@@ -276,6 +317,15 @@ typedef struct mlx_fast_turbo_quant_attention_options_ {
   bool causal;
   int split_k_blocks;
   float sparse_v_threshold;
+  // Sparse-V mode: 0 off, 1 token threshold, 2 top-k,
+  // 3 cumulative mass, 4 cumulative mass plus max top-k,
+  // 5 block threshold, 6 page top-k, 7 candidate sparse.
+  int sparse_v_selection_mode;
+  int sparse_v_top_k;
+  float sparse_v_cumulative_mass;
+  int sparse_v_max_top_k;
+  int sparse_v_recent_tokens;
+  int sparse_v_candidate_pages;
   bool diagnostics;
   int backend_version;
 } mlx_fast_turbo_quant_attention_options;
@@ -286,6 +336,12 @@ typedef enum mlx_fast_turbo_quant_segmented_attention_backend_ {
   MLX_FAST_TURBO_QUANT_SEGMENTED_ATTENTION_NATIVE_FUSED = 2,
 } mlx_fast_turbo_quant_segmented_attention_backend;
 
+typedef enum mlx_fast_turbo_quant_segmented_attention_codec_ {
+  MLX_FAST_TURBO_QUANT_SEGMENTED_ATTENTION_CODEC_POLAR_QJL = 0,
+  MLX_FAST_TURBO_QUANT_SEGMENTED_ATTENTION_CODEC_POLAR_WHT = 1,
+  MLX_FAST_TURBO_QUANT_SEGMENTED_ATTENTION_CODEC_HYBRID_K8_POLAR_WHT_VALUE = 2,
+} mlx_fast_turbo_quant_segmented_attention_codec;
+
 mlx_status mlx_fast_turbo_quant_segmented_attention_get_backend(
     mlx_fast_turbo_quant_segmented_attention_backend* backend,
     bool allow_experimental_jit,
@@ -293,6 +349,18 @@ mlx_status mlx_fast_turbo_quant_segmented_attention_get_backend(
 
 mlx_status mlx_fast_turbo_quant_segmented_attention_is_available(
     bool* available,
+    bool allow_experimental_jit,
+    const mlx_stream s);
+
+mlx_status mlx_fast_turbo_quant_segmented_attention_get_backend_for_codec(
+    mlx_fast_turbo_quant_segmented_attention_backend* backend,
+    mlx_fast_turbo_quant_segmented_attention_codec codec,
+    bool allow_experimental_jit,
+    const mlx_stream s);
+
+mlx_status mlx_fast_turbo_quant_segmented_attention_is_available_for_codec(
+    bool* available,
+    mlx_fast_turbo_quant_segmented_attention_codec codec,
     bool allow_experimental_jit,
     const mlx_stream s);
 
@@ -327,6 +395,84 @@ mlx_status mlx_fast_turbo_quant_segmented_attention_with_diagnostics(
     const mlx_array value_high_precision_mask,
     const mlx_array value_residual_signs,
     const mlx_array value_scales,
+    mlx_fast_turbo_quant_attention_layout_descriptor layout,
+    mlx_fast_turbo_quant_precision_policy_descriptor precision,
+    mlx_fast_turbo_quant_attention_options options,
+    const mlx_stream s);
+
+mlx_status mlx_fast_turbo_quant_segmented_attention_with_page_summaries(
+    mlx_array* res,
+    const mlx_array queries,
+    const mlx_array key_packed,
+    const mlx_array key_signs,
+    const mlx_array key_high_precision_mask,
+    const mlx_array key_residual_signs,
+    const mlx_array key_scales,
+    const mlx_array value_packed,
+    const mlx_array value_signs,
+    const mlx_array value_high_precision_mask,
+    const mlx_array value_residual_signs,
+    const mlx_array value_scales,
+    const mlx_array key_page_summary,
+    mlx_fast_turbo_quant_attention_layout_descriptor layout,
+    mlx_fast_turbo_quant_precision_policy_descriptor precision,
+    mlx_fast_turbo_quant_attention_options options,
+    const mlx_stream s);
+
+mlx_status
+mlx_fast_turbo_quant_segmented_attention_with_page_summaries_and_diagnostics(
+    mlx_vector_array* res,
+    const mlx_array queries,
+    const mlx_array key_packed,
+    const mlx_array key_signs,
+    const mlx_array key_high_precision_mask,
+    const mlx_array key_residual_signs,
+    const mlx_array key_scales,
+    const mlx_array value_packed,
+    const mlx_array value_signs,
+    const mlx_array value_high_precision_mask,
+    const mlx_array value_residual_signs,
+    const mlx_array value_scales,
+    const mlx_array key_page_summary,
+    mlx_fast_turbo_quant_attention_layout_descriptor layout,
+    mlx_fast_turbo_quant_precision_policy_descriptor precision,
+    mlx_fast_turbo_quant_attention_options options,
+    const mlx_stream s);
+
+mlx_status mlx_fast_turbo_quant_segmented_attention_with_candidate_sketches(
+    mlx_array* res,
+    const mlx_array queries,
+    const mlx_array key_packed,
+    const mlx_array key_signs,
+    const mlx_array key_high_precision_mask,
+    const mlx_array key_residual_signs,
+    const mlx_array key_scales,
+    const mlx_array value_packed,
+    const mlx_array value_signs,
+    const mlx_array value_high_precision_mask,
+    const mlx_array value_residual_signs,
+    const mlx_array value_scales,
+    const mlx_array key_candidate_sketch,
+    mlx_fast_turbo_quant_attention_layout_descriptor layout,
+    mlx_fast_turbo_quant_precision_policy_descriptor precision,
+    mlx_fast_turbo_quant_attention_options options,
+    const mlx_stream s);
+
+mlx_status
+mlx_fast_turbo_quant_segmented_attention_with_candidate_sketches_and_diagnostics(
+    mlx_vector_array* res,
+    const mlx_array queries,
+    const mlx_array key_packed,
+    const mlx_array key_signs,
+    const mlx_array key_high_precision_mask,
+    const mlx_array key_residual_signs,
+    const mlx_array key_scales,
+    const mlx_array value_packed,
+    const mlx_array value_signs,
+    const mlx_array value_high_precision_mask,
+    const mlx_array value_residual_signs,
+    const mlx_array value_scales,
+    const mlx_array key_candidate_sketch,
     mlx_fast_turbo_quant_attention_layout_descriptor layout,
     mlx_fast_turbo_quant_precision_policy_descriptor precision,
     mlx_fast_turbo_quant_attention_options options,

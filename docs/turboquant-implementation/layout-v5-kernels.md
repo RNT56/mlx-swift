@@ -1,4 +1,4 @@
-# Layout V5 and Kernels
+# Layout V5/V6 and Kernels
 
 W13 is the optimization lane. It must not activate before benchmark JSON, quality gates, and evidence import exist. Implementation may land behind a disabled flag, but product activation waits for measurement.
 
@@ -24,14 +24,14 @@ Do not modify admission or Pines evidence code from this repo.
 
 ## Feature flag
 
-Layout V5 was implemented behind a flag and is now the default write layout for
-real-device evidence collection:
+Layout V6 is the production/default/current write layout. Layout V5 remains an
+explicit compatibility and benchmark opt-in:
 
 ```text
-turboQuantLayoutV5 = on by default
+TurboQuantAttentionLayout.productionDefaultVersion == 6
 ```
 
-V4 compatibility is required.
+V4 and V5 compatibility is required.
 
 ## Goals
 
@@ -43,7 +43,7 @@ V4 compatibility is required.
 
 ## Layout V5 tasks
 
-1. Add Layout V5 current/next version contract.
+1. Promote Layout V6 split-magnitude storage as current/next/default.
 2. Add deterministic high-precision mask option.
 3. Replace prior-coordinate loops with popcount offsets:
 
@@ -53,7 +53,7 @@ let bitOffset = local * baseBits + highBefore * (highBits - baseBits)
 ```
 
 4. Add optional fp16 scale path if quality and speed support it.
-5. Add V4 read compatibility.
+5. Add V4/V5 read compatibility.
 6. Add migration tests.
 7. Report actual bits/value.
 
@@ -88,7 +88,7 @@ If current code already supports additional dimensions such as 112 or 240, keep 
 
 ## Quality requirements
 
-Layout V5 cannot be product-enabled unless:
+Layout V5/V6 optimizations cannot be product-enabled unless:
 
 - QualityGate passes;
 - fallback equivalence remains true;
@@ -98,9 +98,9 @@ Layout V5 cannot be product-enabled unless:
 
 ## Acceptance
 
-- V4 loads for compatibility comparisons.
-- V5 is the default write layout.
-- V5 improves speed or actual bits/value in benchmark.
+- V4 and V5 load for compatibility comparisons.
+- V6 is the default/current write layout.
+- V6 improves speed or actual bits/value in benchmark.
 - Fused path beats two-stage for Q=1 on supported dimensions.
 - Unsupported dimensions fall back with typed reason.
 - Benchmark JSON includes before/after.

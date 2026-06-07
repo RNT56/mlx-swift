@@ -28,6 +28,7 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
     public var capabilities: TurboQuantKernelCapabilities
     public var storageEstimate: TurboQuantStorageEstimate
     public var pathDecision: TurboQuantAttentionDecision?
+    public var pathMeasurements: [TurboQuantCoreBenchmarkPathMeasurement]
     public var metrics: TurboQuantCoreBenchmarkMetrics
     public var hiddenCopyAudit: TurboQuantHiddenCopyAudit
 }
@@ -48,16 +49,40 @@ public struct TurboQuantCoreBenchmarkMetrics: Codable, Sendable {
     public var prefillTokensPerSecond: Double?
     public var decodeTokensPerSecondP50: Double?
     public var decodeTokensPerSecondP95: Double?
+    public var rawSDPAReferenceDType: String?
+    public var rawSDPAAttentionLatencyMSP50: Double?
+    public var rawSDPAAttentionLatencyMSP95: Double?
+    public var rawSDPADecodeTokensPerSecondP50: Double?
+    public var rawSDPADecodeTokensPerSecondP95: Double?
+    public var speedRatioToRawSDPAP50: Double?
+    public var speedRatioToRawSDPAP95: Double?
     public var totalBytes: Int
     public var compressedKVBytes: Int
+    public var rawSDPAKVBytes: Int?
+    public var memoryBytesSavedVsRawSDPA: Int?
+    public var memoryReductionPercent: Double?
     public var peakMemoryBytes: Int?
     public var actualBitsPerValue: Double
     public var fallbackUsed: Bool
     public var fallbackReason: String?
     public var memoryWarningsSeen: Int
     public var jetsamObserved: Bool
+    public var cooldownMS: Int?
+    public var pathCooldownMS: Int?
 }
 ```
+
+Each core JSON report now includes `pathMeasurements`, one row for every
+`TurboQuantAttentionPath` enum case. Row `status` values are:
+
+| Status | Meaning |
+| --- | --- |
+| `reference` | FP16 raw SDPA baseline row. |
+| `measured` | Primitive path was timed for this shape/capability set. |
+| `skipped` | Path is meaningful but was not requested or not applicable to this value-bit/shape cell. |
+| `failed` | Primitive path was attempted and threw. |
+| `notCallable` | Path label exists, but the current public benchmark target cannot force a distinct primitive dispatch for it. |
+| `unavailable` | Capability, route, or sentinel is unavailable. |
 
 ## CLI requirements
 
@@ -73,7 +98,49 @@ Add flags where applicable:
 --group-size
 --path
 --warmup
+--cooldown-ms
+--path-cooldown-ms
 ```
+
+Current path values accepted by `TurboQuantBenchmark --path`:
+
+| Value | Meaning |
+| --- | --- |
+| `auto` or omitted | Use router-selected path. |
+| `native-mlx` / `native-mlx-compressed` | Native segmented MLX compressed attention API. |
+| `affine-int4-native` / `native-affine-int4` | Affine int4 native label. Reported as not separately callable until a public primitive dispatcher exists. |
+| `affine-k8v4-native` / `native-affine-k8v4` | Native mixed affine K8/V4 path. |
+| `affine-k8vx-native` / `native-affine-k8vx` | Native mixed affine K8/Vx path for lower-value-bit experiments. |
+| `affine-k8vx-residual` / `native-affine-k8vx-residual` | Residual native mixed affine K8/Vx label. |
+| `online-fused` | Swift Metal online fused Polar/QJL compressed path. |
+| `tiled-online-fused` | Swift Metal tiled online fused long-context path. |
+| `sparse-value-two-stage` / `sparse-value-two-stage-compressed` | Explicit sparse-value two-stage label. Current evidence is surfaced through native Sparse-V rows when `--sparse-v` is set. |
+| `two-stage` / `two-stage-compressed` | QK and AV split compressed path. |
+| `mlx-packed-fallback` | MLX packed fallback comparison path. |
+| `baseline` | Raw SDPA baseline. |
+| `unavailable` | Sentinel route for blocked paths. |
+
+`--cooldown-ms` sleeps between warmup/measured samples without adding the sleep
+to measured duration. `--path-cooldown-ms` sleeps between path families after a
+timing block. Both default to `0` and are recorded in `metrics`.
+
+Sparse-V options are exposed by the native compressed/affine paths for
+threshold, top-k, cumulative-mass, and hybrid cumulative-plus-top-k selection.
+Reports must preserve the Sparse-V mode, skipped/considered tokens, retained
+mass, dense-reference cosine/max error, fallback reason, and per-head/per-layer
+diagnostics when present. Dense compressed AV remains the reference/fallback for
+promotion evidence.
+
+Qwen GQA4/HD256 decode cells should always pass:
+
+```bash
+--head-dim 256 --query-heads 16 --kv-heads 4 --query-length 1
+```
+
+The LM-side runner
+`/Users/mt/Programming/Schtack/mlx-forks/mlx-swift-lm/scripts/run-turboquant-current-benchmarks.sh`
+loops this executable across the current path/preset/context matrix and stores
+the stdout/stderr for every cell.
 
 ## Hidden-copy audit
 
@@ -117,7 +184,10 @@ This status means the current source paths and validation gates have been audite
 - report includes capabilities;
 - report includes storage estimates;
 - report includes path decision;
+- report includes per-path coverage rows for every attention path enum case;
 - report includes actual bits/value;
+- report includes FP16 raw-SDPA reference timing, speed ratios, bytes saved, and
+  cooldown settings when measurement is available;
 - Pines can parse the report into BenchmarkReport.v1.
 
 ## Tests

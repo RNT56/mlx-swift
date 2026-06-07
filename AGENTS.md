@@ -1,5 +1,9 @@
 # Agent Notes for the RNT56 MLX Swift Fork
 
+Read [CLAUDE.md](CLAUDE.md) first for the workspace-level MLX fork guide,
+current TurboQuant goals, multi-repo structure, evidence rules, and validation
+expectations. The notes below are this repo's local branch/dependency guidance.
+
 This repository is the `RNT56/mlx-swift` fork used by downstream projects. Treat it as an integrated fork, not a disposable experiment branch.
 
 ## Branch Model

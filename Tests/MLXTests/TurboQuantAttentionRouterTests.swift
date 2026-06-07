@@ -19,6 +19,45 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
         XCTAssertTrue(decision.rejectedPaths.isEmpty)
     }
 
+    func testSparseVNativeCompressedSelectedWhenCapabilityPasses() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(sparseVThreshold: 1e-5),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: true,
+                nativeDiagnosticsSupport: true,
+                nativeBackendVersion: TurboQuantNativeAttentionOptions.backendVersion
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .nativeMLXCompressed)
+        XCTAssertTrue(decision.rejectedPaths.isEmpty)
+    }
+
+    func testSparseVRejectsNativeWhenSparseCapabilityMissing() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(
+                preferOnlineFused: false,
+                sparseVThreshold: 1e-5
+            ),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: false,
+                attentionQK: true,
+                attentionAV: true,
+                bfloatOutput: true
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .twoStageCompressed)
+        XCTAssertTrue(
+            decision.rejectedPaths.contains {
+                $0.path == .nativeMLXCompressed && $0.reason.contains("Sparse V")
+            }
+        )
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .onlineFused })
+    }
+
     func testNativeCompressedRejectsUnsupportedMaskAndFallsBack() {
         let decision = selectTurboQuantAttentionPath(
             request: Self.request(maskKind: .materializedArray),
@@ -91,7 +130,9 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
     private static func request(
         queryLength: Int = 1,
         maskKind: TurboQuantAttentionMaskKind = .causal,
-        fallbackState: TurboQuantAttentionFallbackState = .none
+        preferOnlineFused: Bool = true,
+        fallbackState: TurboQuantAttentionFallbackState = .none,
+        sparseVThreshold: Float? = nil
     ) -> TurboQuantAttentionRequest {
         let layout = TurboQuantAttentionLayout(
             batchSize: 1,
@@ -110,7 +151,9 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
             queryDType: .float16,
             outputDType: .float16,
             maskKind: maskKind,
-            fallbackState: fallbackState
+            preferOnlineFused: preferOnlineFused,
+            fallbackState: fallbackState,
+            sparseVThreshold: sparseVThreshold
         )
     }
 }

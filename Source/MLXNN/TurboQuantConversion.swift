@@ -306,8 +306,8 @@ private func turboQuantConversionMetadata(
     result["turboquant_value_bits"] = "\(options.valueBits ?? options.preset.defaultValueBits)"
     result["turboquant_converted_tensors"] = "\(convertedCount)"
     result["turboquant_schema_version"] = "2"
-    result["turboquant_layout_version"] = "\(TurboQuantAttentionLayout.currentVersion)"
-    result["turboquant_attention_layout_version"] = "\(TurboQuantAttentionLayout.currentVersion)"
+    result["turboquant_layout_version"] = "\(TurboQuantAttentionLayout.productionDefaultVersion)"
+    result["turboquant_attention_layout_version"] = "\(TurboQuantAttentionLayout.productionDefaultVersion)"
     result["turboquant_seed_policy"] = "fixed"
     result["turboquant_key_format"] = "polar_qjl_mixed_bits_v4"
     result["turboquant_value_format"] = "packed_value_bits_v4"
@@ -365,8 +365,8 @@ private func updateTurboQuantConfigJSON(
         "linear_class": "TurboQuantLinear",
         "turboquant_format": "mlx_packed",
         "turboquant_schema_version": 2,
-        "turboquant_layout_version": TurboQuantAttentionLayout.currentVersion,
-        "turboquant_attention_layout_version": TurboQuantAttentionLayout.currentVersion,
+        "turboquant_layout_version": TurboQuantAttentionLayout.productionDefaultVersion,
+        "turboquant_attention_layout_version": TurboQuantAttentionLayout.productionDefaultVersion,
         "turboquant_seed_policy": "fixed",
         "turboquant_key_format": "polar_qjl_mixed_bits_v4",
         "turboquant_value_format": "packed_value_bits_v4",

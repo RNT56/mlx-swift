@@ -25,7 +25,23 @@ struct BenchmarkResult: Codable {
     var actualBitsPerValue: Double?
     var memoryBytes: Int?
     var latencySeconds: Double?
+    var denseReferenceLatencySeconds: Double?
     var quality: QualityMetrics?
+    var sparseVSelectionMode: String?
+    var sparseVThreshold: Float?
+    var sparseVTopK: Int?
+    var sparseVCumulativeMass: Float?
+    var sparseVMaxTopK: Int?
+    var sparseVRecentTokenCount: Int?
+    var sparseVOlderTokenCount: Int?
+    var sparseVPageCandidateCount: Int?
+    var sparseVPageSummary: Bool?
+    var sparseVSkippedTokens: Int?
+    var sparseVTotalTokens: Int?
+    var sparseVSkipRatio: Double?
+    var activeBlocks: Int?
+    var blockTokens: Int?
+    var kernelKind: Int?
     var error: String?
 }
 
@@ -40,22 +56,79 @@ struct BenchmarkReport: Codable {
     var results: [BenchmarkResult]
 }
 
+private enum BenchmarkSparseVSelectionMode: Equatable {
+    case off
+    case threshold
+    case topK
+    case cumulativeMass
+    case hybridCumulativeMassTopK
+    case blockThreshold
+    case pageTopK
+    case candidateSparse
+
+    var nativeMode: TurboQuantSparseValueNativeSelectionMode {
+        switch self {
+        case .off:
+            return .off
+        case .threshold:
+            return .threshold
+        case .topK:
+            return .topK
+        case .cumulativeMass:
+            return .cumulativeMass
+        case .hybridCumulativeMassTopK:
+            return .hybridCumulativeMassTopK
+        case .blockThreshold:
+            return .blockThreshold
+        case .pageTopK, .candidateSparse:
+            return .pageTopK
+        }
+    }
+
+    var reportMode: TurboQuantSparseVSelectionMode? {
+        switch self {
+        case .off:
+            return nil
+        case .threshold:
+            return .threshold
+        case .topK:
+            return .topK
+        case .cumulativeMass:
+            return .cumulativeMass
+        case .hybridCumulativeMassTopK:
+            return .hybridCumulativeMassTopK
+        case .blockThreshold:
+            return .blockThreshold
+        case .pageTopK:
+            return .pageTopK
+        case .candidateSparse:
+            return .candidateSparse
+        }
+    }
+}
+
 private enum BenchmarkCLIError: Error, CustomStringConvertible {
     case invalidInteger(String)
+    case invalidFloat(String)
     case invalidPreset(String)
     case invalidPath(String)
     case invalidScaleStorage(String)
+    case invalidSparseVSelection(String)
 
     var description: String {
         switch self {
         case .invalidInteger(let flag):
             "Invalid integer value for \(flag)."
+        case .invalidFloat(let flag):
+            "Invalid floating-point value for \(flag)."
         case .invalidPreset(let value):
             "Invalid TurboQuant preset '\(value)'."
         case .invalidPath(let value):
             "Invalid TurboQuant path '\(value)'."
         case .invalidScaleStorage(let value):
             "Invalid TurboQuant scale storage '\(value)'."
+        case .invalidSparseVSelection(let value):
+            "Invalid Sparse-V selection mode '\(value)'."
         }
     }
 }
@@ -65,6 +138,8 @@ private struct BenchmarkOptions {
     var includeTimestamp: Bool
     var iterations: Int
     var warmup: Int
+    var cooldownMilliseconds: Int
+    var pathCooldownMilliseconds: Int
     var batchSize: Int
     var queryHeadCount: Int
     var kvHeadCount: Int
@@ -79,9 +154,66 @@ private struct BenchmarkOptions {
     var scaleStorage: TurboQuantScaleStorage
     var blockParallelTokenBlockSize: Int?
     var requestedPath: TurboQuantAttentionPath?
+    var sparseVSelectionMode: BenchmarkSparseVSelectionMode?
+    var sparseVThreshold: Float?
+    var sparseVTopK: Int?
+    var sparseVCumulativeMass: Float?
+    var sparseVMaxTopK: Int?
+    var sparseVRecentTokens: Int?
+    var sparseVCandidatePages: Int?
+    var sparseVUsePageSummary: Bool
 
     var resolvedValueBits: Int {
         valueBits ?? preset.defaultValueBits
+    }
+
+    var sparseVEnabled: Bool {
+        guard let sparseVSelectionMode else { return false }
+        return sparseVSelectionMode != .off
+    }
+
+    var resolvedSparseVThreshold: Float {
+        sparseVThreshold ?? 1e-5
+    }
+
+    var resolvedSparseVTopK: Int {
+        sparseVTopK ?? 128
+    }
+
+    var resolvedSparseVCumulativeMass: Float {
+        sparseVCumulativeMass ?? 0.995
+    }
+
+    var resolvedSparseVMaxTopK: Int {
+        sparseVMaxTopK ?? sparseVTopK ?? 512
+    }
+
+    var resolvedSparseVRecentTokens: Int {
+        sparseVRecentTokens ?? 256
+    }
+
+    var resolvedSparseVCandidatePages: Int {
+        sparseVCandidatePages ?? 4
+    }
+
+    var sparseVRecentTokenCount: Int? {
+        sparseVSelectionMode == .candidateSparse ? resolvedSparseVRecentTokens : nil
+    }
+
+    var sparseVOlderTokenCount: Int? {
+        sparseVSelectionMode == .candidateSparse ? resolvedSparseVTopK : nil
+    }
+
+    var sparseVPageCandidateCount: Int? {
+        switch sparseVSelectionMode {
+        case .candidateSparse:
+            return resolvedSparseVCandidatePages
+        case .pageTopK:
+            return resolvedSparseVTopK
+        case .off, .threshold, .topK, .cumulativeMass, .hybridCumulativeMassTopK,
+            .blockThreshold, nil:
+            return nil
+        }
     }
 
     static func parse(_ arguments: [String] = CommandLine.arguments) throws -> BenchmarkOptions {
@@ -96,6 +228,10 @@ private struct BenchmarkOptions {
             includeTimestamp: arguments.contains("--include-timestamp"),
             iterations: try intValue("--iterations", in: arguments, default: 10, minimum: 1),
             warmup: try intValue("--warmup", in: arguments, default: 1, minimum: 0),
+            cooldownMilliseconds: try intValue(
+                "--cooldown-ms", in: arguments, default: 0, minimum: 0),
+            pathCooldownMilliseconds: try intValue(
+                "--path-cooldown-ms", in: arguments, default: 0, minimum: 0),
             batchSize: try intValue(
                 "--batch-size", in: arguments, default: defaultBenchmarkBatchSize, minimum: 1),
             queryHeadCount: try intValue(
@@ -112,14 +248,27 @@ private struct BenchmarkOptions {
             layoutVersion: try intValue(
                 "--layout-version",
                 in: arguments,
-                default: TurboQuantAttentionLayout.currentVersion,
+                default: TurboQuantAttentionLayout.productionDefaultVersion,
                 minimum: 1
             ),
             enableLayoutV5: arguments.contains("--enable-layout-v5"),
             scaleStorage: try scaleStorage(in: arguments),
             blockParallelTokenBlockSize: try optionalIntValue(
                 "--block-tokens", in: arguments, minimum: 1),
-            requestedPath: try requestedPath(in: arguments)
+            requestedPath: try requestedPath(in: arguments),
+            sparseVSelectionMode: try sparseVSelectionMode(in: arguments),
+            sparseVThreshold: try optionalFloatValue("--sparse-v-threshold", in: arguments),
+            sparseVTopK: try optionalIntValue("--sparse-v-top-k", in: arguments, minimum: 0),
+            sparseVCumulativeMass: try optionalFloatValue(
+                "--sparse-v-cumulative-mass", in: arguments)
+                ?? optionalFloatValue("--sparse-v-mass", in: arguments),
+            sparseVMaxTopK: try optionalIntValue("--sparse-v-max-top-k", in: arguments, minimum: 0)
+                ?? optionalIntValue("--sparse-v-hybrid-top-k", in: arguments, minimum: 0),
+            sparseVRecentTokens: try optionalIntValue(
+                "--sparse-v-recent-tokens", in: arguments, minimum: 0),
+            sparseVCandidatePages: try optionalIntValue(
+                "--sparse-v-candidate-pages", in: arguments, minimum: 0),
+            sparseVUsePageSummary: arguments.contains("--sparse-v-page-summary")
         )
     }
 
@@ -160,6 +309,16 @@ private struct BenchmarkOptions {
         return value
     }
 
+    private static func optionalFloatValue(_ name: String, in arguments: [String]) throws -> Float? {
+        guard let rawValue = stringValue(name, in: arguments) else {
+            return nil
+        }
+        guard let value = Float(rawValue), value.isFinite else {
+            throw BenchmarkCLIError.invalidFloat(name)
+        }
+        return value
+    }
+
     private static func requestedPath(in arguments: [String]) throws -> TurboQuantAttentionPath? {
         guard let value = stringValue("--path", in: arguments), value != "auto" else {
             return nil
@@ -169,9 +328,24 @@ private struct BenchmarkOptions {
         case TurboQuantAttentionPath.nativeMLXCompressed.rawValue, "native-mlx",
             "native-mlx-compressed":
             return .nativeMLXCompressed
+        case TurboQuantAttentionPath.sparseValueTwoStageCompressed.rawValue,
+            "sparse-value-two-stage", "sparse-value-two-stage-compressed", "sparse-two-stage":
+            return .sparseValueTwoStageCompressed
+        case TurboQuantAttentionPath.affineInt4Native.rawValue, "affine-int4-native",
+            "native-affine-int4":
+            return .affineInt4Native
         case TurboQuantAttentionPath.affineK8V4Native.rawValue, "affine-k8v4-native",
             "native-affine-k8v4":
             return .affineK8V4Native
+        case TurboQuantAttentionPath.affineK8VxNative.rawValue, "affine-k8vx-native",
+            "native-affine-k8vx":
+            return .affineK8VxNative
+        case TurboQuantAttentionPath.affineK8VxResidual.rawValue, "affine-k8vx-residual",
+            "native-affine-k8vx-residual":
+            return .affineK8VxResidual
+        case TurboQuantAttentionPath.metalHybridK8PolarWHTValue.rawValue,
+            "metal-hybrid-k8-polarwht-value", "hybrid-k8-polarwht-value":
+            return .metalHybridK8PolarWHTValue
         case TurboQuantAttentionPath.onlineFused.rawValue, "online-fused":
             return .onlineFused
         case TurboQuantAttentionPath.tiledOnlineFused.rawValue, "tiled-online-fused":
@@ -183,6 +357,8 @@ private struct BenchmarkOptions {
             return .mlxPackedFallback
         case TurboQuantAttentionPath.baseline.rawValue:
             return .baseline
+        case TurboQuantAttentionPath.unavailable.rawValue:
+            return .unavailable
         default:
             throw BenchmarkCLIError.invalidPath(value)
         }
@@ -196,6 +372,39 @@ private struct BenchmarkOptions {
             throw BenchmarkCLIError.invalidScaleStorage(value)
         }
         return storage
+    }
+
+    private static func sparseVSelectionMode(
+        in arguments: [String]
+    ) throws -> BenchmarkSparseVSelectionMode? {
+        guard let value = stringValue("--sparse-v", in: arguments)
+            ?? stringValue("--sparse-v-mode", in: arguments)
+        else {
+            return nil
+        }
+
+        switch value.lowercased().replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+        {
+        case "off", "none", "false", "0":
+            return .off
+        case "threshold":
+            return .threshold
+        case "topk":
+            return .topK
+        case "cumulative", "cumulativemass", "mass":
+            return .cumulativeMass
+        case "hybrid", "hybridcumulativemass", "hybridcumulativemasstopk":
+            return .hybridCumulativeMassTopK
+        case "blockthreshold", "blockmass":
+            return .blockThreshold
+        case "pagetopk", "page":
+            return .pageTopK
+        case "candidatesparse":
+            return .candidateSparse
+        default:
+            throw BenchmarkCLIError.invalidSparseVSelection(value)
+        }
     }
 }
 
@@ -230,9 +439,16 @@ private func qualityMetrics(_ lhs: MLXArray, _ rhs: MLXArray) -> QualityMetrics 
 private func timed(
     iterations: Int,
     warmup: Int = 1,
+    cooldownMilliseconds: Int = 0,
     _ body: () throws -> MLXArray
 ) throws -> (Double, MLXArray) {
-    try timedValue(iterations: iterations, warmup: warmup, evaluate: { eval($0) }, body)
+    try timedValue(
+        iterations: iterations,
+        warmup: warmup,
+        cooldownMilliseconds: cooldownMilliseconds,
+        evaluate: { eval($0) },
+        body
+    )
 }
 
 private struct TimingSummary {
@@ -249,40 +465,54 @@ private struct TimedValueSummary<T> {
 private func timedSampled(
     iterations: Int,
     warmup: Int = 1,
+    cooldownMilliseconds: Int = 0,
     _ body: () throws -> MLXArray
 ) throws -> TimedValueSummary<MLXArray> {
-    try timedValueSampled(iterations: iterations, warmup: warmup, evaluate: { eval($0) }, body)
+    try timedValueSampled(
+        iterations: iterations,
+        warmup: warmup,
+        cooldownMilliseconds: cooldownMilliseconds,
+        evaluate: { eval($0) },
+        body
+    )
 }
 
 private func timedValue<T>(
     iterations: Int,
     warmup: Int,
+    cooldownMilliseconds: Int = 0,
     evaluate: (T) -> Void,
     _ body: () throws -> T
 ) throws -> (Double, T) {
     let measuredIterations = max(1, iterations)
     var last: T?
+    var elapsedTotal = 0.0
 
     for _ in 0 ..< max(0, warmup) {
         let value = try body()
         evaluate(value)
         last = value
+        cooldown(milliseconds: cooldownMilliseconds)
     }
 
-    let start = Date.timeIntervalSinceReferenceDate
-    for _ in 0 ..< measuredIterations {
+    for iteration in 0 ..< measuredIterations {
+        let start = Date.timeIntervalSinceReferenceDate
         let value = try body()
         evaluate(value)
+        elapsedTotal += Date.timeIntervalSinceReferenceDate - start
         last = value
+        if iteration + 1 < measuredIterations {
+            cooldown(milliseconds: cooldownMilliseconds)
+        }
     }
-    let elapsed = Date.timeIntervalSinceReferenceDate - start
 
-    return (elapsed / Double(measuredIterations), last!)
+    return (elapsedTotal / Double(measuredIterations), last!)
 }
 
 private func timedValueSampled<T>(
     iterations: Int,
     warmup: Int,
+    cooldownMilliseconds: Int = 0,
     evaluate: (T) -> Void,
     _ body: () throws -> T
 ) throws -> TimedValueSummary<T> {
@@ -295,15 +525,19 @@ private func timedValueSampled<T>(
         let value = try body()
         evaluate(value)
         last = value
+        cooldown(milliseconds: cooldownMilliseconds)
     }
 
-    for _ in 0 ..< measuredIterations {
+    for iteration in 0 ..< measuredIterations {
         let start = Date.timeIntervalSinceReferenceDate
         let value = try body()
         evaluate(value)
         let elapsed = Date.timeIntervalSinceReferenceDate - start
         samples.append(elapsed)
         last = value
+        if iteration + 1 < measuredIterations {
+            cooldown(milliseconds: cooldownMilliseconds)
+        }
     }
 
     let sorted = samples.sorted()
@@ -316,6 +550,11 @@ private func timedValueSampled<T>(
         ),
         value: last!
     )
+}
+
+private func cooldown(milliseconds: Int) {
+    guard milliseconds > 0 else { return }
+    Thread.sleep(forTimeInterval: Double(milliseconds) / 1000)
 }
 
 private func percentile(sortedSamples: [Double], percentile: Double) -> Double {
@@ -369,20 +608,33 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
     var plainDecodeTokensPerSecondP95: Double?
     var speedRatioToPlainP50: Double?
     var speedRatioToPlainP95: Double?
-    var plainKVBytes: Int?
+    var rawSDPAAttentionLatencyMSP50: Double?
+    var rawSDPAAttentionLatencyMSP95: Double?
+    var rawSDPADecodeTokensPerSecondP50: Double?
+    var rawSDPADecodeTokensPerSecondP95: Double?
+    var speedRatioToRawSDPAP50: Double?
+    var speedRatioToRawSDPAP95: Double?
+    var rawSDPAKVBytes: Int?
+    var memoryBytesSavedVsRawSDPA: Int?
     var memoryReductionRatio: Double?
+    var memoryReductionPercent: Double?
+    var pathMeasurements: [TurboQuantCoreBenchmarkPathMeasurement] = []
 
-    if availability.supportsMetalPolarQJLAttention && pathDecision.selectedPath.usesCompressedMetal
-    {
+    if availability.supportsMetalPolarQJLAttention {
         do {
-            let measurement = try measureCoreAttention(options: options, decision: pathDecision)
+            let measurement = try measureCoreAttention(
+                options: options,
+                decision: pathDecision,
+                availability: availability
+            )
             storageEstimate = measurement.storageEstimate
             encodeMS = milliseconds(measurement.encodeSeconds)
             decodeMS = milliseconds(measurement.decodeSeconds)
             qkMS = milliseconds(measurement.qkSeconds)
             avMS = milliseconds(measurement.avSeconds)
             fusedMS = milliseconds(measurement.fusedSeconds)
-            plainKVBytes = measurement.plainKVBytes
+            rawSDPAKVBytes = measurement.rawSDPAKVBytes
+            pathMeasurements = measurement.pathMeasurements
 
             if let encodeSeconds = measurement.encodeSeconds, encodeSeconds > 0 {
                 prefillTokensPerSecond = Double(options.contextTokens) / encodeSeconds
@@ -404,33 +656,47 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
                 }
             }
 
-            if let plainTiming = measurement.plainAttentionTiming {
-                plainAttentionLatencyMSP50 = milliseconds(plainTiming.p50Seconds)
-                plainAttentionLatencyMSP95 = milliseconds(plainTiming.p95Seconds)
-                if plainTiming.p50Seconds > 0 {
-                    plainDecodeTokensPerSecondP50 =
-                        Double(options.queryLength) / plainTiming.p50Seconds
+            if let rawTiming = measurement.rawSDPAAttentionTiming {
+                rawSDPAAttentionLatencyMSP50 = milliseconds(rawTiming.p50Seconds)
+                rawSDPAAttentionLatencyMSP95 = milliseconds(rawTiming.p95Seconds)
+                plainAttentionLatencyMSP50 = rawSDPAAttentionLatencyMSP50
+                plainAttentionLatencyMSP95 = rawSDPAAttentionLatencyMSP95
+                if rawTiming.p50Seconds > 0 {
+                    rawSDPADecodeTokensPerSecondP50 =
+                        Double(options.queryLength) / rawTiming.p50Seconds
+                    plainDecodeTokensPerSecondP50 = rawSDPADecodeTokensPerSecondP50
                 }
-                if plainTiming.p95Seconds > 0 {
-                    plainDecodeTokensPerSecondP95 =
-                        Double(options.queryLength) / plainTiming.p95Seconds
+                if rawTiming.p95Seconds > 0 {
+                    rawSDPADecodeTokensPerSecondP95 =
+                        Double(options.queryLength) / rawTiming.p95Seconds
+                    plainDecodeTokensPerSecondP95 = rawSDPADecodeTokensPerSecondP95
                 }
             }
 
             if let decodeTokensPerSecondP50,
-                let plainDecodeTokensPerSecondP50,
-                plainDecodeTokensPerSecondP50 > 0
+                let rawSDPADecodeTokensPerSecondP50,
+                rawSDPADecodeTokensPerSecondP50 > 0
             {
-                speedRatioToPlainP50 = decodeTokensPerSecondP50 / plainDecodeTokensPerSecondP50
+                speedRatioToRawSDPAP50 =
+                    decodeTokensPerSecondP50 / rawSDPADecodeTokensPerSecondP50
+                speedRatioToPlainP50 = speedRatioToRawSDPAP50
             }
             if let decodeTokensPerSecondP95,
-                let plainDecodeTokensPerSecondP95,
-                plainDecodeTokensPerSecondP95 > 0
+                let rawSDPADecodeTokensPerSecondP95,
+                rawSDPADecodeTokensPerSecondP95 > 0
             {
-                speedRatioToPlainP95 = decodeTokensPerSecondP95 / plainDecodeTokensPerSecondP95
+                speedRatioToRawSDPAP95 =
+                    decodeTokensPerSecondP95 / rawSDPADecodeTokensPerSecondP95
+                speedRatioToPlainP95 = speedRatioToRawSDPAP95
             }
-            if let plainKVBytes, storageEstimate.totalBytes > 0 {
-                memoryReductionRatio = Double(plainKVBytes) / Double(storageEstimate.totalBytes)
+            if let rawSDPAKVBytes, storageEstimate.totalBytes > 0 {
+                memoryBytesSavedVsRawSDPA = max(0, rawSDPAKVBytes - storageEstimate.totalBytes)
+                memoryReductionRatio =
+                    Double(rawSDPAKVBytes) / Double(storageEstimate.totalBytes)
+                if rawSDPAKVBytes > 0, let memoryBytesSavedVsRawSDPA {
+                    memoryReductionPercent =
+                        Double(memoryBytesSavedVsRawSDPA) / Double(rawSDPAKVBytes) * 100
+                }
             }
         } catch {
             benchmarkError = String(describing: error)
@@ -477,6 +743,14 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
                 ? "gqa\(options.queryHeadCount / options.kvHeadCount)" : nil,
             outputDType: String(describing: pathDecision.outputDType)
         ),
+        sparseVEnabled: options.sparseVEnabled,
+        sparseVSelectionMode: options.sparseVSelectionMode?.reportMode,
+        sparseVThreshold: (options.sparseVSelectionMode == .threshold
+            || options.sparseVSelectionMode == .blockThreshold)
+            ? options.resolvedSparseVThreshold : nil,
+        sparseVRecentTokenCount: options.sparseVRecentTokenCount,
+        sparseVOlderTokenCount: options.sparseVOlderTokenCount,
+        sparseVPageCandidateCount: options.sparseVPageCandidateCount,
         contextTokens: options.contextTokens,
         headDimension: options.headDimension,
         queryLength: options.queryLength,
@@ -510,16 +784,28 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         plainDecodeTokensPerSecondP95: plainDecodeTokensPerSecondP95,
         speedRatioToPlainP50: speedRatioToPlainP50,
         speedRatioToPlainP95: speedRatioToPlainP95,
+        rawSDPAReferenceDType: rawSDPAKVBytes == nil ? nil : "float16",
+        rawSDPAAttentionLatencyMSP50: rawSDPAAttentionLatencyMSP50,
+        rawSDPAAttentionLatencyMSP95: rawSDPAAttentionLatencyMSP95,
+        rawSDPADecodeTokensPerSecondP50: rawSDPADecodeTokensPerSecondP50,
+        rawSDPADecodeTokensPerSecondP95: rawSDPADecodeTokensPerSecondP95,
+        speedRatioToRawSDPAP50: speedRatioToRawSDPAP50,
+        speedRatioToRawSDPAP95: speedRatioToRawSDPAP95,
         totalBytes: storageEstimate.totalBytes,
         compressedKVBytes: storageEstimate.totalBytes,
-        plainKVBytes: plainKVBytes,
+        plainKVBytes: rawSDPAKVBytes,
+        rawSDPAKVBytes: rawSDPAKVBytes,
+        memoryBytesSavedVsRawSDPA: memoryBytesSavedVsRawSDPA,
         memoryReductionRatio: memoryReductionRatio,
+        memoryReductionPercent: memoryReductionPercent,
         peakMemoryBytes: nil,
         actualBitsPerValue: storageEstimate.actualBitsPerValue,
         fallbackUsed: fallbackUsed,
         fallbackReason: fallbackReason?.isEmpty == true ? nil : fallbackReason,
         memoryWarningsSeen: 0,
-        jetsamObserved: false
+        jetsamObserved: false,
+        cooldownMS: options.cooldownMilliseconds,
+        pathCooldownMS: options.pathCooldownMilliseconds
     )
 
     let report = TurboQuantCoreBenchmarkReport(
@@ -527,6 +813,7 @@ private func runCoreBenchmarkJSON(options: BenchmarkOptions) throws {
         capabilities: capabilities,
         storageEstimate: storageEstimate,
         pathDecision: pathDecision,
+        pathMeasurements: pathMeasurements,
         metrics: metrics,
         hiddenCopyAudit: hiddenCopyAudit
     )
@@ -537,11 +824,13 @@ private func benchmarkRoute(for path: TurboQuantAttentionPath) -> TurboQuantBenc
     switch path {
     case .baseline:
         return .rawSDPA
-    case .nativeMLXCompressed, .affineK8V4Native:
+    case .nativeMLXCompressed, .affineK8V4Native, .affineK8VxNative,
+        .affineK8VxResidual, .affineInt4Native:
         return .compressedFused
-    case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed:
+    case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed,
+        .metalPolarWHTHybrid, .metalHybridK8PolarWHTValue:
         return .compressedFused
-    case .twoStageCompressed, .affineInt4Native, .mlxPackedFallback:
+    case .twoStageCompressed, .polarWHTReferenceHybrid, .mlxPackedFallback:
         return .decodedFallback
     case .unavailable:
         return .unavailable
@@ -552,11 +841,13 @@ private func benchmarkBackend(for path: TurboQuantAttentionPath) -> TurboQuantBe
     switch path {
     case .baseline:
         return .rawSDPA
-    case .nativeMLXCompressed, .affineK8V4Native:
+    case .nativeMLXCompressed, .affineK8V4Native, .affineK8VxNative,
+        .affineK8VxResidual, .affineInt4Native:
         return .nativeMLX
-    case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed, .twoStageCompressed:
+    case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed,
+        .twoStageCompressed, .metalPolarWHTHybrid, .metalHybridK8PolarWHTValue:
         return .swiftMetalKernel
-    case .affineInt4Native, .mlxPackedFallback:
+    case .polarWHTReferenceHybrid, .mlxPackedFallback:
         return .decodedReference
     case .unavailable:
         return .unavailable
@@ -571,8 +862,9 @@ private struct CoreAttentionMeasurement {
     var avSeconds: Double?
     var fusedSeconds: Double?
     var attentionTiming: TimingSummary?
-    var plainAttentionTiming: TimingSummary?
-    var plainKVBytes: Int?
+    var rawSDPAAttentionTiming: TimingSummary?
+    var rawSDPAKVBytes: Int?
+    var pathMeasurements: [TurboQuantCoreBenchmarkPathMeasurement]
 
     var twoStageAttentionSeconds: Double? {
         guard let qkSeconds, let avSeconds else { return nil }
@@ -580,10 +872,17 @@ private struct CoreAttentionMeasurement {
     }
 }
 
-private func measureCoreAttention(
-    options: BenchmarkOptions,
-    decision: TurboQuantAttentionDecision
-) throws -> CoreAttentionMeasurement {
+private struct CoreAttentionInputs {
+    var query: MLXArray
+    var keys: MLXArray
+    var values: MLXArray
+    var rawSDPAQuery: MLXArray
+    var rawSDPAKeys: MLXArray
+    var rawSDPAValues: MLXArray
+    var scale: Float
+}
+
+private func makeCoreAttentionInputs(options: BenchmarkOptions) -> CoreAttentionInputs {
     let query = MLXArray(
         values(
             count: options.batchSize * options.queryHeadCount * options.queryLength
@@ -610,14 +909,164 @@ private func measureCoreAttention(
         ),
         [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
     )
+    let rawSDPAQuery = query.asType(.float16)
+    let rawSDPAKeys = keys.asType(.float16)
+    let rawSDPAValues = valuesArray.asType(.float16)
+    eval(rawSDPAQuery, rawSDPAKeys, rawSDPAValues)
+    return CoreAttentionInputs(
+        query: query,
+        keys: keys,
+        values: valuesArray,
+        rawSDPAQuery: rawSDPAQuery,
+        rawSDPAKeys: rawSDPAKeys,
+        rawSDPAValues: rawSDPAValues,
+        scale: 1 / sqrt(Float(options.headDimension))
+    )
+}
+
+private func rawSDPAAttention(inputs: CoreAttentionInputs) -> MLXArray {
+    MLXFast.scaledDotProductAttention(
+        queries: inputs.rawSDPAQuery,
+        keys: inputs.rawSDPAKeys,
+        values: inputs.rawSDPAValues,
+        scale: inputs.scale,
+        mask: .causal
+    )
+    .asType(.float32)
+}
+
+private func twoStageAttention(
+    query: MLXArray,
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantAttentionCode,
+    scale: Float
+) throws -> MLXArray {
+    let scores = try turboQuantMetalQK(
+        queries: query,
+        keyCode: keyCode,
+        scale: scale,
+        mask: .causal
+    )
+    let weights = softmax(scores.asType(.float32), axis: -1)
+    eval(weights)
+    return try turboQuantMetalAV(
+        attentionWeights: weights,
+        valueCode: valueCode,
+        outputDType: .float32
+    )
+}
+
+private func pathMeasurement(
+    path: TurboQuantAttentionPath,
+    status: TurboQuantCoreBenchmarkPathStatus,
+    selected: Bool,
+    validForRequest: Bool,
+    queryLength: Int,
+    reason: String? = nil,
+    timing: TimingSummary? = nil,
+    output: MLXArray? = nil,
+    rawReference: TimedValueSummary<MLXArray>? = nil,
+    compressedKVBytes: Int? = nil,
+    rawSDPAKVBytes: Int? = nil,
+    actualBitsPerValue: Double? = nil
+) -> TurboQuantCoreBenchmarkPathMeasurement {
+    let p50TokensPerSecond = tokensPerSecond(queryLength: queryLength, seconds: timing?.p50Seconds)
+    let p95TokensPerSecond = tokensPerSecond(queryLength: queryLength, seconds: timing?.p95Seconds)
+    let rawP50TokensPerSecond = tokensPerSecond(
+        queryLength: queryLength,
+        seconds: rawReference?.timing.p50Seconds
+    )
+    let rawP95TokensPerSecond = tokensPerSecond(
+        queryLength: queryLength,
+        seconds: rawReference?.timing.p95Seconds
+    )
+    let quality = output.flatMap { output in
+        rawReference.map { qualityMetrics($0.value, output) }
+    }
+    let savedBytes = memoryBytesSaved(compressedBytes: compressedKVBytes, rawBytes: rawSDPAKVBytes)
+    return TurboQuantCoreBenchmarkPathMeasurement(
+        path: path,
+        route: benchmarkRoute(for: path).rawValue,
+        backend: benchmarkBackend(for: path).rawValue,
+        status: status,
+        selected: selected,
+        validForRequest: validForRequest,
+        referenceDType: rawReference == nil ? nil : "float16",
+        reason: reason,
+        latencyMSAverage: milliseconds(timing?.averageSeconds),
+        latencyMSP50: milliseconds(timing?.p50Seconds),
+        latencyMSP95: milliseconds(timing?.p95Seconds),
+        decodeTokensPerSecondP50: p50TokensPerSecond,
+        decodeTokensPerSecondP95: p95TokensPerSecond,
+        rawSDPALatencyMSP50: milliseconds(rawReference?.timing.p50Seconds),
+        rawSDPALatencyMSP95: milliseconds(rawReference?.timing.p95Seconds),
+        rawSDPADecodeTokensPerSecondP50: rawP50TokensPerSecond,
+        rawSDPADecodeTokensPerSecondP95: rawP95TokensPerSecond,
+        speedRatioToRawSDPAP50: speedRatio(p50TokensPerSecond, rawP50TokensPerSecond),
+        speedRatioToRawSDPAP95: speedRatio(p95TokensPerSecond, rawP95TokensPerSecond),
+        compressedKVBytes: compressedKVBytes,
+        rawSDPAKVBytes: rawSDPAKVBytes,
+        memoryBytesSavedVsRawSDPA: savedBytes,
+        memoryReductionRatio: memoryReductionRatio(
+            compressedBytes: compressedKVBytes,
+            rawBytes: rawSDPAKVBytes
+        ),
+        memoryReductionPercent: memoryReductionPercent(savedBytes: savedBytes, rawBytes: rawSDPAKVBytes),
+        actualBitsPerValue: actualBitsPerValue,
+        maxAbsoluteErrorVsRawSDPA: quality.map { Double($0.maxAbsoluteError) },
+        cosineSimilarityVsRawSDPA: quality.map { Double($0.cosineSimilarity) }
+    )
+}
+
+private func tokensPerSecond(queryLength: Int, seconds: Double?) -> Double? {
+    guard let seconds, seconds > 0 else { return nil }
+    return Double(queryLength) / seconds
+}
+
+private func speedRatio(_ candidate: Double?, _ reference: Double?) -> Double? {
+    guard let candidate, let reference, reference > 0 else { return nil }
+    return candidate / reference
+}
+
+private func memoryBytesSaved(compressedBytes: Int?, rawBytes: Int?) -> Int? {
+    guard let compressedBytes, let rawBytes else { return nil }
+    return max(0, rawBytes - compressedBytes)
+}
+
+private func memoryReductionRatio(compressedBytes: Int?, rawBytes: Int?) -> Double? {
+    guard let compressedBytes, let rawBytes, compressedBytes > 0 else { return nil }
+    return Double(rawBytes) / Double(compressedBytes)
+}
+
+private func memoryReductionPercent(savedBytes: Int?, rawBytes: Int?) -> Double? {
+    guard let savedBytes, let rawBytes, rawBytes > 0 else { return nil }
+    return Double(savedBytes) / Double(rawBytes) * 100
+}
+
+private func measureCoreAttention(
+    options: BenchmarkOptions,
+    decision: TurboQuantAttentionDecision,
+    availability: TurboQuantKernelAvailability
+) throws -> CoreAttentionMeasurement {
+    let inputs = makeCoreAttentionInputs(options: options)
+    let rawSDPAKVBytes = inputs.rawSDPAKeys.nbytes + inputs.rawSDPAValues.nbytes
+    let rawReference = try timedSampled(
+        iterations: options.iterations,
+        warmup: options.warmup,
+        cooldownMilliseconds: options.cooldownMilliseconds
+    ) {
+        rawSDPAAttention(inputs: inputs)
+    }
+    cooldown(milliseconds: options.pathCooldownMilliseconds)
 
     let (encodeSeconds, codes) = try timedValue(
         iterations: options.iterations,
         warmup: options.warmup,
+        cooldownMilliseconds: options.cooldownMilliseconds,
         evaluate: evaluateAttentionCodes
     ) {
         let keyCode = try turboQuantMetalEncodeAttention(
-            keys,
+            inputs.keys,
             configuration: TurboQuantConfiguration(
                 preset: options.preset,
                 role: .key,
@@ -630,7 +1079,7 @@ private func measureCoreAttention(
             )
         )
         let valueCode = try turboQuantMetalEncodeAttention(
-            valuesArray,
+            inputs.values,
             configuration: TurboQuantConfiguration(
                 preset: options.preset,
                 role: .value,
@@ -648,23 +1097,25 @@ private func measureCoreAttention(
 
     let keyCode = codes.0
     let valueCode = codes.1
-    let scale = 1 / sqrt(Float(options.headDimension))
-    let plainAttention = try timedSampled(
-        iterations: options.iterations,
-        warmup: options.warmup
-    ) {
-        MLXFast.scaledDotProductAttention(
-            queries: query,
-            keys: keys,
-            values: valuesArray,
-            scale: scale,
-            mask: .causal
-        )
-    }
+    let polarWHTValueCode = try turboQuantMetalPolarWHTEncodeAttentionValues(
+        inputs.values,
+        bits: options.resolvedValueBits,
+        seed: 0xBEEF_0000_0000_0302
+    )
+    evaluatePolarWHTAttentionValueCode(polarWHTValueCode)
+    let storageEstimate = actualAggregateStorageEstimate(keyCode: keyCode, valueCode: valueCode)
+    let hybridStorageEstimate = actualHybridAggregateStorageEstimate(
+        keyCode: keyCode,
+        valueCode: polarWHTValueCode
+    )
+    let compressedKVBytes = storageEstimate.totalBytes
+    let actualBitsPerValue = storageEstimate.actualBitsPerValue
+    cooldown(milliseconds: options.pathCooldownMilliseconds)
 
     let (decodeSeconds, _) = try timedValue(
         iterations: options.iterations,
         warmup: options.warmup,
+        cooldownMilliseconds: options.cooldownMilliseconds,
         evaluate: { eval($0.0, $0.1) }
     ) {
         (
@@ -672,69 +1123,610 @@ private func measureCoreAttention(
             try turboQuantMetalDecodeAttention(valueCode, outputDType: .float32)
         )
     }
+    cooldown(milliseconds: options.pathCooldownMilliseconds)
 
-    let (qkSeconds, scores) = try timed(iterations: options.iterations, warmup: options.warmup) {
+    let (qkSeconds, scores) = try timed(
+        iterations: options.iterations,
+        warmup: options.warmup,
+        cooldownMilliseconds: options.cooldownMilliseconds
+    ) {
         try turboQuantMetalQK(
-            queries: query,
+            queries: inputs.query,
             keyCode: keyCode,
-            scale: scale,
+            scale: inputs.scale,
             mask: .causal
         )
     }
     let weights = softmax(scores.asType(.float32), axis: -1)
     eval(weights)
 
-    let (avSeconds, _) = try timed(iterations: options.iterations, warmup: options.warmup) {
+    let (avSeconds, _) = try timed(
+        iterations: options.iterations,
+        warmup: options.warmup,
+        cooldownMilliseconds: options.cooldownMilliseconds
+    ) {
         try turboQuantMetalAV(
             attentionWeights: weights,
             valueCode: valueCode,
             outputDType: .float32
         )
     }
+    cooldown(milliseconds: options.pathCooldownMilliseconds)
 
-    let selectedPathUsesFused =
-        decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused
-    let selectedAttention = try timedSampled(iterations: options.iterations, warmup: options.warmup)
-    {
-        try turboQuantMetalScaledDotProductAttention(
-            queries: query,
-            keyCode: keyCode,
-            valueCode: valueCode,
-            scale: scale,
-            mask: .causal,
-            preferOnlineFused: selectedPathUsesFused,
-            blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
+    var pathMeasurements: [TurboQuantCoreBenchmarkPathMeasurement] = []
+    var timingByPath: [TurboQuantAttentionPath: TimingSummary] = [:]
+
+    func appendMeasurement(
+        _ path: TurboQuantAttentionPath,
+        status: TurboQuantCoreBenchmarkPathStatus,
+        validForRequest: Bool,
+        reason: String? = nil,
+        timing: TimingSummary? = nil,
+        output: MLXArray? = nil,
+        compressedBytes: Int? = compressedKVBytes,
+        bitsPerValue: Double? = actualBitsPerValue
+    ) {
+        if let timing, status == .measured || status == .reference {
+            timingByPath[path] = timing
+        }
+        pathMeasurements.append(
+            pathMeasurement(
+                path: path,
+                status: status,
+                selected: decision.selectedPath == path,
+                validForRequest: validForRequest,
+                queryLength: options.queryLength,
+                reason: reason,
+                timing: timing,
+                output: output,
+                rawReference: rawReference,
+                compressedKVBytes: compressedBytes,
+                rawSDPAKVBytes: rawSDPAKVBytes,
+                actualBitsPerValue: bitsPerValue
+            )
         )
     }
-    let fusedSeconds: Double?
-    if selectedPathUsesFused {
-        fusedSeconds = selectedAttention.timing.averageSeconds
-    } else if decision.selectedPath != .twoStageCompressed {
-        fusedSeconds = try timed(iterations: options.iterations, warmup: options.warmup) {
-            try turboQuantMetalScaledDotProductAttention(
-                queries: query,
-                keyCode: keyCode,
-                valueCode: valueCode,
-                scale: scale,
-                mask: .causal,
-                preferOnlineFused: true,
-                blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
+
+    appendMeasurement(
+        .baseline,
+        status: .reference,
+        validForRequest: true,
+        reason: "FP16 raw SDPA reference",
+        timing: rawReference.timing,
+        output: rawReference.value,
+        compressedBytes: rawSDPAKVBytes,
+        bitsPerValue: 16
+    )
+
+    let nativeOptions =
+        sparseVNativeAttentionOptions(benchmark: options, scale: inputs.scale, diagnostics: false)
+        ?? TurboQuantNativeAttentionOptions(
+            scale: inputs.scale,
+            causal: true,
+            backendVersion: availability.attentionCapabilities.nativeBackendVersion
+                ?? TurboQuantNativeAttentionOptions.backendVersion
+        )
+
+    func nativePathSkipReason(_ path: TurboQuantAttentionPath) -> String? {
+        switch path {
+        case .affineK8V4Native where options.resolvedValueBits != 4:
+            return "affine K8/V4 evidence requires --value-bits 4"
+        case .affineK8VxNative where options.resolvedValueBits >= 4,
+            .affineK8VxResidual where options.resolvedValueBits >= 4:
+            return "affine K8/Vx evidence requires --value-bits below 4"
+        default:
+            return nil
+        }
+    }
+
+    for path in [
+        TurboQuantAttentionPath.nativeMLXCompressed,
+        .affineK8V4Native,
+        .affineK8VxNative,
+        .affineK8VxResidual,
+    ] {
+        if availability.attentionCapabilities.nativeCompressedAttention != true {
+            appendMeasurement(
+                path,
+                status: .unavailable,
+                validForRequest: false,
+                reason: availability.attentionCapabilities.nativeFallbackReason
+                    ?? "native compressed attention capability is unavailable"
             )
-        }.0
+            continue
+        }
+        if let reason = nativePathSkipReason(path) {
+            appendMeasurement(path, status: .skipped, validForRequest: false, reason: reason)
+            continue
+        }
+        do {
+            let measured = try timedSampled(
+                iterations: options.iterations,
+                warmup: options.warmup,
+                cooldownMilliseconds: options.cooldownMilliseconds
+            ) {
+                try turboQuantNativeScaledDotProductAttention(
+                    queries: inputs.query,
+                    keyCode: keyCode,
+                    valueCode: valueCode,
+                    options: nativeOptions
+                )
+            }
+            appendMeasurement(
+                path,
+                status: .measured,
+                validForRequest: true,
+                timing: measured.timing,
+                output: measured.value
+            )
+        } catch {
+            appendMeasurement(
+                path,
+                status: .failed,
+                validForRequest: true,
+                reason: String(describing: error)
+            )
+        }
+        cooldown(milliseconds: options.pathCooldownMilliseconds)
+    }
+
+    do {
+        let routed = selectTurboQuantAttentionPath(
+            request: coreAttentionRequest(options: options, preferOnlineFused: true),
+            capabilities: availability.attentionCapabilities
+        )
+        for path in [TurboQuantAttentionPath.onlineFused, .tiledOnlineFused] {
+            let capabilityAvailable =
+                path == .onlineFused
+                ? availability.attentionCapabilities.onlineFused
+                : availability.attentionCapabilities.tiledOnlineFused
+            guard capabilityAvailable else {
+                appendMeasurement(
+                    path,
+                    status: .unavailable,
+                    validForRequest: false,
+                    reason: "\(path.rawValue) capability is unavailable"
+                )
+                continue
+            }
+            guard routed.selectedPath == path else {
+                appendMeasurement(
+                    path,
+                    status: .notCallable,
+                    validForRequest: false,
+                    reason:
+                        "public compressed attention wrapper routes this request to \(routed.selectedPath.rawValue)"
+                )
+                continue
+            }
+            let measured = try timedSampled(
+                iterations: options.iterations,
+                warmup: options.warmup,
+                cooldownMilliseconds: options.cooldownMilliseconds
+            ) {
+                try turboQuantMetalScaledDotProductAttention(
+                    queries: inputs.query,
+                    keyCode: keyCode,
+                    valueCode: valueCode,
+                    scale: inputs.scale,
+                    mask: .causal,
+                    preferOnlineFused: true,
+                    blockParallelTokenBlockSize: options.blockParallelTokenBlockSize
+                )
+            }
+            appendMeasurement(
+                path,
+                status: .measured,
+                validForRequest: true,
+                timing: measured.timing,
+                output: measured.value
+            )
+            cooldown(milliseconds: options.pathCooldownMilliseconds)
+        }
+    } catch {
+        appendMeasurement(
+            .onlineFused,
+            status: .failed,
+            validForRequest: true,
+            reason: String(describing: error)
+        )
+        appendMeasurement(
+            .tiledOnlineFused,
+            status: .failed,
+            validForRequest: true,
+            reason: String(describing: error)
+        )
+    }
+
+    if availability.attentionCapabilities.qk && availability.attentionCapabilities.av {
+        do {
+            let measured = try timedSampled(
+                iterations: options.iterations,
+                warmup: options.warmup,
+                cooldownMilliseconds: options.cooldownMilliseconds
+            ) {
+                try twoStageAttention(
+                    query: inputs.query,
+                    keyCode: keyCode,
+                    valueCode: valueCode,
+                    scale: inputs.scale
+                )
+            }
+            appendMeasurement(
+                .twoStageCompressed,
+                status: .measured,
+                validForRequest: true,
+                timing: measured.timing,
+                output: measured.value
+            )
+        } catch {
+            appendMeasurement(
+                .twoStageCompressed,
+                status: .failed,
+                validForRequest: true,
+                reason: String(describing: error)
+            )
+        }
+    } else {
+        appendMeasurement(
+            .twoStageCompressed,
+            status: .unavailable,
+            validForRequest: false,
+            reason: "compressed QK/AV capabilities are unavailable"
+        )
+    }
+    cooldown(milliseconds: options.pathCooldownMilliseconds)
+
+    if availability.attentionCapabilities.hybridK8PolarWHTValueAttention {
+        do {
+            let measured = try timedSampled(
+                iterations: options.iterations,
+                warmup: options.warmup,
+                cooldownMilliseconds: options.cooldownMilliseconds
+            ) {
+                try turboQuantMetalHybridPolarWHTValueScaledDotProductAttention(
+                    queries: inputs.query,
+                    keyCode: keyCode,
+                    valueCode: polarWHTValueCode,
+                    scale: inputs.scale,
+                    mask: .causal,
+                    outputDType: .float32
+                )
+            }
+            appendMeasurement(
+                .metalHybridK8PolarWHTValue,
+                status: .measured,
+                validForRequest: true,
+                timing: measured.timing,
+                output: measured.value,
+                compressedBytes: hybridStorageEstimate.totalBytes,
+                bitsPerValue: hybridStorageEstimate.actualBitsPerValue
+            )
+        } catch {
+            appendMeasurement(
+                .metalHybridK8PolarWHTValue,
+                status: .failed,
+                validForRequest: true,
+                reason: String(describing: error),
+                compressedBytes: hybridStorageEstimate.totalBytes,
+                bitsPerValue: hybridStorageEstimate.actualBitsPerValue
+            )
+        }
+    } else {
+        appendMeasurement(
+            .metalHybridK8PolarWHTValue,
+            status: .unavailable,
+            validForRequest: false,
+            reason: "hybrid K8 + PolarWHT-V attention capability is unavailable",
+            compressedBytes: hybridStorageEstimate.totalBytes,
+            bitsPerValue: hybridStorageEstimate.actualBitsPerValue
+        )
+    }
+    cooldown(milliseconds: options.pathCooldownMilliseconds)
+
+    appendMeasurement(
+        .sparseValueTwoStageCompressed,
+        status: options.sparseVEnabled ? .notCallable : .skipped,
+        validForRequest: false,
+        reason: options.sparseVEnabled
+            ? "Sparse-V core primitive evidence is emitted through native compressed path rows"
+            : "pass --sparse-v to request Sparse-V evidence"
+    )
+    appendMeasurement(
+        .affineInt4Native,
+        status: .notCallable,
+        validForRequest: false,
+        reason: "affine int4 native is a router label; no public primitive dispatcher is exposed"
+    )
+    appendMeasurement(
+        .mlxPackedFallback,
+        status: .skipped,
+        validForRequest: false,
+        reason: "MLX packed fallback is a compatibility fallback, not an optimization path"
+    )
+    appendMeasurement(
+        .unavailable,
+        status: .unavailable,
+        validForRequest: false,
+        reason: "sentinel path"
+    )
+
+    let selectedAttentionTiming = timingByPath[decision.selectedPath]
+    let fusedSeconds: Double?
+    if decision.selectedPath == .onlineFused || decision.selectedPath == .tiledOnlineFused {
+        fusedSeconds = selectedAttentionTiming?.averageSeconds
     } else {
         fusedSeconds = nil
     }
 
+    let selectedStorageEstimate =
+        decision.selectedPath == .metalHybridK8PolarWHTValue
+        ? hybridStorageEstimate
+        : storageEstimate
+
     return CoreAttentionMeasurement(
-        storageEstimate: actualAggregateStorageEstimate(keyCode: keyCode, valueCode: valueCode),
+        storageEstimate: selectedStorageEstimate,
         encodeSeconds: encodeSeconds,
         decodeSeconds: decodeSeconds,
         qkSeconds: qkSeconds,
         avSeconds: avSeconds,
         fusedSeconds: fusedSeconds,
-        attentionTiming: selectedAttention.timing,
-        plainAttentionTiming: plainAttention.timing,
-        plainKVBytes: keys.nbytes + valuesArray.nbytes
+        attentionTiming: selectedAttentionTiming,
+        rawSDPAAttentionTiming: rawReference.timing,
+        rawSDPAKVBytes: rawSDPAKVBytes,
+        pathMeasurements: pathMeasurements
+    )
+}
+
+private func sparseVModeLabel(_ mode: BenchmarkSparseVSelectionMode) -> String {
+    switch mode {
+    case .off:
+        return "off"
+    case .threshold:
+        return "threshold"
+    case .topK:
+        return "topK"
+    case .cumulativeMass:
+        return "cumulativeMass"
+    case .hybridCumulativeMassTopK:
+        return "hybridCumulativeMassTopK"
+    case .blockThreshold:
+        return "blockThreshold"
+    case .pageTopK:
+        return "pageTopK"
+    case .candidateSparse:
+        return "candidateSparse"
+    }
+}
+
+private func sparseVNativeAttentionOptions(
+    benchmark options: BenchmarkOptions,
+    scale: Float,
+    diagnostics: Bool
+) -> TurboQuantNativeAttentionOptions? {
+    guard let mode = options.sparseVSelectionMode, mode != .off else {
+        return nil
+    }
+
+    switch mode {
+    case .off:
+        return nil
+    case .threshold:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVThreshold: options.resolvedSparseVThreshold,
+            sparseVSelectionMode: .threshold,
+            diagnostics: diagnostics
+        )
+    case .blockThreshold:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVThreshold: options.resolvedSparseVThreshold,
+            sparseVSelectionMode: .blockThreshold,
+            diagnostics: diagnostics
+        )
+    case .topK:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVSelectionMode: .topK,
+            sparseVTopK: options.resolvedSparseVTopK,
+            diagnostics: diagnostics
+        )
+    case .pageTopK:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVSelectionMode: .pageTopK,
+            sparseVTopK: options.resolvedSparseVTopK,
+            diagnostics: diagnostics
+        )
+    case .candidateSparse:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVSelectionMode: .pageTopK,
+            sparseVTopK: options.resolvedSparseVTopK,
+            sparseVRecentTokens: options.resolvedSparseVRecentTokens,
+            sparseVCandidatePages: options.resolvedSparseVCandidatePages,
+            diagnostics: diagnostics
+        )
+    case .cumulativeMass:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVSelectionMode: .cumulativeMass,
+            sparseVCumulativeMass: options.resolvedSparseVCumulativeMass,
+            diagnostics: diagnostics
+        )
+    case .hybridCumulativeMassTopK:
+        return TurboQuantNativeAttentionOptions(
+            scale: scale,
+            causal: true,
+            sparseVSelectionMode: .hybridCumulativeMassTopK,
+            sparseVCumulativeMass: options.resolvedSparseVCumulativeMass,
+            sparseVMaxTopK: options.resolvedSparseVMaxTopK,
+            diagnostics: diagnostics
+        )
+    }
+}
+
+private func runNativeSparseVBenchmark(options: BenchmarkOptions) throws -> BenchmarkResult {
+    guard let mode = options.sparseVSelectionMode, mode != .off else {
+        return skipped("attention.native_sparse", reason: "Sparse-V benchmark not requested")
+    }
+    guard options.queryLength == 1 else {
+        return skipped(
+            "attention.native_sparse.\(sparseVModeLabel(mode))",
+            reason: "native Sparse-V benchmark is decode-only; pass --query-length 1")
+    }
+    guard options.queryHeadCount % options.kvHeadCount == 0 else {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "query heads must be a multiple of KV heads")
+    }
+
+    let q = MLXArray(
+        values(
+            count: options.batchSize * options.queryHeadCount * options.queryLength
+                * options.headDimension,
+            scale: 0.019
+        ),
+        [options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension]
+    )
+    let k = MLXArray(
+        values(
+            count: options.batchSize * options.kvHeadCount * options.contextTokens
+                * options.headDimension,
+            scale: 0.007,
+            phase: 0.1
+        ),
+        [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
+    )
+    let v = MLXArray(
+        values(
+            count: options.batchSize * options.kvHeadCount * options.contextTokens
+                * options.headDimension,
+            scale: 0.009,
+            phase: 0.2
+        ),
+        [options.batchSize, options.kvHeadCount, options.contextTokens, options.headDimension]
+    )
+    let keyCode = try turboQuantMetalEncodeAttention(
+        k,
+        configuration: TurboQuantConfiguration(
+            preset: options.preset,
+            role: .key,
+            groupSize: options.groupSize,
+            backend: .metalPolarQJL,
+            seed: 0xBEEF_0000_0000_0201,
+            attentionLayoutVersion: options.layoutVersion,
+            allowExperimentalLayoutV5: options.enableLayoutV5,
+            attentionScaleStorage: options.scaleStorage
+        )
+    )
+    let valueCode = try turboQuantMetalEncodeAttention(
+        v,
+        configuration: TurboQuantConfiguration(
+            preset: options.preset,
+            role: .value,
+            groupSize: options.groupSize,
+            backend: .metalPolarQJL,
+            seed: 0xBEEF_0000_0000_0202,
+            valueBits: options.resolvedValueBits,
+            attentionLayoutVersion: options.layoutVersion,
+            allowExperimentalLayoutV5: options.enableLayoutV5,
+            attentionScaleStorage: options.scaleStorage
+        )
+    )
+    let scale = 1 / sqrt(Float(options.headDimension))
+    let denseOptions = TurboQuantNativeAttentionOptions(scale: scale, causal: true)
+    let sparseOptions = sparseVNativeAttentionOptions(
+        benchmark: options,
+        scale: scale,
+        diagnostics: false
+    )!
+    let sparseDiagnosticOptions = sparseVNativeAttentionOptions(
+        benchmark: options,
+        scale: scale,
+        diagnostics: true
+    )!
+    let keyPageSummary =
+        (mode == .pageTopK || mode == .candidateSparse) && options.sparseVUsePageSummary
+        ? try turboQuantKeyPageSummaries(keyCode: keyCode)
+        : nil
+
+    let dense = try timedSampled(iterations: options.iterations, warmup: options.warmup) {
+        try turboQuantNativeScaledDotProductAttention(
+            queries: q,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            options: denseOptions
+        )
+    }
+    let sparse = try timedSampled(iterations: options.iterations, warmup: options.warmup) {
+        try turboQuantNativeScaledDotProductAttention(
+            queries: q,
+            keyCode: keyCode,
+            valueCode: valueCode,
+            options: sparseOptions,
+            keyPageSummary: keyPageSummary
+        )
+    }
+    let diagnostic = try turboQuantNativeScaledDotProductAttentionWithDiagnostics(
+        queries: q,
+        keyCode: keyCode,
+        valueCode: valueCode,
+        options: sparseDiagnosticOptions,
+        keyPageSummary: keyPageSummary
+    )
+    eval(diagnostic.output)
+
+    let codeMemoryBytes = keyCode.storageByteCount + valueCode.storageByteCount
+    let codeValueCount =
+        keyCode.layout.batchSize * keyCode.layout.kvHeadCount
+        * max(keyCode.layout.logicalLength, 1) * keyCode.layout.headDimension
+        + valueCode.layout.batchSize * valueCode.layout.kvHeadCount
+        * max(valueCode.layout.logicalLength, 1) * valueCode.layout.headDimension
+    let actualBitsPerValue = Double(codeMemoryBytes * 8) / Double(codeValueCount)
+    let diagnostics = diagnostic.diagnostics
+
+    return BenchmarkResult(
+        name: "attention.native_sparse.\(sparseVModeLabel(mode))",
+        status: "ok",
+        selectedPath: TurboQuantAttentionPath.nativeMLXCompressed.rawValue,
+        dtype: "\(sparse.value.dtype)",
+        shape: sparse.value.shape,
+        queryShape: q.shape,
+        keyShape: k.shape,
+        valueShape: v.shape,
+        preset: keyCode.preset,
+        valueBits: valueCode.valueBits,
+        actualBitsPerValue: actualBitsPerValue,
+        memoryBytes: codeMemoryBytes,
+        latencySeconds: sparse.timing.averageSeconds,
+        denseReferenceLatencySeconds: dense.timing.averageSeconds,
+        quality: qualityMetrics(dense.value, sparse.value),
+        sparseVSelectionMode: sparseVModeLabel(mode),
+        sparseVThreshold: mode == .threshold || mode == .blockThreshold
+            ? options.resolvedSparseVThreshold : nil,
+        sparseVTopK: mode == .topK || mode == .pageTopK || mode == .candidateSparse
+            ? options.resolvedSparseVTopK : nil,
+        sparseVCumulativeMass: mode == .cumulativeMass || mode == .hybridCumulativeMassTopK
+            ? options.resolvedSparseVCumulativeMass : nil,
+        sparseVMaxTopK: mode == .hybridCumulativeMassTopK ? options.resolvedSparseVMaxTopK : nil,
+        sparseVRecentTokenCount: options.sparseVRecentTokenCount,
+        sparseVOlderTokenCount: options.sparseVOlderTokenCount,
+        sparseVPageCandidateCount: options.sparseVPageCandidateCount,
+        sparseVPageSummary: mode == .pageTopK || mode == .candidateSparse
+            ? options.sparseVUsePageSummary : nil,
+        sparseVSkippedTokens: diagnostics?.sparseSkippedTokens,
+        sparseVTotalTokens: diagnostics?.sparseTotalTokens,
+        sparseVSkipRatio: diagnostics?.sparseSkipRatio,
+        activeBlocks: diagnostics?.activeBlocks,
+        blockTokens: diagnostics?.blockTokens,
+        kernelKind: diagnostics?.kernelKind
     )
 }
 
@@ -925,6 +1917,25 @@ private func runLegacyBenchmark(options: BenchmarkOptions) throws {
         results.append(skipped("attention", reason: "Metal attention unavailable or probe failed"))
     }
 
+    if options.sparseVSelectionMode != nil {
+        if availability.attentionCapabilities.nativeSparseVSupport == true {
+            do {
+                results.append(try runNativeSparseVBenchmark(options: options))
+            } catch {
+                results.append(
+                    BenchmarkResult(
+                        name: "attention.native_sparse",
+                        status: "failed",
+                        shape: [],
+                        error: "\(error)"
+                    ))
+            }
+        } else {
+            results.append(
+                skipped("attention.native_sparse", reason: "native Sparse-V support unavailable"))
+        }
+    }
+
     let report = BenchmarkReport(
         schemaVersion: 2,
         generatedAt: options.includeTimestamp ? ISO8601DateFormatter().string(from: Date()) : nil,
@@ -942,20 +1953,10 @@ private func corePathDecision(
     options: BenchmarkOptions,
     availability: TurboQuantKernelAvailability
 ) -> TurboQuantAttentionDecision {
-    let request = TurboQuantAttentionRequest(
-        queryShape: [
-            options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension,
-        ],
-        keyLayout: symbolicAttentionLayout(options: options, role: .key),
-        valueLayout: symbolicAttentionLayout(options: options, role: .value),
-        queryDType: .float32,
-        outputDType: .float32,
-        maskKind: .causal,
-        preferOnlineFused: options.requestedPath != .twoStageCompressed,
-        fallbackState: TurboQuantAttentionFallbackState(
-            packedFallbackAvailable: true,
-            baselineAvailable: true
-        )
+    let request = coreAttentionRequest(
+        options: options,
+        preferOnlineFused: options.requestedPath != .twoStageCompressed
+            && options.requestedPath != .sparseValueTwoStageCompressed
     )
 
     switch options.requestedPath {
@@ -964,6 +1965,36 @@ private func corePathDecision(
             selectedPath: .nativeMLXCompressed,
             outputDType: request.outputDType,
             reason: "caller requested native MLX compressed attention path"
+        )
+    case .onlineFused:
+        return forcedFallbackDecision(
+            selectedPath: .onlineFused,
+            outputDType: request.outputDType,
+            reason: "caller requested online fused compressed attention path"
+        )
+    case .tiledOnlineFused:
+        return forcedFallbackDecision(
+            selectedPath: .tiledOnlineFused,
+            outputDType: request.outputDType,
+            reason: "caller requested tiled online fused compressed attention path"
+        )
+    case .sparseValueTwoStageCompressed:
+        return forcedFallbackDecision(
+            selectedPath: .sparseValueTwoStageCompressed,
+            outputDType: request.outputDType,
+            reason: "caller requested sparse-value two-stage compressed attention path"
+        )
+    case .metalHybridK8PolarWHTValue:
+        return forcedFallbackDecision(
+            selectedPath: .metalHybridK8PolarWHTValue,
+            outputDType: request.outputDType,
+            reason: "caller requested hybrid K8 + PolarWHT-V attention path"
+        )
+    case .twoStageCompressed:
+        return forcedFallbackDecision(
+            selectedPath: .twoStageCompressed,
+            outputDType: request.outputDType,
+            reason: "caller requested two-stage compressed attention path"
         )
     case .unavailable:
         return forcedFallbackDecision(
@@ -989,6 +2020,18 @@ private func corePathDecision(
             outputDType: request.outputDType,
             reason: "caller requested native affine K8/V4 path"
         )
+    case .affineK8VxNative:
+        return forcedFallbackDecision(
+            selectedPath: .affineK8VxNative,
+            outputDType: request.outputDType,
+            reason: "caller requested native affine K8/Vx path"
+        )
+    case .affineK8VxResidual:
+        return forcedFallbackDecision(
+            selectedPath: .affineK8VxResidual,
+            outputDType: request.outputDType,
+            reason: "caller requested residual affine K8/Vx path"
+        )
     case .mlxPackedFallback:
         return forcedFallbackDecision(
             selectedPath: .mlxPackedFallback,
@@ -1003,16 +2046,37 @@ private func corePathDecision(
     }
 }
 
+private func coreAttentionRequest(
+    options: BenchmarkOptions,
+    preferOnlineFused: Bool
+) -> TurboQuantAttentionRequest {
+    TurboQuantAttentionRequest(
+        queryShape: [
+            options.batchSize, options.queryHeadCount, options.queryLength, options.headDimension,
+        ],
+        keyLayout: symbolicAttentionLayout(options: options, role: .key),
+        valueLayout: symbolicAttentionLayout(options: options, role: .value),
+        queryDType: .float32,
+        outputDType: .float32,
+        maskKind: .causal,
+        preferOnlineFused: preferOnlineFused,
+        fallbackState: TurboQuantAttentionFallbackState(
+            packedFallbackAvailable: true,
+            baselineAvailable: true
+        )
+    )
+}
+
 private func validateCoreBenchmarkOptions(_ options: BenchmarkOptions) throws {
     guard options.queryHeadCount % options.kvHeadCount == 0 else {
         throw TurboQuantError.invalidMetalConfiguration(
             "query heads must be a multiple of KV heads")
     }
     if options.scaleStorage == .float16 {
-        guard options.layoutVersion == TurboQuantAttentionLayout.currentVersion
+        guard options.layoutVersion >= 5, options.enableLayoutV5
         else {
             throw TurboQuantError.invalidMetalConfiguration(
-                "float16 attention scale storage requires Layout V\(TurboQuantAttentionLayout.currentVersion)"
+                "float16 attention scale storage requires --enable-layout-v5 and Layout V5 or newer"
             )
         }
     }
@@ -1023,14 +2087,27 @@ private func forcedFallbackDecision(
     outputDType: DType,
     reason: String
 ) -> TurboQuantAttentionDecision {
-    TurboQuantAttentionDecision(
+    let rejectedPaths = [
+        TurboQuantAttentionPath.nativeMLXCompressed,
+        .onlineFused,
+        .tiledOnlineFused,
+        .sparseValueTwoStageCompressed,
+        .metalHybridK8PolarWHTValue,
+        .twoStageCompressed,
+        .affineInt4Native,
+        .affineK8V4Native,
+        .affineK8VxNative,
+        .affineK8VxResidual,
+        .mlxPackedFallback,
+        .baseline,
+    ]
+    .filter { $0 != selectedPath }
+    .map { RejectedPath(path: $0, reason: reason) }
+
+    return TurboQuantAttentionDecision(
         selectedPath: selectedPath,
         outputDType: outputDType,
-        rejectedPaths: [
-            RejectedPath(path: .onlineFused, reason: reason),
-            RejectedPath(path: .tiledOnlineFused, reason: reason),
-            RejectedPath(path: .twoStageCompressed, reason: reason),
-        ]
+        rejectedPaths: rejectedPaths
     )
 }
 
@@ -1106,6 +2183,21 @@ private func actualAggregateStorageEstimate(
     )
 }
 
+private func actualHybridAggregateStorageEstimate(
+    keyCode: TurboQuantAttentionCode,
+    valueCode: TurboQuantPolarWHTAttentionValueCode
+) -> TurboQuantStorageEstimate {
+    let keyEstimate = estimateTurboQuantStorage(code: keyCode)
+    let valueEstimate = TurboQuantStorageEstimate(
+        role: .value,
+        logicalValues: valueCode.logicalValueCount,
+        packedBytes: valueCode.storageByteCount,
+        bitsetBytes: 0,
+        scaleBytes: 0
+    )
+    return aggregateStorageEstimate(keyEstimate: keyEstimate, valueEstimate: valueEstimate)
+}
+
 private func aggregateStorageEstimate(
     keyEstimate: TurboQuantStorageEstimate,
     valueEstimate: TurboQuantStorageEstimate
@@ -1134,6 +2226,10 @@ private func evaluateAttentionCode(_ code: TurboQuantAttentionCode) {
         code.residualSigns,
         code.scales
     )
+}
+
+private func evaluatePolarWHTAttentionValueCode(_ code: TurboQuantPolarWHTAttentionValueCode) {
+    eval(code.packedIndices, code.norms)
 }
 
 private func milliseconds(_ seconds: Double?) -> Double? {
@@ -1172,13 +2268,28 @@ private func currentGitCommit() -> String? {
 }
 
 extension TurboQuantAttentionPath {
+    fileprivate var usesNativeCompressedAttention: Bool {
+        switch self {
+        case .nativeMLXCompressed, .affineK8V4Native, .affineK8VxNative,
+            .affineK8VxResidual:
+            return true
+        case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed,
+            .twoStageCompressed, .metalPolarWHTHybrid, .metalHybridK8PolarWHTValue,
+            .polarWHTReferenceHybrid, .affineInt4Native, .mlxPackedFallback, .baseline,
+            .unavailable:
+            return false
+        }
+    }
+
     fileprivate var usesCompressedMetal: Bool {
         switch self {
         case .nativeMLXCompressed:
             return false
-        case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed, .twoStageCompressed:
+        case .onlineFused, .tiledOnlineFused, .sparseValueTwoStageCompressed,
+            .twoStageCompressed, .metalPolarWHTHybrid, .metalHybridK8PolarWHTValue:
             return true
-        case .affineInt4Native, .affineK8V4Native, .mlxPackedFallback, .baseline, .unavailable:
+        case .affineInt4Native, .affineK8V4Native, .affineK8VxNative, .affineK8VxResidual,
+            .polarWHTReferenceHybrid, .mlxPackedFallback, .baseline, .unavailable:
             return false
         }
     }
