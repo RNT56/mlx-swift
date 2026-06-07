@@ -174,4 +174,34 @@ final class TurboQuantCodecDietTests: XCTestCase {
         XCTAssertGreaterThan(16.0 / threeBit.bpv, 4.0, "3-bit should reach paper-range compression")
         XCTAssertGreaterThan(threeBit.cos, 0.97, "3-bit quality should remain usable")
     }
+
+    /// Validates the INTEGRATED production codec format (.gaussianLloydMax): encode via the new
+    /// `turboQuantGaussianReferenceEncode` and decode via the standard `turboQuantReferenceDecode`
+    /// dispatch. Confirms round-trip correctness + that the real packed-storage path matches the
+    /// standalone quantizer quality, and that `storageByteCount` reflects the diet.
+    func testIntegratedGaussianCodecRoundTrip() throws {
+        let n = 4096
+        MLXRandom.seed(0xD1E7)
+        let arr = ((MLXRandom.normal([n]) * 1.0).asType(.float32))
+        let original = arr.asArray(Float.self)
+
+        print("\n=== N4 integrated codec (.gaussianLloydMax) round-trip ===")
+        for bits in [3, 4, 5] {
+            let code = try turboQuantGaussianReferenceEncode(arr, bits: bits, groupSize: 64)
+            XCTAssertEqual(code.format, .gaussianLloydMax)
+            let decoded = try turboQuantReferenceDecode(code).asArray(Float.self)  // standard dispatch
+            XCTAssertEqual(decoded.count, n)
+            let cos = cosine(original, decoded)
+            let bpv = Double(code.storageByteCount) * 8.0 / Double(n)
+            print(String(
+                format: "  %d-bit: %.3f bits/value (%.2fx vs fp16, incl. norms)  cosine %.6f", bits,
+                bpv, 16.0 / bpv, cos))
+            // Real packed path must match the standalone quantizer quality (within noise) and
+            // stay near the nominal payload bits (+ tiny per-group norm metadata).
+            XCTAssertGreaterThan(cos, bits == 3 ? 0.97 : (bits == 4 ? 0.99 : 0.998))
+            XCTAssertLessThan(bpv, Double(bits) + 1.0, "storage should be ~bits/value + small norm metadata")
+            XCTAssertGreaterThan(16.0 / bpv, 2.0, "integrated codec must beat fp16 by >2x")
+        }
+        print("  => integrated production codec format works end-to-end (encode + standard decode dispatch).")
+    }
 }

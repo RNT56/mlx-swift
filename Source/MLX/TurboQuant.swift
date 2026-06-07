@@ -238,6 +238,10 @@ public enum TurboQuantReferenceFormat: String, Codable, Sendable, Hashable, Case
     case magnitudeResidualSign
     case turboQuantProd
     case affineValue
+    /// N4 payload diet: per-group RMS norm + packed indices into a data-free Gaussian
+    /// Lloyd-Max codebook (the optimal scalar quantizer for the post-rotation Gaussian
+    /// distribution). Reaches the magnitude codec's quality at fewer payload bits/value.
+    case gaussianLloydMax
 }
 
 public enum TurboQuantKernelProfile: String, Codable, Sendable, CaseIterable {
@@ -1106,6 +1110,9 @@ public struct TurboQuantReferenceCode: Hashable, Codable, Sendable {
                 + residualSigns.count
                 + (baseScales.count + highScales.count + residualScales.count)
                 * MemoryLayout<Float>.stride
+        case .gaussianLloydMax:
+            // packed centroid indices + one norm per group (baseScales)
+            packedMagnitudes.count + baseScales.count * MemoryLayout<Float>.stride
         }
     }
 
@@ -7584,12 +7591,146 @@ private func encodeTurboQuantReference(
     )
 }
 
+// MARK: - N4 data-free Gaussian Lloyd-Max payload quantizer (reference codec)
+
+/// Optimal scalar-quantizer reproduction points for a unit Gaussian at 2^bits levels,
+/// computed by the Lloyd algorithm over the N(0,1) density on a fixed grid. Data-free
+/// (no input dependence) — it targets the post-rotation Gaussian distribution QJL produces.
+private func gaussianLloydMaxCentroids(bits: Int) -> [Float] {
+    let levels = Swift.max(2, 1 << Swift.max(1, bits))
+    let gridCount = 8192
+    var xs = [Double](repeating: 0, count: gridCount)
+    var w = [Double](repeating: 0, count: gridCount)
+    for i in 0 ..< gridCount {
+        let x = -6.0 + 12.0 * Double(i) / Double(gridCount - 1)
+        xs[i] = x
+        w[i] = exp(-0.5 * x * x)  // unnormalized Gaussian density
+    }
+    var c = (0 ..< levels).map { -3.0 + 6.0 * Double($0) / Double(levels - 1) }
+    for _ in 0 ..< 80 {
+        var sum = [Double](repeating: 0, count: levels)
+        var cnt = [Double](repeating: 0, count: levels)
+        for i in 0 ..< gridCount {
+            var best = 0
+            var bd = Double.infinity
+            for k in 0 ..< levels {
+                let d = abs(xs[i] - c[k])
+                if d < bd { bd = d; best = k }
+            }
+            sum[best] += xs[i] * w[i]
+            cnt[best] += w[i]
+        }
+        for k in 0 ..< levels where cnt[k] > 0 { c[k] = sum[k] / cnt[k] }
+    }
+    return c.map { Float($0) }
+}
+
+private func packGaussianIndex(_ value: Int, bits: Int, bit: Int, into buffer: inout [UInt8]) {
+    for b in 0 ..< bits where (value >> b) & 1 == 1 {
+        let pos = bit + b
+        buffer[pos >> 3] |= UInt8(1 << (pos & 7))
+    }
+}
+
+private func unpackGaussianIndex(bits: Int, bit: Int, from buffer: [UInt8]) -> Int {
+    var value = 0
+    for b in 0 ..< bits {
+        let pos = bit + b
+        if (buffer[pos >> 3] >> UInt8(pos & 7)) & 1 == 1 { value |= (1 << b) }
+    }
+    return value
+}
+
+/// Encode `array` with the data-free Gaussian Lloyd-Max payload quantizer (N4): a per-group
+/// RMS norm (stored in `baseScales`) + packed centroid indices (`packedMagnitudes`). Decode
+/// via the standard ``turboQuantReferenceDecode(_:)`` (it dispatches on the format).
+public func turboQuantGaussianReferenceEncode(
+    _ array: MLXArray,
+    bits: Int,
+    groupSize: Int = 64,
+    role: TurboQuantTensorRole = .vector,
+    preset: TurboQuantPreset = .turbo3_5,
+    seed: UInt64 = 0x9E37_79B9_7F4A_7C15
+) throws -> TurboQuantReferenceCode {
+    guard bits >= 1, bits <= 8 else {
+        throw TurboQuantError.invalidReferenceCode("gaussian quantizer bits must be 1...8")
+    }
+    guard groupSize > 0 else { throw TurboQuantError.invalidGroupSize(groupSize) }
+    let values = array.asArray(Float.self)
+    let n = values.count
+    let groupCount = (n + groupSize - 1) / groupSize
+    let centroids = gaussianLloydMaxCentroids(bits: bits)
+    let levels = centroids.count
+
+    var norms = [Float](repeating: 1, count: groupCount)
+    var packed = [UInt8](repeating: 0, count: (n * bits + 7) / 8)
+    for g in 0 ..< groupCount {
+        let start = g * groupSize
+        let end = Swift.min(start + groupSize, n)
+        var sumSq: Double = 0
+        for i in start ..< end { sumSq += Double(values[i]) * Double(values[i]) }
+        let rms = (sumSq / Double(Swift.max(1, end - start))).squareRoot()
+        let sigma = Float(rms > 0 ? rms : 1)
+        norms[g] = sigma
+        for i in start ..< end {
+            let xn = values[i] / sigma
+            var best = 0
+            var bd = Float.infinity
+            for k in 0 ..< levels {
+                let d = abs(xn - centroids[k])
+                if d < bd { bd = d; best = k }
+            }
+            packGaussianIndex(best, bits: bits, bit: i * bits, into: &packed)
+        }
+    }
+    return TurboQuantReferenceCode(
+        shape: array.shape, preset: preset, role: role, format: .gaussianLloydMax,
+        groupSize: groupSize, seed: seed, residualScale: 0,
+        baseMagnitudeBits: bits, highMagnitudeBits: bits, valueCount: n,
+        baseScales: norms, highScales: [], residualScales: [],
+        signs: Data(), highPrecisionMask: Data(), residualSigns: Data(),
+        packedMagnitudes: Data(packed))
+}
+
+private func decodeTurboQuantGaussianLloydMaxReference(
+    _ code: TurboQuantReferenceCode
+) throws -> [Float] {
+    guard code.groupSize > 0 else { throw TurboQuantError.invalidGroupSize(code.groupSize) }
+    guard code.shape.reduce(1, *) == code.valueCount else {
+        throw TurboQuantError.invalidReferenceCode(
+            "shape \(code.shape) does not match value count \(code.valueCount)")
+    }
+    let bits = code.baseMagnitudeBits
+    guard bits >= 1, bits <= 8 else {
+        throw TurboQuantError.invalidReferenceCode("gaussian quantizer bits must be 1...8")
+    }
+    let n = code.valueCount
+    let groupCount = (n + code.groupSize - 1) / code.groupSize
+    guard code.baseScales.count == groupCount else {
+        throw TurboQuantError.invalidReferenceCode("gaussian norm table count does not match groups")
+    }
+    let packed = [UInt8](code.packedMagnitudes)
+    guard packed.count >= (n * bits + 7) / 8 else {
+        throw TurboQuantError.invalidReferenceCode("gaussian packed index storage is truncated")
+    }
+    let centroids = gaussianLloydMaxCentroids(bits: bits)
+    var values = [Float](repeating: 0, count: n)
+    for i in 0 ..< n {
+        let idx = unpackGaussianIndex(bits: bits, bit: i * bits, from: packed)
+        let sigma = code.baseScales[i / code.groupSize]
+        values[i] = centroids[Swift.min(idx, centroids.count - 1)] * sigma
+    }
+    return values
+}
+
 private func decodeTurboQuantReference(_ code: TurboQuantReferenceCode) throws -> [Float] {
     switch code.format {
     case .affineValue:
         return try decodeTurboQuantAffineValueReference(code)
     case .turboQuantProd:
         return try decodeTurboQuantProductReference(code)
+    case .gaussianLloydMax:
+        return try decodeTurboQuantGaussianLloydMaxReference(code)
     case .magnitudeResidualSign:
         break
     }
