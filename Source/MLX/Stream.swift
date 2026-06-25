@@ -83,7 +83,12 @@ public final class Stream: @unchecked Sendable, Equatable {
 
     let ctx: mlx_stream
 
-    public static let gpu = Stream(mlx_default_gpu_stream_new())
+    public static let gpu: Stream = {
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+            SwiftPMMetallibResource.configureIfNeeded()
+        #endif
+        return Stream(mlx_default_gpu_stream_new())
+    }()
     public static let cpu = Stream(mlx_default_cpu_stream_new())
 
     @TaskLocal static var defaultStream: Stream?
@@ -112,12 +117,14 @@ public final class Stream: @unchecked Sendable, Equatable {
     public init() {
         let device = Device.defaultDevice()
         var ctx = mlx_stream_new()
+        configureSwiftPMMetallibIfNeeded(for: device)
         mlx_get_default_stream(&ctx, device.ctx)
         self.ctx = ctx
     }
 
     @available(*, deprecated, message: "use init(Device) -- index not supported")
     public init(index: Int32, _ device: Device) {
+        configureSwiftPMMetallibIfNeeded(for: device)
         self.ctx = evalLock.withLock {
             mlx_stream_new_device(device.ctx)
         }
@@ -127,6 +134,7 @@ public final class Stream: @unchecked Sendable, Equatable {
     ///
     /// See also ``withNewDefaultStream(device:_:)-5bwc3``
     public init(_ device: Device) {
+        configureSwiftPMMetallibIfNeeded(for: device)
         self.ctx = evalLock.withLock {
             mlx_stream_new_device(device.ctx)
         }
@@ -156,6 +164,14 @@ public final class Stream: @unchecked Sendable, Equatable {
     public static func == (lhs: Stream, rhs: Stream) -> Bool {
         mlx_stream_equal(lhs.ctx, rhs.ctx)
     }
+}
+
+private func configureSwiftPMMetallibIfNeeded(for device: Device) {
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        if device.deviceType == .gpu {
+            SwiftPMMetallibResource.configureIfNeeded()
+        }
+    #endif
 }
 
 extension Stream: CustomStringConvertible {

@@ -286,9 +286,6 @@ let cmlx = Target.target(
         "mlx/mlx/distributed/nccl/nccl.cpp",
         "mlx/mlx/distributed/nccl/nccl_stub",
         "mlx/mlx/distributed/jaccl/jaccl.cpp",
-        "mlx/mlx/distributed/jaccl/mesh.cpp",
-        "mlx/mlx/distributed/jaccl/ring.cpp",
-        "mlx/mlx/distributed/jaccl/utils.cpp",
     ],
     cSettings: [
         .headerSearchPath("mlx"),
