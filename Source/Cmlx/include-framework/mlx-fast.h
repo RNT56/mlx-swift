@@ -1,3 +1,4 @@
+#ifdef __cplusplus
 // Copyright © 2023-2024 Apple Inc.
 
 #pragma once
@@ -9,8 +10,8 @@
 #include <variant>
 #include <vector>
 
-#include "mlx/api.h"
-#include "mlx/utils.h"
+#include <Cmlx/mlx-api.h>
+#include <Cmlx/mlx-utils.h>
 
 namespace mlx::core::fast {
 
@@ -94,6 +95,31 @@ MLX_API array mixed_quantized_scaled_dot_product_attention(
     int value_group_size = 32,
     int value_bits = 4,
     bool causal = false,
+    StreamOrDevice s = {});
+
+/** Returns `[output, diagnostics]` for mixed affine K8/Vx attention.
+ *
+ * `sparse_v_threshold > 0` enables decode-only Sparse-V skipping and reports
+ * diagnostics as uint32 `[rows, 2]` with `[skipped, considered]` counts.
+ **/
+MLX_API std::vector<array>
+mixed_quantized_scaled_dot_product_attention_with_diagnostics(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const std::optional<array>& key_biases,
+    const array& values,
+    const array& value_scales,
+    const std::optional<array>& value_biases,
+    const float scale,
+    const std::optional<array>& mask = std::nullopt,
+    const std::optional<array>& sinks = std::nullopt,
+    int key_group_size = 64,
+    int key_bits = 8,
+    int value_group_size = 32,
+    int value_bits = 4,
+    bool causal = false,
+    float sparse_v_threshold = 0.0f,
     StreamOrDevice s = {});
 
 struct TurboQuantAttentionLayoutDescriptor {
@@ -379,3 +405,4 @@ MLX_API std::vector<array> precompiled_cuda_kernel(
     StreamOrDevice s = {});
 
 } // namespace mlx::core::fast
+#endif

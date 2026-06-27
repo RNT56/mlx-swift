@@ -10,16 +10,16 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "mlx/c/array.h"
-#include "mlx/c/closure.h"
-#include "mlx/c/distributed_group.h"
-#include "mlx/c/error.h"
-#include "mlx/c/io_types.h"
-#include "mlx/c/map.h"
-#include "mlx/c/optional.h"
-#include "mlx/c/stream.h"
-#include "mlx/c/string.h"
-#include "mlx/c/vector.h"
+#include <Cmlx/mlx-c-array.h>
+#include <Cmlx/mlx-c-closure.h>
+#include <Cmlx/mlx-c-distributed_group.h>
+#include <Cmlx/mlx-c-error.h>
+#include <Cmlx/mlx-c-io_types.h>
+#include <Cmlx/mlx-c-map.h>
+#include <Cmlx/mlx-c-optional.h>
+#include <Cmlx/mlx-c-stream.h>
+#include <Cmlx/mlx-c-string.h>
+#include <Cmlx/mlx-c-vector.h>
 
 #ifdef __cplusplus
 extern "C" {

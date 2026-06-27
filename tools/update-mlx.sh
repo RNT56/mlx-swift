@@ -37,6 +37,7 @@ make \
     gather_front \
     gemm \
     gemm_nax \
+    gemv \
     gemv_masked \
     hadamard \
     logsumexp \
