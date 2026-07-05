@@ -2313,9 +2313,102 @@ extension TurboQuantAttentionPath {
     }
 }
 
-private let options = try BenchmarkOptions.parse()
-if options.emitCoreJSON {
-    try runCoreBenchmarkJSON(options: options)
+// T2.2 gate 3 support: dump raw attention output floats for a fixed, deterministic
+// GQA decode configuration so an external process (TurboQuantH16ParityTests) can
+// diff the fp32-staged and H16-diet kernel outputs across two subprocess
+// invocations that each set `TQ_H16` BEFORE process start (the diet switch is a
+// global `let`, read once and cached -- flipping it mid-process is unreliable, so
+// the only correct comparison spawns two processes). Reads `--h16-parity-preset`,
+// `--h16-parity-head-dim`, defaults to turbo4v2 / 128. Output: one JSON array of
+// floats per line to stdout, nothing else on stdout.
+if CommandLine.arguments.contains("--h16-parity-dump") {
+    try runH16ParityDump(arguments: CommandLine.arguments)
 } else {
-    try runLegacyBenchmark(options: options)
+    let options = try BenchmarkOptions.parse()
+    if options.emitCoreJSON {
+        try runCoreBenchmarkJSON(options: options)
+    } else {
+        try runLegacyBenchmark(options: options)
+    }
+}
+
+private func runH16ParityDump(arguments: [String]) throws {
+    func stringValue(_ name: String) -> String? {
+        guard let index = arguments.firstIndex(of: name), arguments.indices.contains(index + 1)
+        else { return nil }
+        return arguments[index + 1]
+    }
+    let presetName = stringValue("--h16-parity-preset") ?? TurboQuantPreset.turbo4v2.rawValue
+    guard let preset = TurboQuantPreset(rawValue: presetName) else {
+        throw BenchmarkCLIError.invalidPreset(presetName)
+    }
+    let headDim = Int(stringValue("--h16-parity-head-dim") ?? "128") ?? 128
+    let useCoop = arguments.contains("--h16-parity-coop")
+
+    let batchSize = 1
+    let kvHeads = 4
+    // COOPW (T2.4 stage-2): default queryHeads stays 16 (repeats 4, the original H16
+    // gate-3 config); `--h16-parity-repeats` lets the coopw parity suite dial repeats
+    // down to 2 or 3 to exercise the widened coop guard / _coopw kernel.
+    let repeats = Int(stringValue("--h16-parity-repeats") ?? "4") ?? 4
+    let queryHeads = kvHeads * repeats
+    let groupSize = 64
+    let defaultLength = useCoop ? 40_000 : 1056  // coop needs >= turboQuantCooperativeDecodeMinContext (32768)
+    let length = Int(stringValue("--h16-parity-context") ?? "") ?? defaultLength
+    // turboQuantShouldUseBlockParallelFusedAttention requires activeBlockCount <=
+    // blockWidth; at large contexts the default 256-token block width no longer
+    // satisfies that (e.g. 131072/256 = 512 > 256), so scale the block width with
+    // context when the caller does not request one explicitly.
+    let defaultBlockTokens = length > 65536 ? 512 : 256
+    let blockTokens = Int(stringValue("--h16-parity-block-tokens") ?? "") ?? defaultBlockTokens
+
+    func randomArray(shape: [Int], scale: Float, phase: Float) -> MLXArray {
+        let count = shape.reduce(1, *)
+        var values = [Float](repeating: 0, count: count)
+        for i in 0 ..< count {
+            values[i] = sin(Float(i) * 0.017 + phase) * scale
+        }
+        return MLXArray(values, shape).asType(.float16)
+    }
+
+    let keys = randomArray(
+        shape: [batchSize, kvHeads, length, headDim], scale: 1.0, phase: 0.11)
+    let values = randomArray(
+        shape: [batchSize, kvHeads, length, headDim], scale: 1.0, phase: 0.37)
+    let queries = randomArray(
+        shape: [batchSize, queryHeads, 1, headDim], scale: 1.0, phase: 0.71)
+    let scale = Float(1.0 / Double(headDim).squareRoot())
+
+    let key = try turboQuantMetalEncodeAttention(
+        keys,
+        configuration: TurboQuantConfiguration(
+            preset: preset, role: .key, groupSize: groupSize, backend: .metalPolarQJL,
+            seed: 0x7200_0000_0000_0001,
+            attentionLayoutVersion: TurboQuantAttentionLayout.splitMagnitudeVersion
+        )
+    )
+    let value = try turboQuantMetalEncodeAttention(
+        values,
+        configuration: TurboQuantConfiguration(
+            preset: preset, role: .value, groupSize: groupSize, backend: .metalPolarQJL,
+            seed: 0x7200_0000_0000_0002,
+            attentionLayoutVersion: TurboQuantAttentionLayout.splitMagnitudeVersion
+        )
+    )
+    eval(key.packedMagnitudes, key.signs, key.scales, value.packedMagnitudes, value.scales)
+
+    let out = try turboQuantMetalScaledDotProductAttention(
+        queries: queries,
+        keyCode: key,
+        valueCode: value,
+        scale: scale,
+        mask: .none,
+        preferOnlineFused: true,
+        blockParallelTokenBlockSize: blockTokens
+    )
+    eval(out)
+    let flat = out.asType(.float32).asArray(Float.self)
+    let data = try JSONEncoder().encode(flat)
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write("\n".data(using: .utf8)!)
 }

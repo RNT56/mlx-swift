@@ -125,6 +125,20 @@ let turboQuantCooperativeDecodeMinContext = 32_768
 let turboQuantCooperativeDecodeEnabled: Bool =
     ProcessInfo.processInfo.environment["TQ_COOP"] == "1"
 
+/// T2.2 H16 tgmem-diet master switch. **Default OFF (opt-in)**; set `TQ_H16=1` to select
+/// the half-staged (partial/tile_scores in `half`, tile_has_weight as a bitset) GQA
+/// block-partials kernel variant instead of the fp32-staged default. Composes with
+/// `TQ_COOP`: kernel SELECTION (strided-H16 vs coop-H16) uses `coopActive && repeats==4`,
+/// but the LANES_PER_TOKEN template value fed to the selected kernel is NOT simply
+/// `coopActive` — the strided-H16 kernel's coop branch (`lanes_per_token == 4u`) still
+/// hardcodes `r<4u` loops over `query_cache` rows that are only initialized up to
+/// `repeat_count`, so LANES_PER_TOKEN must fall back to 1 whenever `useH16 && repeats<4`
+/// even though `coopActive` (the widened repeats 2-4 guard) is true. See the dispatch-site
+/// comments near the two `("LANES_PER_TOKEN", ...)` template entries. Cosine-gated, not
+/// byte-identical to the fp32 kernel; read once.
+let turboQuantH16DietEnabled: Bool =
+    ProcessInfo.processInfo.environment["TQ_H16"] == "1"
+
 public let turboQuantKeyPageSummaryPageSize = 512
 
 /// Gate for the cooperative quad-per-key coalesced QK decode (TQCOOP). Active only when
@@ -142,9 +156,8 @@ func turboQuantCooperativeQuadDecodeActive(
     groupSize: Int,
     logicalLength: Int
 ) -> Bool {
-    guard turboQuantCooperativeDecodeEnabled, enabled, queryHeadRepeats == 4 else {
-        return false
-    }
+    guard turboQuantCooperativeDecodeEnabled, enabled,
+          queryHeadRepeats >= 2 && queryHeadRepeats <= 4 else { return false }
     // Coop is excluded from layout v7: its offsets are hardcoded to the v6 token-major
     // packed/bitset/scale layout and would silently misread v7's tile-swizzled K planes.
     // Gated to exactly v6 (not v7, and no floor for legacy v4/v5 either -- see below).
@@ -160,7 +173,7 @@ func turboQuantCooperativeQuadDecodeActive(
     let uniform = base == high
     let split = high == base + 1 && layoutVersion == TurboQuantAttentionLayout.splitMagnitudeVersion
     guard uniform || split else { return false }
-    guard headDim % 4 == 0 else { return false }
+    guard headDim == 128 || headDim == 256 else { return false }
     let chunk = headDim / 4
     return chunk >= 1 && chunk <= groupSize && groupSize % chunk == 0
 }
@@ -6930,18 +6943,36 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
             useGroupedQueryKernel
             ? queries.dim(0) * keyCode.layout.kvHeadCount * queries.dim(2)
             : rowCount
+        let useH16 = turboQuantH16DietEnabled && useGroupedQueryKernel
+        // COOPW is not ported to the H16 diet kernel (out of scope for T2.4 stage-2); the
+        // H16-diet coop branch still hardcodes r<4u, so H16-coop dispatch stays gated to
+        // exactly repeats==4 regardless of the widened turboQuantCooperativeQuadDecodeActive
+        // guard above.
+        let coopWActive = coopActive && queryHeadRepeats < 4 && !useH16
         let partialKernel =
-            coopActive
-            ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoop
-            : (useGroupedQueryKernel
-                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
-                : TurboQuantMetalKernels.fusedAttentionBlockPartials)
+            useH16
+            ? ((coopActive && queryHeadRepeats == 4)
+                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoopH16_rf1
+                : TurboQuantMetalKernels.fusedAttentionGQABlockPartialsH16_rf1)
+            : (coopWActive
+                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoopW_rf1
+                : (coopActive
+                    ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoop_rf1
+                    : (useGroupedQueryKernel
+                        ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials_rf1
+                        : TurboQuantMetalKernels.fusedAttentionBlockPartials)))
         TurboQuantKernelDispatchTrace.shared.record(
-            "segmented:" + (coopActive
-                ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2"
-                : (useGroupedQueryKernel
-                    ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2"
-                    : "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2")))
+            "segmented:" + (useH16
+                ? ((coopActive && queryHeadRepeats == 4)
+                    ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2_h16_rf1"
+                    : "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_h16_rf1")
+                : (coopWActive
+                    ? "turboquant_attention_fused_gqa_block_partials_coopw_runtime_layout_rtu1_s2_rf1"
+                    : (coopActive
+                        ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2_rf1"
+                        : (useGroupedQueryKernel
+                            ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_rf1"
+                            : "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2")))))
         let template =
             runtimeLayoutAttentionTemplate(
                 configuration: TurboQuantConfiguration(
@@ -6968,7 +6999,16 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
                 ("THREADS_PER_BLOCK", blockWidth),
                 ("BLOCK_TOKENS", blockWidth),
                 ("GQA_REPEATS", useGroupedQueryKernel ? queryHeadRepeats : 1),
-                ("LANES_PER_TOKEN", coopActive ? 4 : 1),
+                // H16-BUG-FIX: when useH16 is true and repeats < 4, the selected kernel is
+                // the strided fusedAttentionGQABlockPartialsH16 (see partialKernel below),
+                // whose coop branch (lanes_per_token == 4u) hardcodes r<4u loops over
+                // query_cache rows that the shared prologue only initializes up to
+                // repeat_count. Feeding LANES_PER_TOKEN=4 into that strided-H16 kernel at
+                // repeats<4 would read uninitialized threadgroup memory (UB / shader-
+                // validation trap). LANES_PER_TOKEN must therefore track whether the coop
+                // branch is actually safe for the kernel that will be dispatched, not just
+                // whether coop is "active" in the abstract.
+                ("LANES_PER_TOKEN", (coopActive && !(useH16 && queryHeadRepeats < 4)) ? 4 : 1),
             ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
 
         let compressedPartials = partialKernel(
@@ -7386,6 +7426,8 @@ private func turboQuantMetalBlockParallelFusedAttention(
         }
     }
 
+    let useH16 = turboQuantH16DietEnabled && useGroupedQueryKernel && !isTileTransposedV7
+
     let template =
         runtimeLayoutAttentionTemplate(
             configuration: TurboQuantConfiguration(
@@ -7413,29 +7455,52 @@ private func turboQuantMetalBlockParallelFusedAttention(
             ("BLOCK_TOKENS", blockWidth),
             ("GQA_REPEATS", useGroupedQueryKernel ? queryHeadRepeats : 1),
         ]
-        + (isTileTransposedV7 ? [] : [("LANES_PER_TOKEN", coopActive ? 4 : 1)])
+        // H16-BUG-FIX: see the segmented-site comment above the analogous LANES_PER_TOKEN
+        // line. When useH16 is true and repeats < 4, the selected kernel is the strided
+        // fusedAttentionGQABlockPartialsH16, whose coop branch (lanes_per_token == 4u)
+        // hardcodes r<4u loops over query_cache rows only initialized up to repeat_count.
+        // LANES_PER_TOKEN must not be 4 for that combination.
+        + (isTileTransposedV7
+            ? []
+            : [("LANES_PER_TOKEN", (coopActive && !(useH16 && queryHeadRepeats < 4)) ? 4 : 1)])
         + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
 
     let partialRows =
         useGroupedQueryKernel
         ? queries.dim(0) * kvHeadCount * queries.dim(2)
         : rowCount
+    // COOPW is not ported to the H16 diet kernel (out of scope for T2.4 stage-2); H16-coop
+    // dispatch stays gated to exactly repeats==4 regardless of the widened
+    // turboQuantCooperativeQuadDecodeActive guard above.
+    let coopWActive = coopActive && queryHeadRepeats < 4 && !useH16 && !isTileTransposedV7
     let partialKernel =
         isTileTransposedV7
         ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsV7
-        : (coopActive
-            ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoop
-            : (useGroupedQueryKernel
-                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
-                : TurboQuantMetalKernels.fusedAttentionBlockPartials))
+        : (useH16
+            ? ((coopActive && queryHeadRepeats == 4)
+                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoopH16_rf1
+                : TurboQuantMetalKernels.fusedAttentionGQABlockPartialsH16_rf1)
+            : (coopWActive
+                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoopW_rf1
+                : (coopActive
+                    ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoop_rf1
+                    : (useGroupedQueryKernel
+                        ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials_rf1
+                        : TurboQuantMetalKernels.fusedAttentionBlockPartials))))
     TurboQuantKernelDispatchTrace.shared.record(
         "blockParallel:" + (isTileTransposedV7
             ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_v7"
-            : (coopActive
-                ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2"
-                : (useGroupedQueryKernel
-                    ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2"
-                    : "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2"))))
+            : (useH16
+                ? ((coopActive && queryHeadRepeats == 4)
+                    ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2_h16_rf1"
+                    : "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_h16_rf1")
+                : (coopWActive
+                    ? "turboquant_attention_fused_gqa_block_partials_coopw_runtime_layout_rtu1_s2_rf1"
+                    : (coopActive
+                        ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2_rf1"
+                        : (useGroupedQueryKernel
+                            ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_rf1"
+                            : "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2"))))))
     let partialOutputDType = outputDType == .float32 ? DType.float32 : outputDType
     let partials = partialKernel(
         [
@@ -10948,8 +11013,8 @@ private enum TurboQuantMetalKernels {
         ensureRowContiguous: false
     )
 
-    static let fusedAttentionGQABlockPartials = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2",
+    static let fusedAttentionGQABlockPartials_rf1 = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_rf1",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10961,7 +11026,7 @@ private enum TurboQuantMetalKernels {
             "runtime_block_count",
         ],
         outputNames: ["partial_stats", "partial_out"],
-        source: fusedAttentionGQABlockPartialsSource,
+        source: fusedAttentionGQABlockPartialsSource_rf1,
         header: attentionHeader,
         ensureRowContiguous: false
     )
@@ -10991,8 +11056,8 @@ private enum TurboQuantMetalKernels {
     // name so its compiled MLX variant (LANES_PER_TOKEN=4, cooperative coalesced decode)
     // never shares a compiled-variant cache slot with the strided LANES_PER_TOKEN=1
     // kernel. Selected only when turboQuantCooperativeQuadDecodeActive() is true.
-    static let fusedAttentionGQABlockPartialsCoop = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2",
+    static let fusedAttentionGQABlockPartialsCoop_rf1 = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2_rf1",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -11004,7 +11069,82 @@ private enum TurboQuantMetalKernels {
             "runtime_block_count",
         ],
         outputNames: ["partial_stats", "partial_out"],
-        source: fusedAttentionGQABlockPartialsSource,
+        source: fusedAttentionGQABlockPartialsSource_rf1,
+        header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
+    // COOPW (T2.4 stage-2): repeats-2/3 coop. The clamp in fusedAttentionGQABlockPartialsSource_rf1
+    // (r < repeat_count instead of the hardcoded r < 4u) makes that ONE source constant
+    // correct for repeats 2, 3, and 4 -- so this registration reuses it unchanged. It still
+    // needs a DISTINCT kernel name (same compiled-variant-cache reasoning as
+    // fusedAttentionGQABlockPartialsCoop above) so repeats<4 dispatch never aliases with the
+    // repeats==4 coop kernel's compiled variant. Selected only when
+    // turboQuantCooperativeQuadDecodeActive() is true AND queryHeadRepeats < 4 (repeats==4
+    // keeps using fusedAttentionGQABlockPartialsCoop above, byte-frozen).
+    static let fusedAttentionGQABlockPartialsCoopW_rf1 = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_gqa_block_partials_coopw_runtime_layout_rtu1_s2_rf1",
+        inputNames: [
+            "q",
+            "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
+            "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
+            "runtime_block_count",
+        ],
+        outputNames: ["partial_stats", "partial_out"],
+        source: fusedAttentionGQABlockPartialsSource_rf1,
+        header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
+    // T2.2 H16 tgmem diet: same back-half algorithm as fusedAttentionGQABlockPartials /
+    // fusedAttentionGQABlockPartialsCoop, but partial/tile_scores are staged as half and
+    // tile_has_weight is a 32-lane bitset, halving static threadgroup memory so 2
+    // threadgroups can be resident per core instead of 1 (see G5 probe / roadmap T2.2).
+    // Default-off (TQ_H16 env gate); cosine-gated, not byte-identical to the fp32 kernel.
+    // Shares LANES_PER_TOKEN with the strided/coop split (this constant is dispatched at
+    // LANES_PER_TOKEN=1; the coop variant below reuses the identical source at LANES=4),
+    // so it needs its own DISTINCT kernel name for the same compiled-variant-cache reason
+    // as TQCOOP above.
+    static let fusedAttentionGQABlockPartialsH16_rf1 = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_h16_rf1",
+        inputNames: [
+            "q",
+            "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
+            "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
+            "runtime_block_count",
+        ],
+        outputNames: ["partial_stats", "partial_out"],
+        source: fusedAttentionGQABlockPartialsH16Source_rf1,
+        header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
+    // T2.2 H16 diet + TQCOOP: identical source to fusedAttentionGQABlockPartialsH16
+    // (LANES_PER_TOKEN=4 selects the cooperative quad-per-key branch at the template
+    // level), but a DISTINCT kernel name so its compiled MLX variant never shares a
+    // compiled-variant cache slot with the strided LANES_PER_TOKEN=1 H16 kernel above.
+    static let fusedAttentionGQABlockPartialsCoopH16_rf1 = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2_h16_rf1",
+        inputNames: [
+            "q",
+            "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
+            "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
+            "runtime_block_count",
+        ],
+        outputNames: ["partial_stats", "partial_out"],
+        source: fusedAttentionGQABlockPartialsH16Source_rf1,
         header: attentionHeader,
         ensureRowContiguous: false
     )
@@ -16127,7 +16267,7 @@ private enum TurboQuantMetalKernels {
         }
         """
 
-    private static let fusedAttentionGQABlockPartialsSource = """
+    private static let fusedAttentionGQABlockPartialsSource_rf1 = """
         constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
         uint block_count = uint(runtime_block_count);
         constexpr uint gqa_repeats = uint(GQA_REPEATS);
@@ -16146,6 +16286,449 @@ private enum TurboQuantMetalKernels {
         threadgroup float partial[4 * THREADS_PER_BLOCK];
         threadgroup float tile_scores[4 * THREADS_PER_BLOCK];
         threadgroup uint tile_has_weight[THREADS_PER_BLOCK];
+        threadgroup uint tile_physical_tokens[THREADS_PER_BLOCK];
+        threadgroup float query_cache[4 * HEAD_DIM];
+
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        float attention_scale = float(runtime_attention_scale);
+        uint q_token = gqa_row % uint(QUERY_LENGTH);
+        uint kv_head = (gqa_row / uint(QUERY_LENGTH)) % uint(KV_HEADS);
+        uint batch = gqa_row / (uint(QUERY_LENGTH) * uint(KV_HEADS));
+        uint causal_limit = logical_length - uint(QUERY_LENGTH) + q_token;
+        uint block_start = block_index * uint(BLOCK_TOKENS);
+        constexpr uint repeat_count = uint(GQA_REPEATS) < 4u ? uint(GQA_REPEATS) : 4u;
+        if (DO_CAUSAL && block_start > causal_limit) {
+            if (lane == 0u) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint stat_index = ((row * block_count + block_index) * 2u);
+                    partial_stats[stat_index] = -INFINITY;
+                    partial_stats[stat_index + 1u] = 0.0f;
+                }
+            }
+            if (lane < uint(HEAD_DIM)) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                    partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
+                }
+            }
+            return;
+        }
+        ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
+        ulong value_seed = tq_make_seed(
+            uint(VALUE_SEED_3), uint(VALUE_SEED_2),
+            uint(VALUE_SEED_1), uint(VALUE_SEED_0));
+
+        if (lane < uint(HEAD_DIM)) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                long q_index =
+                    long(batch) * q_strides[0]
+                    + long(q_head) * q_strides[1]
+                    + long(q_token) * q_strides[2]
+                    + long(lane) * q_strides[3];
+                query_cache[repeat * uint(HEAD_DIM) + lane] = float(q[q_index]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Part B: rotate the query ONCE per (repeat, group) and reuse it across every key
+        // token. Because the rotation seed is token-independent (see tq_storage_group_index),
+        // the rotation is identical for all keys, so hoisting it here turns the prior O(N)
+        // per-key query rotations into O(repeat_count * groups_per_vector) per attention step.
+        {
+            uint rg_total = repeat_count * uint(GROUPS_PER_VECTOR);
+            if (lane < rg_total) {
+                uint r = lane / uint(GROUPS_PER_VECTOR);
+                uint g = lane % uint(GROUPS_PER_VECTOR);
+                uint gs = g * uint(GROUP_SIZE);
+                uint cnt = min(uint(GROUP_SIZE), uint(HEAD_DIM) - gs);
+                uint rot_seed_index = tq_storage_group_index(
+                    batch, kv_head, 0u, g, uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR));
+                thread float tmp[GROUP_SIZE];
+                for (uint i = 0u; i < cnt; i++) {
+                    tmp[i] = query_cache[r * uint(HEAD_DIM) + gs + i];
+                }
+                tq_apply_product_rotation(tmp, cnt, key_seed, rot_seed_index, false);
+                for (uint i = 0u; i < cnt; i++) {
+                    query_cache[r * uint(HEAD_DIM) + gs + i] = tmp[i];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        constexpr uint lanes_per_token = uint(LANES_PER_TOKEN);
+        uint physical_token = 0u;
+        bool active = false;
+        thread float scaled_scores[4];
+        scaled_scores[0] = -INFINITY;
+        scaled_scores[1] = -INFINITY;
+        scaled_scores[2] = -INFINITY;
+        scaled_scores[3] = -INFINITY;
+
+        if (lanes_per_token == 4u) {
+            // TQCOOP cooperative quad-per-key coalesced decode (turbo8 uniform path).
+            // 4 lanes cooperate on one key, each decoding a contiguous HEAD_DIM/4 chunk
+            // (so the quad's 4 chunks tile one cache line -> coalesced, ~4x less L1
+            // pressure than the strided 1-thread-per-token mapping). Each quad walks 4
+            // tokens in 4 passes; lane j keeps the score of pass j so the existing
+            // per-lane back-half (tile_scores[lane], reductions, AV) is unchanged.
+            uint lane_in_quad = lane & 3u;
+            uint quad_id = lane >> 2u;
+            uint num_quads = uint(THREADS_PER_BLOCK) >> 2u;
+            uint dims_per_lane = uint(HEAD_DIM) / 4u;
+            uint dim_start = lane_in_quad * dims_per_lane;
+            uint g = dim_start / uint(GROUP_SIZE);
+            uint local_start = dim_start - g * uint(GROUP_SIZE);
+            uint count_g = min(uint(GROUP_SIZE), uint(HEAD_DIM) - g * uint(GROUP_SIZE));
+            float inv_sqrt_count = rsqrt(float(max(count_g, 1u)));
+            float residual_scale_factor =
+                sqrt(3.14159265358979323846f / (2.0f * float(count_g)));
+            constexpr uint coop_base_bits = uint(KEY_BASE_BITS);
+            constexpr uint coop_high_bits = uint(KEY_HIGH_BITS);
+            // Coop handles uniform (turbo8/turbo4v2: base==high) AND split-magnitude
+            // (turbo3_5: high==base+1 at layout v6 — a base-bits stream + a 1-bit high stream,
+            // both per-group contiguous, so each lane's chunk still coalesces). Branch-2
+            // variable-bit is dead at v6 and gated out, so these two cases are exhaustive.
+            constexpr bool coop_split =
+                uint(LAYOUT_VERSION) >= 6u && coop_high_bits == coop_base_bits + 1u;
+            uint coop_high_count = coop_split
+                ? tq_high_precision_count(
+                    count_g, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR))
+                : 0u;
+            uint my_token = 0u;
+            for (uint j = 0u; j < 4u; j++) {
+                uint logical_token = block_start + quad_id + j * num_quads;
+                bool tok_active = logical_token < logical_length
+                    && (!DO_CAUSAL || logical_token <= causal_limit);
+                thread float ts[4];
+                ts[0] = 0.0f; ts[1] = 0.0f; ts[2] = 0.0f; ts[3] = 0.0f;
+                uint phys = 0u;
+                if (tok_active) {
+                    phys = tq_physical_token(
+                        logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+                    uint base = tq_packed_offset(
+                        batch, kv_head, phys, g, 0u,
+                        uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP));
+                    uint cached_idx = 0xffffffffu;
+                    uint cached_val = 0u;
+                    uint extra_idx = 0xffffffffu;
+                    uint extra_val = 0u;
+                    uint cached_bw = 0xffffffffu;
+                    uint cached_sign = 0u;
+                    thread float qd[4];
+                    thread float sd[4];
+                    qd[0] = 0.0f; qd[1] = 0.0f; qd[2] = 0.0f; qd[3] = 0.0f;
+                    sd[0] = 0.0f; sd[1] = 0.0f; sd[2] = 0.0f; sd[3] = 0.0f;
+                    for (uint i = 0u; i < dims_per_lane; i++) {
+                        uint local = local_start + i;
+                        uint dim = dim_start + i;
+                        uint bits;
+                        uint code;
+                        if (coop_split) {
+                            bool hp = local < coop_high_count;
+                            bits = hp ? coop_high_bits : coop_base_bits;
+                            uint base_bo = local * coop_base_bits;
+                            uint base_pw = base_bo >> 5;
+                            uint base_pb = base_bo & 31u;
+                            if (base_pw != cached_idx) {
+                                cached_idx = base_pw;
+                                cached_val = k_packed[base + base_pw];
+                            }
+                            uint base_asm = cached_val >> base_pb;
+                            if (base_pb + coop_base_bits > 32u) {
+                                base_asm |= k_packed[base + base_pw + 1u] << (32u - base_pb);
+                            }
+                            code = base_asm & ((1u << coop_base_bits) - 1u);
+                            if (hp) {
+                                uint extra_bits = coop_high_bits - coop_base_bits;
+                                uint extra_bo = uint(GROUP_SIZE) * coop_base_bits + local;
+                                uint extra_pw = extra_bo >> 5;
+                                uint extra_pb = extra_bo & 31u;
+                                if (extra_pw != extra_idx) {
+                                    extra_idx = extra_pw;
+                                    extra_val = k_packed[base + extra_pw];
+                                }
+                                uint extra_asm = extra_val >> extra_pb;
+                                if (extra_pb + extra_bits > 32u) {
+                                    extra_asm |=
+                                        k_packed[base + extra_pw + 1u] << (32u - extra_pb);
+                                }
+                                code |= (extra_asm & ((1u << extra_bits) - 1u)) << coop_base_bits;
+                            }
+                        } else {
+                            bits = coop_base_bits;
+                            uint bo = local * coop_base_bits;
+                            uint pw = bo >> 5;
+                            uint pb = bo & 31u;
+                            if (pw != cached_idx) {
+                                cached_idx = pw;
+                                cached_val = k_packed[base + pw];
+                            }
+                            uint aw = cached_val >> pb;
+                            if (pb + coop_base_bits > 32u) {
+                                aw |= k_packed[base + pw + 1u] << (32u - pb);
+                            }
+                            code = aw & ((1u << coop_base_bits) - 1u);
+                        }
+                        uint bw = local >> 5;
+                        if (bw != cached_bw) {
+                            cached_bw = bw;
+                            cached_sign = k_signs[tq_bitset_offset(
+                                batch, kv_head, phys, g, bw,
+                                uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                                uint(BITSET_WORDS_PER_GROUP))];
+                        }
+                        float level = tq_codebook_unit(bits, code) * inv_sqrt_count;
+                        float sgn = (cached_sign & (1u << (local & 31u))) != 0u ? -1.0f : 1.0f;
+                        // COOPW invariant: rows [repeat_count, 4) of query_cache are
+                        // NEVER initialized by the shared prologue (init loop and rotation
+                        // are both bounded by repeat_count). Clamping every coop r-loop to
+                        // repeat_count is load-bearing: the hardcoded r<4u form read those
+                        // uninitialized threadgroup rows (UB, shader-validation trap risk).
+                        // At repeat_count==4 the bound is unchanged -> byte-identical.
+                        for (uint r = 0u; r < repeat_count; r++) {
+                            float qv = query_cache[r * uint(HEAD_DIM) + dim];
+                            qd[r] += qv * level;
+                            sd[r] += sgn * qv;
+                        }
+                    }
+                    float norm = k_scales[tq_scale_offset(
+                        batch, kv_head, phys, g, 0u,
+                        uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR))];
+                    float residual_norm = k_scales[tq_scale_offset(
+                        batch, kv_head, phys, g, 1u,
+                        uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR))];
+                    float residual_scale = residual_norm * residual_scale_factor;
+                    for (uint r = 0u; r < repeat_count; r++) {
+                        ts[r] = norm * qd[r] + residual_scale * sd[r];
+                    }
+                }
+                for (uint r = 0u; r < repeat_count; r++) {
+                    ts[r] += simd_shuffle_xor(ts[r], 1u);
+                    ts[r] += simd_shuffle_xor(ts[r], 2u);
+                }
+                if (lane_in_quad == j) {
+                    active = tok_active;
+                    my_token = tok_active ? phys : 0u;
+                    for (uint r = 0u; r < repeat_count; r++) {
+                        scaled_scores[r] = tok_active ? ts[r] * attention_scale : -INFINITY;
+                    }
+                }
+            }
+            physical_token = my_token;
+        } else {
+        uint logical_token = block_start + lane;
+        active = lane < uint(BLOCK_TOKENS)
+            && logical_token < logical_length
+            && (!DO_CAUSAL || logical_token <= causal_limit);
+
+        if (active) {
+            physical_token = tq_physical_token(
+                logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] = 0.0f;
+            }
+            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
+                uint group_start = group * uint(GROUP_SIZE);
+                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
+                if (repeat_count == 4u) {
+                    thread float query_values[4 * GROUP_SIZE];
+                    thread float quad_scores[4];
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        quad_scores[repeat] = 0.0f;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[repeat * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_quad(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        quad_scores,
+                        batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        scaled_scores[repeat] += quad_scores[repeat];
+                    }
+                    continue;
+                }
+                for (uint pair_start = 0u; pair_start < repeat_count; pair_start += 2u) {
+                    uint pair_repeats = min(2u, repeat_count - pair_start);
+                    thread float query_values[2 * GROUP_SIZE];
+                    thread float pair_scores[2];
+                    pair_scores[0] = 0.0f;
+                    pair_scores[1] = 0.0f;
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        uint repeat = pair_start + pair;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[pair * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_pair(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        pair_scores,
+                        pair_repeats, batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        scaled_scores[pair_start + pair] += pair_scores[pair];
+                    }
+                }
+            }
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] *= attention_scale;
+            }
+        }
+        }
+        tile_physical_tokens[lane] = physical_token;
+
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            tile_scores[score_base + lane] = scaled_scores[repeat];
+            partial[score_base + lane] = scaled_scores[repeat];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    partial[score_base + lane] =
+                        max(partial[score_base + lane], partial[score_base + lane + stride]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        thread float tile_maxes[4];
+        tile_maxes[0] = -INFINITY;
+        tile_maxes[1] = -INFINITY;
+        tile_maxes[2] = -INFINITY;
+        tile_maxes[3] = -INFINITY;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            tile_maxes[repeat] = partial[repeat * threads_per_block];
+        }
+        // Every lane must finish reading the reduced maxes above BEFORE any lane
+        // overwrites partial[] with exp-weights below. Without this barrier, a lagging
+        // simdgroup can read lane 0's already-written weight as the "max" for a later
+        // repeat (drift across the barrier-free repeat loop is widest at the last
+        // repeat), which intermittently corrupts the whole output row of one GQA
+        // repeat at BT>=512 / 131072 (256 active blocks). Root-caused 2026-07-06 as
+        // the same class as the v7 quad race; see
+        // artifacts/turboquant-w2-regrad-20260706 and
+        // artifacts/turboquant-v7-20260703/quad-nondeterminism.md.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint has_weight = 0u;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            float tile_weight = active
+                ? exp(tile_scores[score_base + lane] - tile_maxes[repeat])
+                : 0.0f;
+            tile_scores[score_base + lane] = tile_weight;
+            partial[score_base + lane] = tile_weight;
+            if (tile_weight > 0.0f) {
+                has_weight = 1u;
+            }
+        }
+        tile_has_weight[lane] = has_weight;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    partial[score_base + lane] += partial[score_base + lane + stride];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint stat_index = ((row * block_count + block_index) * 2u);
+                uint score_base = repeat * threads_per_block;
+                partial_stats[stat_index] = tile_maxes[repeat];
+                partial_stats[stat_index + 1u] = partial[score_base];
+            }
+        }
+
+        if (lane < uint(HEAD_DIM)) {
+            thread float decode_scratch[GROUP_SIZE];
+            thread float dimension_accum[4];
+            dimension_accum[0] = 0.0f;
+            dimension_accum[1] = 0.0f;
+            dimension_accum[2] = 0.0f;
+            dimension_accum[3] = 0.0f;
+
+            for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
+                if (tile_has_weight[tile_lane] != 0u) {
+                    float value = tq_decode_attention_value(
+                        v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
+                        batch, kv_head, tile_physical_tokens[tile_lane], lane,
+                        value_seed, 1u,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
+                        uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS),
+                        uint(LAYOUT_VERSION), uint(HEAD_DIM), 0u,
+                        decode_scratch);
+                    for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                        dimension_accum[repeat] +=
+                            tile_scores[repeat * threads_per_block + tile_lane] * value;
+                    }
+                }
+            }
+
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum[repeat]);
+            }
+        }
+        """
+
+    private static let fusedAttentionGQABlockPartialsH16Source_rf1 = """
+        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
+        constexpr uint gqa_repeats = uint(GQA_REPEATS);
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint block_index = group_index % block_count;
+        uint gqa_row = group_index / block_count;
+        uint total_gqa_rows = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(QUERY_LENGTH);
+        if (gqa_row >= total_gqa_rows) {
+            return;
+        }
+
+        // T2.2 H16 diet: partial/tile_scores staged as half (was float) and
+        // tile_has_weight folded into a 32-lane bitset (was uint[THREADS_PER_BLOCK]).
+        // This halves the two largest tgmem arrays and shrinks the mask array from
+        // THREADS_PER_BLOCK*4B to (THREADS_PER_BLOCK/32)*4B, clearing the < 16384 B
+        // static-tgmem boundary needed for 2 threadgroups/core (see G5 probe). All
+        // reduction math still runs in fp32 registers; only the threadgroup-memory
+        // storage dtype changes. query_cache and tile_physical_tokens are unchanged
+        // (rotation precision / full 32-bit token indices at 131K).
+        threadgroup half partial[4 * THREADS_PER_BLOCK];
+        threadgroup half tile_scores[4 * THREADS_PER_BLOCK];
+        threadgroup uint tile_has_weight_bits[(THREADS_PER_BLOCK + 31u) / 32u];
         threadgroup uint tile_physical_tokens[THREADS_PER_BLOCK];
         threadgroup float query_cache[4 * HEAD_DIM];
 
@@ -16454,8 +17037,19 @@ private enum TurboQuantMetalKernels {
 
         for (uint repeat = 0u; repeat < repeat_count; repeat++) {
             uint score_base = repeat * threads_per_block;
-            tile_scores[score_base + lane] = scaled_scores[repeat];
-            partial[score_base + lane] = scaled_scores[repeat];
+            // H16 overflow guard: the raw pre-softmax logit is unbounded and is
+            // stored as half before the max-subtraction. Clamp to a safe fp16
+            // sub-max range; -INFINITY (masked/inactive lanes) maps to -65504,
+            // which the exp(x - max) step drives to 0 identically to -inf.
+            float raw = scaled_scores[repeat];
+            float guarded = raw;
+            if (!(raw <= 60000.0f)) {
+                guarded = (raw == -INFINITY) ? -65504.0f : 60000.0f;
+            } else if (raw < -65504.0f) {
+                guarded = -65504.0f;
+            }
+            tile_scores[score_base + lane] = half(guarded);
+            partial[score_base + lane] = half(guarded);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -16463,8 +17057,9 @@ private enum TurboQuantMetalKernels {
             if (lane < stride) {
                 for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                     uint score_base = repeat * threads_per_block;
-                    partial[score_base + lane] =
-                        max(partial[score_base + lane], partial[score_base + lane + stride]);
+                    float a = float(partial[score_base + lane]);
+                    float b = float(partial[score_base + lane + stride]);
+                    partial[score_base + lane] = half(max(a, b));
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -16475,27 +17070,42 @@ private enum TurboQuantMetalKernels {
         tile_maxes[1] = -INFINITY;
         tile_maxes[2] = -INFINITY;
         tile_maxes[3] = -INFINITY;
+        // Clear this lane's bitset word once (only the 32 lane-0-of-word threads).
+        if ((lane & 31u) == 0u) { tile_has_weight_bits[lane >> 5] = 0u; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            tile_maxes[repeat] = float(partial[repeat * threads_per_block]);
+        }
+        // Read the reduced maxes above BEFORE any lane overwrites partial[] with
+        // exp-weights below (same v6-family RAW race fixed in the fp32 GQA kernel;
+        // see artifacts/turboquant-w2-regrad-20260706).
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         uint has_weight = 0u;
         for (uint repeat = 0u; repeat < repeat_count; repeat++) {
             uint score_base = repeat * threads_per_block;
-            tile_maxes[repeat] = partial[score_base];
             float tile_weight = active
-                ? exp(tile_scores[score_base + lane] - tile_maxes[repeat])
+                ? exp(float(tile_scores[score_base + lane]) - tile_maxes[repeat])
                 : 0.0f;
-            tile_scores[score_base + lane] = tile_weight;
-            partial[score_base + lane] = tile_weight;
+            tile_scores[score_base + lane] = half(tile_weight);
+            partial[score_base + lane] = half(tile_weight);
             if (tile_weight > 0.0f) {
                 has_weight = 1u;
             }
         }
-        tile_has_weight[lane] = has_weight;
+        if (has_weight != 0u) {
+            atomic_fetch_or_explicit(
+                (threadgroup atomic_uint*)&tile_has_weight_bits[lane >> 5],
+                1u << (lane & 31u), memory_order_relaxed);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
             if (lane < stride) {
                 for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                     uint score_base = repeat * threads_per_block;
-                    partial[score_base + lane] += partial[score_base + lane + stride];
+                    float s = float(partial[score_base + lane])
+                            + float(partial[score_base + lane + stride]);
+                    partial[score_base + lane] = half(s);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -16508,7 +17118,7 @@ private enum TurboQuantMetalKernels {
                 uint stat_index = ((row * block_count + block_index) * 2u);
                 uint score_base = repeat * threads_per_block;
                 partial_stats[stat_index] = tile_maxes[repeat];
-                partial_stats[stat_index + 1u] = partial[score_base];
+                partial_stats[stat_index + 1u] = float(partial[score_base]);
             }
         }
 
@@ -16521,7 +17131,7 @@ private enum TurboQuantMetalKernels {
             dimension_accum[3] = 0.0f;
 
             for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
-                if (tile_has_weight[tile_lane] != 0u) {
+                if ((tile_has_weight_bits[tile_lane >> 5] & (1u << (tile_lane & 31u))) != 0u) {
                     float value = tq_decode_attention_value(
                         v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
                         batch, kv_head, tile_physical_tokens[tile_lane], lane,
@@ -16533,7 +17143,7 @@ private enum TurboQuantMetalKernels {
                         decode_scratch);
                     for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                         dimension_accum[repeat] +=
-                            tile_scores[repeat * threads_per_block + tile_lane] * value;
+                            float(tile_scores[repeat * threads_per_block + tile_lane]) * value;
                     }
                 }
             }
