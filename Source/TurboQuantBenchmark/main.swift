@@ -2321,7 +2321,9 @@ extension TurboQuantAttentionPath {
 // the only correct comparison spawns two processes). Reads `--h16-parity-preset`,
 // `--h16-parity-head-dim`, defaults to turbo4v2 / 128. Output: one JSON array of
 // floats per line to stdout, nothing else on stdout.
-if CommandLine.arguments.contains("--h16-parity-dump") {
+if CommandLine.arguments.contains("--selftest-qappend") {
+    runQuantizeAppendKVSelfTest()
+} else if CommandLine.arguments.contains("--h16-parity-dump") {
     try runH16ParityDump(arguments: CommandLine.arguments)
 } else {
     let options = try BenchmarkOptions.parse()
@@ -2329,6 +2331,122 @@ if CommandLine.arguments.contains("--h16-parity-dump") {
         try runCoreBenchmarkJSON(options: options)
     } else {
         try runLegacyBenchmark(options: options)
+    }
+}
+
+// Hidden bit-exactness smoke for the fused quantize-append (P1-1) kernel.
+// Appends a random fp16 K [1,2,1,128] / V [1,2,1,128] into zeroed capacity-8
+// planes at offsets 0 and 3 via MLXFast.quantizeAppendKV, and compares the six
+// planes bitwise against the stock quantized() + slice-update reference.
+// Prints PASS/FAIL and exits non-zero on failure.
+private func runQuantizeAppendKVSelfTest() {
+    let headDim = 128
+    let batch = 1
+    let heads = 2
+    let capacity = 8
+    let keyGroupSize = 64
+    let keyBits = 8
+    let valueGroupSize = 32
+    let valueBits = 4
+    let keyWords = headDim * keyBits / 32
+    let keyGroups = headDim / keyGroupSize
+    let valueWords = headDim * valueBits / 32
+    let valueGroups = headDim / valueGroupSize
+
+    let kNew = MLXRandom.normal([batch, heads, 1, headDim]).asType(.float16)
+    let vNew = MLXRandom.normal([batch, heads, 1, headDim]).asType(.float16)
+
+    func zeroPlane(_ lastDim: Int, dtype: DType) -> MLXArray {
+        MLXArray.zeros([batch, heads, capacity, lastDim], dtype: dtype)
+    }
+
+    let (kCodesRef, kScalesRef, kBiasesRefOpt) = quantized(
+        kNew, groupSize: keyGroupSize, bits: keyBits, mode: .affine)
+    let (vCodesRef, vScalesRef, vBiasesRefOpt) = quantized(
+        vNew, groupSize: valueGroupSize, bits: valueBits, mode: .affine)
+    guard let kBiasesRef = kBiasesRefOpt, let vBiasesRef = vBiasesRefOpt else {
+        print("qappend-selftest: FAIL (stock quantize returned no biases)")
+        exit(1)
+    }
+
+    let refKCodes = zeroPlane(keyWords, dtype: .uint32)
+    let refKScales = zeroPlane(keyGroups, dtype: .float16)
+    let refKBiases = zeroPlane(keyGroups, dtype: .float16)
+    let refVCodes = zeroPlane(valueWords, dtype: .uint32)
+    let refVScales = zeroPlane(valueGroups, dtype: .float16)
+    let refVBiases = zeroPlane(valueGroups, dtype: .float16)
+
+    var opKCodes = zeroPlane(keyWords, dtype: .uint32)
+    var opKScales = zeroPlane(keyGroups, dtype: .float16)
+    var opKBiases = zeroPlane(keyGroups, dtype: .float16)
+    var opVCodes = zeroPlane(valueWords, dtype: .uint32)
+    var opVScales = zeroPlane(valueGroups, dtype: .float16)
+    var opVBiases = zeroPlane(valueGroups, dtype: .float16)
+
+    for offset in [0, 3] {
+        let range = offset ..< (offset + 1)
+        refKCodes[0..., 0..., range, 0...] = kCodesRef
+        refKScales[0..., 0..., range, 0...] = kScalesRef
+        refKBiases[0..., 0..., range, 0...] = kBiasesRef
+        refVCodes[0..., 0..., range, 0...] = vCodesRef
+        refVScales[0..., 0..., range, 0...] = vScalesRef
+        refVBiases[0..., 0..., range, 0...] = vBiasesRef
+
+        let out:
+            (
+                kCodes: MLXArray, kScales: MLXArray, kBiases: MLXArray,
+                vCodes: MLXArray, vScales: MLXArray, vBiases: MLXArray
+            )
+        do {
+            out = try MLXFast.quantizeAppendKV(
+                keysNew: kNew,
+                valuesNew: vNew,
+                kCodes: opKCodes,
+                kScales: opKScales,
+                kBiases: opKBiases,
+                vCodes: opVCodes,
+                vScales: opVScales,
+                vBiases: opVBiases,
+                seqOffset: offset,
+                steps: 1,
+                keyGroupSize: keyGroupSize,
+                keyBits: keyBits,
+                valueGroupSize: valueGroupSize,
+                valueBits: valueBits)
+        } catch {
+            print("qappend-selftest: FAIL (native op threw: \(error))")
+            exit(1)
+        }
+        opKCodes = out.kCodes
+        opKScales = out.kScales
+        opKBiases = out.kBiases
+        opVCodes = out.vCodes
+        opVScales = out.vScales
+        opVBiases = out.vBiases
+    }
+
+    eval(
+        refKCodes, refKScales, refKBiases, refVCodes, refVScales, refVBiases,
+        opKCodes, opKScales, opKBiases, opVCodes, opVScales, opVBiases)
+
+    func check(_ name: String, _ lhs: MLXArray, _ rhs: MLXArray) -> Bool {
+        let ok = lhs.shape == rhs.shape && all(lhs .== rhs).item(Bool.self)
+        print("qappend-selftest: \(name) \(ok ? "MATCH" : "MISMATCH") shape=\(lhs.shape)")
+        return ok
+    }
+    let allOK =
+        check("k_codes", opKCodes, refKCodes)
+        && check("k_scales", opKScales, refKScales)
+        && check("k_biases", opKBiases, refKBiases)
+        && check("v_codes", opVCodes, refVCodes)
+        && check("v_scales", opVScales, refVScales)
+        && check("v_biases", opVBiases, refVBiases)
+
+    if allOK {
+        print("qappend-selftest: PASS (all six planes bit-identical to stock quantize + slice-update)")
+    } else {
+        print("qappend-selftest: FAIL")
+        exit(1)
     }
 }
 

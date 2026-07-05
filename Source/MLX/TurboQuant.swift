@@ -563,6 +563,8 @@ public struct TurboQuantRuntimeProbeResult: Equatable, Codable, Sendable {
         let qkAvailable = attentionCodecPassed && qkPassed
         let avAvailable = attentionCodecPassed && avPassed
         return TurboQuantKernelCapabilities(
+            nativeQuantizeAppendKV: metalRuntimeAvailable
+                ? turboQuantNativeQuantizeAppendKVAvailable() : false,
             flatEncodeDecode: metalRuntimeAvailable && flatCodecPassed,
             linearMatmul: turboQuantExperimentalLinearMetalEnabled()
                 && metalRuntimeAvailable && flatCodecPassed,
@@ -626,6 +628,161 @@ public struct TurboQuantDeviceCapabilities: Equatable, Codable, Sendable {
         capabilities.runtimeProbe = TurboQuantRuntimeProbe.shared.result()
         return capabilities
     }
+}
+
+// P1-1 fused quantize-append native probe. Runs the op once on a tiny tensor
+// and checks the six outputs bit-exactly against the stock quantized() +
+// slice-update reference. Fails closed (false) on any throw or mismatch, and
+// caches the verdict for the process lifetime (mirrors the availability cache).
+private final class TurboQuantQuantizeAppendKVProbeCache: @unchecked Sendable {
+    static let shared = TurboQuantQuantizeAppendKVProbeCache()
+    private let lock = NSLock()
+    private var cachedResult: Bool?
+    private init() {}
+    func result(_ compute: () -> Bool) -> Bool {
+        if turboQuantHostCachesDisabled { return compute() }
+        lock.lock()
+        if let cachedResult { lock.unlock(); return cachedResult }
+        lock.unlock()
+        let result = compute()
+        lock.lock(); cachedResult = result; lock.unlock()
+        return result
+    }
+    func resetForTesting() { lock.lock(); cachedResult = nil; lock.unlock() }
+}
+
+/// Fail-closed probe for the native fused quantize-append (P1-1) kernel.
+///
+/// Quantizes a tiny K (gs64/b8) and V (gs32/b4) row via ``MLXFast/quantizeAppendKV``
+/// into zeroed capacity-4 planes at two offsets, and compares each of the six
+/// planes bit-exactly (codes and scales/biases) against the stock
+/// ``quantized(_:groupSize:bits:mode:globalScale:stream:)`` + slice-update
+/// reference. Returns `false` on any error or mismatch.
+public func turboQuantNativeQuantizeAppendKVAvailable() -> Bool {
+    TurboQuantQuantizeAppendKVProbeCache.shared.result {
+        turboQuantProbeQuantizeAppendKV()
+    }
+}
+
+func turboQuantResetQuantizeAppendKVProbeForTesting() {
+    TurboQuantQuantizeAppendKVProbeCache.shared.resetForTesting()
+}
+
+private func turboQuantProbeQuantizeAppendKV() -> Bool {
+    guard metalRuntimeAvailable() else { return false }
+    return turboQuantProbeQuantizeAppendKVImpl(
+        headDim: 64,
+        keyGroupSize: 64,
+        keyBits: 8,
+        valueGroupSize: 32,
+        valueBits: 4,
+        capacity: 4)
+}
+
+private func turboQuantProbeQuantizeAppendKVImpl(
+    headDim: Int,
+    keyGroupSize: Int,
+    keyBits: Int,
+    valueGroupSize: Int,
+    valueBits: Int,
+    capacity: Int
+) -> Bool {
+    let keyWords = headDim * keyBits / 32
+    let keyGroups = headDim / keyGroupSize
+    let valueWords = headDim * valueBits / 32
+    let valueGroups = headDim / valueGroupSize
+
+    func deterministicRow(_ phase: Double) -> [Float] {
+        (0 ..< headDim).map { index in
+            let position = Double(index)
+            return Float(0.37 * sin(position * 0.053 + phase) + 0.11 * cos(position * 0.017))
+        }
+    }
+    // [B=1, H=1, steps=1, head_dim]
+    let kNew = MLXArray(deterministicRow(0.13), [1, 1, 1, headDim]).asType(.float16)
+    let vNew = MLXArray(deterministicRow(0.71), [1, 1, 1, headDim]).asType(.float16)
+
+    func zeroPlane(_ lastDim: Int, dtype: DType) -> MLXArray {
+        MLXArray.zeros([1, 1, capacity, lastDim], dtype: dtype)
+    }
+
+    // Reference via stock quantized() written into zeroed planes.
+    let (kCodesRef0, kScalesRef0, kBiasesRef0) = quantized(
+        kNew, groupSize: keyGroupSize, bits: keyBits, mode: .affine)
+    let (vCodesRef0, vScalesRef0, vBiasesRef0) = quantized(
+        vNew, groupSize: valueGroupSize, bits: valueBits, mode: .affine)
+    guard let kBiasesRef0, let vBiasesRef0 else { return false }
+
+    let refKCodes = zeroPlane(keyWords, dtype: .uint32)
+    let refKScales = zeroPlane(keyGroups, dtype: .float16)
+    let refKBiases = zeroPlane(keyGroups, dtype: .float16)
+    let refVCodes = zeroPlane(valueWords, dtype: .uint32)
+    let refVScales = zeroPlane(valueGroups, dtype: .float16)
+    let refVBiases = zeroPlane(valueGroups, dtype: .float16)
+
+    var opKCodes = zeroPlane(keyWords, dtype: .uint32)
+    var opKScales = zeroPlane(keyGroups, dtype: .float16)
+    var opKBiases = zeroPlane(keyGroups, dtype: .float16)
+    var opVCodes = zeroPlane(valueWords, dtype: .uint32)
+    var opVScales = zeroPlane(valueGroups, dtype: .float16)
+    var opVBiases = zeroPlane(valueGroups, dtype: .float16)
+
+    // Exercise two offsets to catch destination-row arithmetic bugs.
+    for offset in [0, 3] {
+        let range = offset ..< (offset + 1)
+        refKCodes[0..., 0..., range, 0...] = kCodesRef0
+        refKScales[0..., 0..., range, 0...] = kScalesRef0
+        refKBiases[0..., 0..., range, 0...] = kBiasesRef0
+        refVCodes[0..., 0..., range, 0...] = vCodesRef0
+        refVScales[0..., 0..., range, 0...] = vScalesRef0
+        refVBiases[0..., 0..., range, 0...] = vBiasesRef0
+
+        let out:
+            (
+                kCodes: MLXArray, kScales: MLXArray, kBiases: MLXArray,
+                vCodes: MLXArray, vScales: MLXArray, vBiases: MLXArray
+            )
+        do {
+            out = try MLXFast.quantizeAppendKV(
+                keysNew: kNew,
+                valuesNew: vNew,
+                kCodes: opKCodes,
+                kScales: opKScales,
+                kBiases: opKBiases,
+                vCodes: opVCodes,
+                vScales: opVScales,
+                vBiases: opVBiases,
+                seqOffset: offset,
+                steps: 1,
+                keyGroupSize: keyGroupSize,
+                keyBits: keyBits,
+                valueGroupSize: valueGroupSize,
+                valueBits: valueBits)
+        } catch {
+            // Fail closed: any native error means the capability is unavailable.
+            return false
+        }
+        opKCodes = out.kCodes
+        opKScales = out.kScales
+        opKBiases = out.kBiases
+        opVCodes = out.vCodes
+        opVScales = out.vScales
+        opVBiases = out.vBiases
+    }
+
+    eval(
+        refKCodes, refKScales, refKBiases, refVCodes, refVScales, refVBiases,
+        opKCodes, opKScales, opKBiases, opVCodes, opVScales, opVBiases)
+
+    func bitwiseEqual(_ lhs: MLXArray, _ rhs: MLXArray) -> Bool {
+        lhs.shape == rhs.shape && all(lhs .== rhs).item(Bool.self)
+    }
+    return bitwiseEqual(opKCodes, refKCodes)
+        && bitwiseEqual(opKScales, refKScales)
+        && bitwiseEqual(opKBiases, refKBiases)
+        && bitwiseEqual(opVCodes, refVCodes)
+        && bitwiseEqual(opVScales, refVScales)
+        && bitwiseEqual(opVBiases, refVBiases)
 }
 
 // TQ_T11: process-lifetime cache for TurboQuantKernelAvailability.current. All inputs are

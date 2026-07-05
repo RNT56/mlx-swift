@@ -242,6 +242,29 @@ int mlx_fast_mixed_quantized_scaled_dot_product_attention(
     bool causal,
     const mlx_stream s);
 
+/**
+ * Fused quantize-and-append for the affine K8/V4 KV-cache append ladder.
+ * Returns the six updated cache planes in `res` in the order
+ * [k_codes, k_scales, k_biases, v_codes, v_scales, v_biases].
+ */
+int mlx_fast_quantize_append_kv(
+    mlx_vector_array* res,
+    const mlx_array k_new,
+    const mlx_array v_new,
+    const mlx_array k_codes,
+    const mlx_array k_scales,
+    const mlx_array k_biases,
+    const mlx_array v_codes,
+    const mlx_array v_scales,
+    const mlx_array v_biases,
+    int seq_offset,
+    int steps,
+    int key_group_size,
+    int key_bits,
+    int value_group_size,
+    int value_bits,
+    const mlx_stream s);
+
 typedef struct mlx_fast_mixed_quantized_attention_options_ {
   float scale;
   bool causal;

@@ -10,6 +10,9 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
     public var nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
     public var nativePolarWHTSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
     public var nativeFallbackReason: String?
+    /// Fused quantize-and-append (P1-1) native kernel availability. `nil` when
+    /// the probe was not run; fails closed to `false` on any error/mismatch.
+    public var nativeQuantizeAppendKV: Bool?
     public var flatEncodeDecode: Bool
     public var linearMatmul: Bool
     public var attentionEncode: Bool
@@ -34,6 +37,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
         nativePolarWHTSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
         nativeFallbackReason: String? = nil,
+        nativeQuantizeAppendKV: Bool? = nil,
         flatEncodeDecode: Bool = false,
         linearMatmul: Bool = false,
         attentionEncode: Bool = false,
@@ -58,6 +62,7 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         self.nativeSegmentedAttentionBackend = nativeSegmentedAttentionBackend
         self.nativePolarWHTSegmentedAttentionBackend = nativePolarWHTSegmentedAttentionBackend
         self.nativeFallbackReason = nativeFallbackReason
+        self.nativeQuantizeAppendKV = nativeQuantizeAppendKV
         self.flatEncodeDecode = flatEncodeDecode
         self.linearMatmul = linearMatmul
         self.attentionEncode = attentionEncode

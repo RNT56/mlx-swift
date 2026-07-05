@@ -300,6 +300,79 @@ public enum MLXFast {
         return MLXArray(result)
     }
 
+    /// Fused quantize-and-append for the affine K8/V4 KV-cache append ladder.
+    ///
+    /// Quantizes the incoming `keysNew`/`valuesNew` rows (fp16/bf16/fp32,
+    /// `[B, nKVHeads, steps, headDim]`) with the stock affine quantize math and
+    /// writes the resulting codes/scales/biases into rows
+    /// `[seqOffset, seqOffset + steps)` of the six full preallocated cache
+    /// planes, returning the six updated planes. Supported specialization set
+    /// (else throws): `keyBits == 8` with `keyGroupSize` in {64, 128};
+    /// `valueBits == 4` with `valueGroupSize` in {32, 64, 128}. Setting the
+    /// environment variable `TQ_QAPPEND=0` returns the bit-identical op fallback.
+    public static func quantizeAppendKV(
+        keysNew: MLXArray,
+        valuesNew: MLXArray,
+        kCodes: MLXArray,
+        kScales: MLXArray,
+        kBiases: MLXArray,
+        vCodes: MLXArray,
+        vScales: MLXArray,
+        vBiases: MLXArray,
+        seqOffset: Int,
+        steps: Int,
+        keyGroupSize: Int,
+        keyBits: Int,
+        valueGroupSize: Int,
+        valueBits: Int,
+        stream: StreamOrDevice = .default
+    ) throws -> (
+        kCodes: MLXArray, kScales: MLXArray, kBiases: MLXArray,
+        vCodes: MLXArray, vScales: MLXArray, vBiases: MLXArray
+    ) {
+        try withError { error in
+            var result = mlx_vector_array_new()
+            defer { mlx_vector_array_free(result) }
+
+            // Returns 0 on success and 1 when the native op threw (leaving
+            // `result` empty). Surface the failure as a Swift throw so callers
+            // can fail closed to the ladder instead of unpacking an empty
+            // vector and trapping out of bounds.
+            let status = mlx_fast_quantize_append_kv(
+                &result,
+                keysNew.ctx,
+                valuesNew.ctx,
+                kCodes.ctx,
+                kScales.ctx,
+                kBiases.ctx,
+                vCodes.ctx,
+                vScales.ctx,
+                vBiases.ctx,
+                Int32(seqOffset),
+                Int32(steps),
+                Int32(keyGroupSize),
+                Int32(keyBits),
+                Int32(valueGroupSize),
+                Int32(valueBits),
+                stream.ctx)
+            try error.check()
+            guard status == 0 else {
+                throw MLXError.caught(
+                    "quantizeAppendKV failed: native op returned status \(status)")
+            }
+
+            let arrays = mlx_vector_array_values(result)
+            guard arrays.count == 6 else {
+                throw MLXError.caught(
+                    "quantizeAppendKV returned \(arrays.count) arrays, expected 6")
+            }
+            return (
+                arrays[0], arrays[1], arrays[2],
+                arrays[3], arrays[4], arrays[5]
+            )
+        }
+    }
+
     /// Computes scaled dot product attention where keys and values are affine
     /// quantized with different bit widths and group sizes.
     public static func mixedQuantizedScaledDotProductAttention(

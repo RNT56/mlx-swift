@@ -2710,6 +2710,125 @@ template <typename T, const int group_size, const int bits>
   }
 }
 
+// Fused quantize-and-append (TurboQuant P1-1). Byte-for-byte the same affine
+// quantize math as affine_quantize above, but reads compact incoming rows
+// (`w` = [B, n_kv_heads, steps, head_dim]) and writes codes/scales/biases into
+// rows [seq_offset, seq_offset + n_steps) of the FULL destination planes
+// (capacity_seq rows per batch*head). Power-of-two `bits` only; the 3/5/6-bit
+// byte-splitting store branches are omitted since they are never instantiated
+// here. NEW kernel name (never mutate affine_quantize -- the compiled-variant
+// cache keys on the name).
+template <typename T, const int group_size, const int bits>
+[[kernel]] void affine_quantize_append(
+    const device T* w [[buffer(0)]],
+    device uint8_t* out [[buffer(1)]],
+    device T* scales [[buffer(2)]],
+    device T* biases [[buffer(3)]],
+    const constant uint& seq_offset [[buffer(4)]],
+    const constant uint& n_steps [[buffer(5)]],
+    const constant uint& capacity_seq [[buffer(6)]],
+    const constant uint& elems_per_row [[buffer(7)]],
+    uint2 index [[thread_position_in_grid]],
+    uint2 grid_dim [[threads_per_grid]]) {
+  constexpr float eps = 1e-7;
+  constexpr int simd_size = 32;
+  constexpr float n_bins = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int values_per_reduce = group_size / simd_size;
+  constexpr int writes_per_reduce = pack_factor / values_per_reduce;
+  constexpr int writes_per_pack =
+      writes_per_reduce > 1 ? 1 : values_per_reduce / pack_factor;
+
+  static_assert(
+      group_size % simd_size == 0,
+      "Group size must be divisible by simd size.");
+  static_assert(
+      (bits & (bits - 1)) == 0,
+      "affine_quantize_append supports power-of-two bits only.");
+
+  size_t offset = index.x + grid_dim.x * size_t(index.y);
+  size_t in_index = offset * values_per_reduce;
+  // Compact output index (relative to the compact input's own layout), matching
+  // affine_quantize exactly for power-of-two bits.
+  size_t out_index = offset * writes_per_pack;
+
+  // Decompose the compact flat position into (batch*head, row within the
+  // incoming block) so the destination row lands inside the full plane.
+  size_t flat_row = in_index / elems_per_row;
+  size_t bh = flat_row / n_steps;
+  size_t row_in_new = flat_row - bh * n_steps;
+  size_t dst_row = bh * capacity_seq + seq_offset + row_in_new;
+
+  // Per-row destination strides. affine_quantize indexes `out` (uint8_t*) in
+  // byte units for every power-of-two bit width (8-bit stores 1 byte per code;
+  // the 2/4-bit packed path indexes out[out_index/writes_per_reduce] in the
+  // same byte space), so the code shift is the row byte stride. Scales/biases
+  // advance by the number of groups per row.
+  size_t code_bytes_per_row = (size_t(elems_per_row) * bits) / 8;
+  size_t groups_per_row = size_t(elems_per_row) / group_size;
+  size_t code_shift = (dst_row - flat_row) * code_bytes_per_row;
+  size_t group_shift = (dst_row - flat_row) * groups_per_row;
+
+  float w_thread[values_per_reduce];
+  float w_min = Limits<T>::max;
+  float w_max = 0;
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < values_per_reduce; i++) {
+    float val = w[in_index + i];
+    w_thread[i] = val;
+    w_min = min(w_min, val);
+    w_max = max(w_max, val);
+  }
+
+  w_min = simd_min(w_min);
+  w_max = simd_max(w_max);
+
+  float scale = max((w_max - w_min) / n_bins, eps);
+  bool side = abs(w_min) > abs(w_max);
+  scale = side ? scale : -scale;
+  float edge = side ? w_min : w_max;
+  float q0 = round(edge / scale);
+  bool at_zero = q0 == 0.0f;
+  scale = at_zero ? scale : edge / q0;
+  float bias = at_zero ? 0 : edge;
+
+  // Write out the scales and biases (shifted to the destination row).
+  size_t gindex = in_index / group_size;
+  if (in_index % group_size == 0) {
+    scales[gindex + group_shift] = static_cast<T>(scale);
+    biases[gindex + group_shift] = static_cast<T>(bias);
+  }
+
+  using OutType = uint32_t;
+  OutType output = 0;
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < values_per_reduce; i++) {
+    uint8_t val = min(round((w_thread[i] - bias) / scale), n_bins);
+    if (bits == 8) {
+      output = val;
+    } else {
+      output |= val << (bits * (i % pack_factor));
+    }
+
+    if (pack_factor < values_per_reduce && i % pack_factor == pack_factor - 1) {
+      out[out_index + code_shift + i / pack_factor] = output;
+      output = 0;
+    } else {
+#pragma clang loop unroll(full)
+      for (int j = 1; j < writes_per_reduce; j++) {
+        uint8_t sval = simd_shuffle_down(val, j);
+        output |= static_cast<OutType>(sval)
+            << (bits * (j * values_per_reduce + i));
+      }
+    }
+  }
+  if (writes_per_reduce > 0 && out_index % writes_per_reduce == 0) {
+    out[out_index / writes_per_reduce + code_shift] = output;
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 [[kernel]] void affine_dequantize(
     const device uint8_t* w [[buffer(0)]],
