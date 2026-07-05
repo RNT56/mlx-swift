@@ -204,4 +204,49 @@ final class TurboQuantCodecDietTests: XCTestCase {
         }
         print("  => integrated production codec format works end-to-end (encode + standard decode dispatch).")
     }
+
+    /// T1.4 stage 1: K scale plane diet, scalesPerGroup 3 -> 2 (the dead third slot, always
+    /// written 0.0 and never read, is removed). Confirms both the Metal attention codec's
+    /// 5-D scale plane (`[batch, kvHeads, capacity, groupsPerVector, scalesPerGroup]`) and the
+    /// flat Metal codec's `[groupCount, scalesPerGroup]` layout now report scalesPerGroup == 2
+    /// for the key role, matching the shrunk allocation. Pattern mirrors
+    /// TurboQuantNativeAttentionTests.swift's `testKeyPageSummariesMatchScaleMaxReference`.
+    func testKeyScalePlaneDietDropsThirdScaleSlot() throws {
+        try requireTurboQuantMetalAttention()
+
+        let tokenCount = 128
+        let headDimension = 64
+        MLXRandom.seed(0x5CA1_E000_0000_0002)
+        let keys = (MLXRandom.normal([1, 1, tokenCount, headDimension]) * 1.0).asType(.float32)
+
+        let keyCode = try turboQuantMetalEncodeAttention(
+            keys,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo3_5,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0x5CA1_E000_0000_0003
+            )
+        )
+        XCTAssertEqual(keyCode.scalesPerGroup, 2)
+        // Attention scale plane is 5-D; last dim is scalesPerGroup.
+        XCTAssertEqual(keyCode.scales.ndim, 5)
+        XCTAssertEqual(keyCode.scales.dim(4), 2)
+
+        try requireTurboQuantMetalCodec()
+        let flatValues = (MLXRandom.normal([4096]) * 1.0).asType(.float32)
+        let flatKeyCode = try turboQuantMetalEncode(
+            flatValues,
+            configuration: TurboQuantConfiguration(
+                preset: .turbo3_5,
+                role: .key,
+                groupSize: 64,
+                backend: .metalPolarQJL,
+                seed: 0x5CA1_E000_0000_0004
+            )
+        )
+        XCTAssertEqual(flatKeyCode.scalesPerGroup, 2)
+        XCTAssertEqual(flatKeyCode.scales.dim(1), 2)
+    }
 }

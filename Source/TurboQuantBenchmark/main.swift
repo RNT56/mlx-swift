@@ -151,6 +151,7 @@ private struct BenchmarkOptions {
     var groupSize: Int
     var layoutVersion: Int
     var enableLayoutV5: Bool
+    var enableLayoutV7: Bool
     var scaleStorage: TurboQuantScaleStorage
     var blockParallelTokenBlockSize: Int?
     var requestedPath: TurboQuantAttentionPath?
@@ -252,6 +253,7 @@ private struct BenchmarkOptions {
                 minimum: 1
             ),
             enableLayoutV5: arguments.contains("--enable-layout-v5"),
+            enableLayoutV7: arguments.contains("--enable-layout-v7"),
             scaleStorage: try scaleStorage(in: arguments),
             blockParallelTokenBlockSize: try optionalIntValue(
                 "--block-tokens", in: arguments, minimum: 1),
@@ -1075,6 +1077,7 @@ private func measureCoreAttention(
                 seed: 0xBEEF_0000_0000_0101,
                 attentionLayoutVersion: options.layoutVersion,
                 allowExperimentalLayoutV5: options.enableLayoutV5,
+                allowExperimentalLayoutV7: options.enableLayoutV7,
                 attentionScaleStorage: options.scaleStorage
             )
         )
@@ -1089,6 +1092,7 @@ private func measureCoreAttention(
                 valueBits: options.resolvedValueBits,
                 attentionLayoutVersion: options.layoutVersion,
                 allowExperimentalLayoutV5: options.enableLayoutV5,
+                allowExperimentalLayoutV7: options.enableLayoutV7,
                 attentionScaleStorage: options.scaleStorage
             )
         )
@@ -1112,16 +1116,28 @@ private func measureCoreAttention(
     let actualBitsPerValue = storageEstimate.actualBitsPerValue
     cooldown(milliseconds: options.pathCooldownMilliseconds)
 
-    let (decodeSeconds, _) = try timedValue(
-        iterations: options.iterations,
-        warmup: options.warmup,
-        cooldownMilliseconds: options.cooldownMilliseconds,
-        evaluate: { eval($0.0, $0.1) }
-    ) {
-        (
-            try turboQuantMetalDecodeAttention(keyCode, outputDType: .float32),
-            try turboQuantMetalDecodeAttention(valueCode, outputDType: .float32)
-        )
+    // `turboQuantMetalDecodeAttention` is a standalone dequantize-only diagnostic kernel
+    // that is intentionally NOT layout-v7-aware (the tile-transposed v7 layout is only
+    // consumed by the QK/AV/pair/quad/fused kernels below). Skip this diagnostic leg for
+    // v7 codes rather than loosening the kernel's own admission check.
+    let decodeSeconds: Double?
+    if keyCode.layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion
+        || valueCode.layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion
+    {
+        decodeSeconds = nil
+    } else {
+        let (measuredDecodeSeconds, _) = try timedValue(
+            iterations: options.iterations,
+            warmup: options.warmup,
+            cooldownMilliseconds: options.cooldownMilliseconds,
+            evaluate: { eval($0.0, $0.1) }
+        ) {
+            (
+                try turboQuantMetalDecodeAttention(keyCode, outputDType: .float32),
+                try turboQuantMetalDecodeAttention(valueCode, outputDType: .float32)
+            )
+        }
+        decodeSeconds = measuredDecodeSeconds
     }
     cooldown(milliseconds: options.pathCooldownMilliseconds)
 
@@ -1623,6 +1639,7 @@ private func runNativeSparseVBenchmark(options: BenchmarkOptions) throws -> Benc
             seed: 0xBEEF_0000_0000_0201,
             attentionLayoutVersion: options.layoutVersion,
             allowExperimentalLayoutV5: options.enableLayoutV5,
+            allowExperimentalLayoutV7: options.enableLayoutV7,
             attentionScaleStorage: options.scaleStorage
         )
     )
@@ -1637,6 +1654,7 @@ private func runNativeSparseVBenchmark(options: BenchmarkOptions) throws -> Benc
             valueBits: options.resolvedValueBits,
             attentionLayoutVersion: options.layoutVersion,
             allowExperimentalLayoutV5: options.enableLayoutV5,
+            allowExperimentalLayoutV7: options.enableLayoutV7,
             attentionScaleStorage: options.scaleStorage
         )
     )

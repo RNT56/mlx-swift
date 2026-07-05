@@ -5,7 +5,8 @@ import Foundation
 public func validateTurboQuantAttentionCode(
     _ code: TurboQuantAttentionCode,
     expectedRole: TurboQuantTensorRole?,
-    requireWritableCapacity: Bool = false
+    requireWritableCapacity: Bool = false,
+    allowTileTransposedV7: Bool = false
 ) throws {
     if let expectedRole {
         guard code.role == expectedRole else {
@@ -18,7 +19,8 @@ public func validateTurboQuantAttentionCode(
     try turboQuantValidateAttentionLayoutDescriptor(
         code.layout,
         role: code.role,
-        groupSize: code.groupSize
+        groupSize: code.groupSize,
+        allowTileTransposedV7: allowTileTransposedV7
     )
 
     if requireWritableCapacity {
@@ -121,13 +123,26 @@ public func validateTurboQuantAttentionCode(
 
 func turboQuantValidateAttentionLayoutBasics(
     _ layout: TurboQuantAttentionLayout,
-    context: String
+    context: String,
+    allowTileTransposedV7: Bool = false
 ) throws {
-    guard TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion) else {
+    guard
+        TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion)
+            || (allowTileTransposedV7
+                && layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion)
+    else {
         throw turboQuantAttentionValidationError(
             "\(context) layout version actual \(layout.layoutVersion), "
                 + "expected one of \(TurboQuantAttentionLayout.supportedVersions)"
         )
+    }
+    if layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion {
+        guard layout.capacity % 32 == 0 else {
+            throw turboQuantAttentionValidationError(
+                "\(context) layout v7 requires capacity to be a multiple of 32; "
+                    + "got \(layout.capacity)"
+            )
+        }
     }
     guard layout.batchSize > 0 else {
         throw turboQuantAttentionValidationError(
@@ -214,7 +229,8 @@ func turboQuantValidateAttentionLayoutBasics(
 func turboQuantValidateAttentionLayoutDescriptor(
     _ layout: TurboQuantAttentionLayout,
     role: TurboQuantTensorRole,
-    groupSize: Int
+    groupSize: Int,
+    allowTileTransposedV7: Bool = false
 ) throws {
     guard role == .key || role == .value else {
         throw turboQuantAttentionValidationError(
@@ -222,7 +238,11 @@ func turboQuantValidateAttentionLayoutDescriptor(
         )
     }
 
-    try turboQuantValidateAttentionLayoutBasics(layout, context: "compressed attention")
+    try turboQuantValidateAttentionLayoutBasics(
+        layout,
+        context: "compressed attention",
+        allowTileTransposedV7: allowTileTransposedV7
+    )
 
     guard groupSize > 0 else {
         throw turboQuantAttentionValidationError(
@@ -435,7 +455,8 @@ private func turboQuantAttentionHighCount(
 }
 
 private func turboQuantAttentionScalesPerGroup(role: TurboQuantTensorRole) -> Int {
-    role == .value ? 2 : 3
+    // K scale plane dieted to 2 (norm, residual_norm); the third slot was dead (written 0.0, never read).
+    return 2
 }
 
 private func turboQuantAttentionCeilDivide(_ value: Int, by divisor: Int) -> Int {

@@ -59,7 +59,8 @@ final class TurboQuantValidationTests: XCTestCase {
     func testLayoutV5AcceptsFp16ScaleStorage() throws {
         var code = Self.makeCode(role: .key)
         code.layout.layoutVersion = TurboQuantAttentionLayout.currentVersion
-        code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
+        // K scale plane dieted to 2 scales/group (T1.4 stage 1); was 3.
+        code.scales = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .float16)
 
         try validateTurboQuantAttentionCode(code, expectedRole: .key)
     }
@@ -148,7 +149,8 @@ final class TurboQuantValidationTests: XCTestCase {
         code.packedMagnitudes = MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32)
         code.highPrecisionMask = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
         code.residualSigns = MLXArray.zeros([1], dtype: .uint32)
-        code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
+        // K scale plane dieted to 2 scales/group (T1.4 stage 1); was 3.
+        code.scales = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .float16)
 
         XCTAssertThrowsError(try validateTurboQuantAttentionCode(code, expectedRole: .key)) {
             error in
@@ -188,7 +190,7 @@ final class TurboQuantValidationTests: XCTestCase {
             signs: signs,
             highPrecisionMask: compact,
             residualSigns: compact,
-            scales: MLXArray.zeros([1, 1, 2, 1, role == .value ? 2 : 3], dtype: .float32)
+            scales: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .float32)
         )
     }
 }

@@ -145,6 +145,10 @@ func turboQuantCooperativeQuadDecodeActive(
     guard turboQuantCooperativeDecodeEnabled, enabled, queryHeadRepeats == 4 else {
         return false
     }
+    // Coop is excluded from layout v7: its offsets are hardcoded to the v6 token-major
+    // packed/bitset/scale layout and would silently misread v7's tile-swizzled K planes.
+    // Gated to exactly v6 (not v7, and no floor for legacy v4/v5 either -- see below).
+    guard layoutVersion == TurboQuantAttentionLayout.splitMagnitudeVersion else { return false }
     // Coop only pays off once memory traffic dominates the decode; keep the strided path at
     // short context where it is neutral/negative (see turboQuantCooperativeDecodeMinContext).
     guard logicalLength >= turboQuantCooperativeDecodeMinContext else { return false }
@@ -154,7 +158,7 @@ func turboQuantCooperativeQuadDecodeActive(
     // The kernel's coop branch implements exactly these two; the (dead-at-v6) variable-bit
     // branch-2 is excluded so coop never runs a decode shape it doesn't handle.
     let uniform = base == high
-    let split = high == base + 1 && layoutVersion >= 6
+    let split = high == base + 1 && layoutVersion == TurboQuantAttentionLayout.splitMagnitudeVersion
     guard uniform || split else { return false }
     guard headDim % 4 == 0 else { return false }
     let chunk = headDim / 4
@@ -611,6 +615,27 @@ public struct TurboQuantDeviceCapabilities: Equatable, Codable, Sendable {
     }
 }
 
+// TQ_T11: process-lifetime cache for TurboQuantKernelAvailability.current. All inputs are
+// cached or process-stable except turboQuantNativeMLXAttentionEnabled() (env read), so caching
+// freezes the env at first access -- matching this codebase's start-of-process env-gate style
+// (e.g. TQ_COOP). TURBOQUANT_DISABLE_HOST_CACHES=1 restores per-call rebuilds for diagnostics.
+private final class TurboQuantKernelAvailabilityCache: @unchecked Sendable {
+    static let shared = TurboQuantKernelAvailabilityCache()
+    private let lock = NSLock()
+    private var cachedResult: TurboQuantKernelAvailability?
+    private init() {}
+    func result(_ compute: () -> TurboQuantKernelAvailability) -> TurboQuantKernelAvailability {
+        if turboQuantHostCachesDisabled { return compute() }
+        lock.lock()
+        if let cachedResult { lock.unlock(); return cachedResult }
+        lock.unlock()
+        let result = compute()
+        lock.lock(); cachedResult = result; lock.unlock()
+        return result
+    }
+    func resetForTesting() { lock.lock(); cachedResult = nil; lock.unlock() }
+}
+
 public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     public var supportsMLXPacked: Bool
     public var supportsPolarQJLReference: Bool
@@ -725,6 +750,17 @@ public struct TurboQuantKernelAvailability: Equatable, Codable, Sendable {
     }
 
     public static var current: TurboQuantKernelAvailability {
+        TurboQuantKernelAvailabilityCache.shared.result { rebuildCurrent() }
+    }
+
+    private static func rebuildCurrent() -> TurboQuantKernelAvailability {
+        let tqProbeStart = TurboQuantHostProbe.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if TurboQuantHostProbe.enabled {
+                TurboQuantHostProbe.shared.recordAvailabilityRebuild(
+                    nanos: DispatchTime.now().uptimeNanoseconds - tqProbeStart)
+            }
+        }
         let metalAvailable = metalRuntimeAvailable()
         let probe = TurboQuantRuntimeProbe.shared.result()
         let probeCapabilities = probe.kernelCapabilities
@@ -865,6 +901,7 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
     public var valueBits: Int?
     public var attentionLayoutVersion: Int
     public var allowExperimentalLayoutV5: Bool
+    public var allowExperimentalLayoutV7: Bool
     public var attentionScaleStorage: TurboQuantScaleStorage
     public var deterministicHighPrecisionMask: Bool
 
@@ -879,6 +916,7 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
         case valueBits
         case attentionLayoutVersion
         case allowExperimentalLayoutV5
+        case allowExperimentalLayoutV7
         case attentionScaleStorage
         case deterministicHighPrecisionMask
     }
@@ -894,6 +932,7 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
         valueBits: Int? = nil,
         attentionLayoutVersion: Int = TurboQuantAttentionLayout.productionDefaultVersion,
         allowExperimentalLayoutV5: Bool = false,
+        allowExperimentalLayoutV7: Bool = false,
         attentionScaleStorage: TurboQuantScaleStorage = .float32,
         deterministicHighPrecisionMask: Bool = true
     ) {
@@ -907,6 +946,7 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
         self.valueBits = valueBits
         self.attentionLayoutVersion = attentionLayoutVersion
         self.allowExperimentalLayoutV5 = allowExperimentalLayoutV5
+        self.allowExperimentalLayoutV7 = allowExperimentalLayoutV7
         self.attentionScaleStorage = attentionScaleStorage
         self.deterministicHighPrecisionMask = deterministicHighPrecisionMask
     }
@@ -928,6 +968,10 @@ public struct TurboQuantConfiguration: Hashable, Codable, Sendable {
         allowExperimentalLayoutV5 = try container.decodeIfPresent(
             Bool.self,
             forKey: .allowExperimentalLayoutV5
+        ) ?? false
+        allowExperimentalLayoutV7 = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .allowExperimentalLayoutV7
         ) ?? false
         attentionScaleStorage = try container.decodeIfPresent(
             TurboQuantScaleStorage.self,
@@ -1821,6 +1865,11 @@ public struct TurboQuantAttentionLayout: Hashable, Codable, Sendable {
     public static let nextVersion = currentVersion
     public static let productionDefaultVersion = currentVersion
     public static let supportedVersions = [legacyVersion, 5, splitMagnitudeVersion]
+    // Layout v7 (tile-transposed K planes): deliberately NOT added to supportedVersions.
+    // supportedVersions feeds the shared validators guarding ~12 unported entry points;
+    // adding 7 there would be fail-open. v7 is admitted only at the explicitly ported
+    // entries enumerated in SPEC 2 section 5.
+    public static let tileTransposedVersion = 7
 
     public var layoutVersion: Int
     public var batchSize: Int
@@ -1907,7 +1956,7 @@ public struct TurboQuantAttentionCode {
         self.groupSize = groupSize
         self.seed = seed
         self.valueBits = valueBits ?? preset.defaultValueBits
-        self.scalesPerGroup = scalesPerGroup ?? (role == .value ? 2 : 3)
+        self.scalesPerGroup = scalesPerGroup ?? 2
         self.packedMagnitudes = packedMagnitudes
         self.signs = signs
         self.highPrecisionMask = highPrecisionMask
@@ -3582,7 +3631,8 @@ public func turboQuantAttentionLayout(
     ringOffset: Int = 0,
     pinnedPrefixLength: Int = 0,
     layoutVersion: Int = TurboQuantAttentionLayout.productionDefaultVersion,
-    allowExperimentalLayoutV5: Bool = false
+    allowExperimentalLayoutV5: Bool = false,
+    allowExperimentalLayoutV7: Bool = false
 ) throws -> TurboQuantAttentionLayout {
     try validateAttentionShape(array.shape, dtype: array.dtype, groupSize: groupSize)
     return try turboQuantAttentionLayout(
@@ -3597,7 +3647,8 @@ public func turboQuantAttentionLayout(
         ringOffset: ringOffset,
         pinnedPrefixLength: pinnedPrefixLength,
         layoutVersion: layoutVersion,
-        allowExperimentalLayoutV5: allowExperimentalLayoutV5
+        allowExperimentalLayoutV5: allowExperimentalLayoutV5,
+        allowExperimentalLayoutV7: allowExperimentalLayoutV7
     )
 }
 
@@ -3613,16 +3664,21 @@ public func turboQuantAttentionLayout(
     ringOffset: Int = 0,
     pinnedPrefixLength: Int = 0,
     layoutVersion: Int = TurboQuantAttentionLayout.productionDefaultVersion,
-    allowExperimentalLayoutV5: Bool = false
+    allowExperimentalLayoutV5: Bool = false,
+    allowExperimentalLayoutV7: Bool = false
 ) throws -> TurboQuantAttentionLayout {
     try validateRequestedAttentionLayoutVersion(
         layoutVersion,
-        allowExperimentalLayoutV5: allowExperimentalLayoutV5
+        allowExperimentalLayoutV5: allowExperimentalLayoutV5,
+        allowExperimentalLayoutV7: allowExperimentalLayoutV7
     )
     try validateAttentionShape(shape, dtype: dtype, groupSize: groupSize)
     let headDimension = shape[3]
     let groupsPerVector = (headDimension + groupSize - 1) / groupSize
-    let resolvedCapacity = capacity ?? shape[2]
+    var resolvedCapacity = capacity ?? shape[2]
+    if layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion, capacity == nil {
+        resolvedCapacity = (resolvedCapacity + 31) / 32 * 32
+    }
     let resolvedLogicalLength = logicalLength ?? shape[2]
     let layout = TurboQuantAttentionLayout(
         layoutVersion: layoutVersion,
@@ -3643,7 +3699,12 @@ public func turboQuantAttentionLayout(
         ),
         bitsetWordsPerGroup: (groupSize + 31) / 32
     )
-    try validateAttentionLayout(layout, role: role, groupSize: groupSize)
+    try validateAttentionLayout(
+        layout,
+        role: role,
+        groupSize: groupSize,
+        allowTileTransposedV7: layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion
+    )
     return layout
 }
 
@@ -3677,7 +3738,8 @@ public func turboQuantMetalEncodeAttention(
         ringOffset: ringOffset,
         pinnedPrefixLength: pinnedPrefixLength,
         layoutVersion: configuration.attentionLayoutVersion,
-        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5
+        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5,
+        allowExperimentalLayoutV7: configuration.allowExperimentalLayoutV7
     )
     guard layout.logicalLength <= layout.capacity else {
         throw TurboQuantError.invalidMetalConfiguration(
@@ -3709,7 +3771,11 @@ public func turboQuantMetalEncodeAttention(
         : unusedBitsetShape
     let residualSignsShape = unusedBitsetShape
     let scalesPerGroup = metalScalesPerGroup(role: configuration.role)
-    let outputs = TurboQuantMetalKernels.encodeAttention(
+    let encodeKernel =
+        layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion
+        ? TurboQuantMetalKernels.encodeAttentionV7
+        : TurboQuantMetalKernels.encodeAttention
+    let outputs = encodeKernel(
         [array],
         template: attentionTemplate(
             configuration: configuration,
@@ -3891,7 +3957,11 @@ public func turboQuantMetalQK(
             queries.dim(0), queries.dim(1), queries.dim(2), keyCode.layout.logicalLength,
         ]
     )
-    try validateAttentionCodeStorage(keyCode)
+    try validateAttentionCodeStorage(
+        keyCode,
+        allowTileTransposedV7: keyCode.layout.layoutVersion
+            == TurboQuantAttentionLayout.tileTransposedVersion
+    )
     try requireTurboQuantMetalAttention()
     guard keyCode.role == .key else {
         throw TurboQuantError.invalidMetalConfiguration("QK requires a key code")
@@ -4032,7 +4102,11 @@ public func turboQuantMetalAV(
     outputDType: DType = .float32,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
-    try validateAttentionCodeStorage(valueCode)
+    try validateAttentionCodeStorage(
+        valueCode,
+        allowTileTransposedV7: valueCode.layout.layoutVersion
+            == TurboQuantAttentionLayout.tileTransposedVersion
+    )
     try requireTurboQuantMetalAttentionOutputDType(outputDType)
     try requireTurboQuantMetalAttention()
     guard valueCode.role == .value else {
@@ -6200,12 +6274,12 @@ public func turboQuantNativeSegmentedAttentionWithDiagnostics(
     keyCandidateSketch: MLXArray? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> TurboQuantNativeSegmentedAttentionResult {
-    try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
+    try validateAttentionPair(keyCode: keyCode, valueCode: valueCode, allowTileTransposedV7: true)
     try validateAttentionQuery(queries, code: keyCode)
-    try validateTurboQuantAttentionCode(keyCode, expectedRole: .key)
-    try validateTurboQuantAttentionCode(valueCode, expectedRole: .value)
-    try validateAttentionCodeStorage(keyCode)
-    try validateAttentionCodeStorage(valueCode)
+    try validateTurboQuantAttentionCode(keyCode, expectedRole: .key, allowTileTransposedV7: true)
+    try validateTurboQuantAttentionCode(valueCode, expectedRole: .value, allowTileTransposedV7: true)
+    try validateAttentionCodeStorage(keyCode, allowTileTransposedV7: true)
+    try validateAttentionCodeStorage(valueCode, allowTileTransposedV7: true)
     guard keyCode.layout.layoutVersion == valueCode.layout.layoutVersion,
         keyCode.layout.batchSize == valueCode.layout.batchSize,
         keyCode.layout.kvHeadCount == valueCode.layout.kvHeadCount,
@@ -6400,10 +6474,12 @@ public func turboQuantMetalScaledDotProductAttention(
     sparseVThreshold: Float? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
-    try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
+    TurboQuantHostProbe.shared.recordAttentionCall()
+    try validateAttentionPair(keyCode: keyCode, valueCode: valueCode, allowTileTransposedV7: true)
     try validateAttentionQuery(queries, code: keyCode)
-    try validateTurboQuantAttentionCode(keyCode, expectedRole: .key)
-    try validateTurboQuantAttentionCode(valueCode, expectedRole: .value)
+    try validateTurboQuantAttentionCode(keyCode, expectedRole: .key, allowTileTransposedV7: true)
+    try validateTurboQuantAttentionCode(
+        valueCode, expectedRole: .value, allowTileTransposedV7: true)
     try validateAttentionMask(
         mask,
         scoreShape: [
@@ -6726,6 +6802,7 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
     sparseVThreshold: Float? = nil,
     stream: StreamOrDevice = .gpu
 ) throws -> MLXArray {
+    TurboQuantHostProbe.shared.recordAttentionCall()
     try requireTurboQuantMetalAttentionOutputDType(outputDType)
     try requireTurboQuantMetalAttention()
     try validateAttentionShape(queries.shape, dtype: queries.dtype, groupSize: 32)
@@ -6782,13 +6859,12 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
             minimum: max(queries.dim(3), min(rawKeys.dim(2), 512))
         )
         let rawPartials = TurboQuantMetalKernels.segmentedRawAttentionStats(
-            [queries, rawKeys, rawValues, scale],
+            [queries, rawKeys, rawValues, scale, Int32(rawKeys.dim(2))],
             template: [
                 ("BATCH_SIZE", queries.dim(0)),
                 ("QUERY_HEADS", queries.dim(1)),
                 ("KV_HEADS", rawKeys.dim(1)),
                 ("QUERY_LENGTH", queries.dim(2)),
-                ("RAW_LENGTH", rawKeys.dim(2)),
                 ("HEAD_DIM", queries.dim(3)),
                 ("THREADS_PER_BLOCK", rawWidth),
             ],
@@ -6860,6 +6936,12 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
             : (useGroupedQueryKernel
                 ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
                 : TurboQuantMetalKernels.fusedAttentionBlockPartials)
+        TurboQuantKernelDispatchTrace.shared.record(
+            "segmented:" + (coopActive
+                ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2"
+                : (useGroupedQueryKernel
+                    ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2"
+                    : "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2")))
         let template =
             runtimeLayoutAttentionTemplate(
                 configuration: TurboQuantConfiguration(
@@ -6885,7 +6967,6 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
                 ("VALUE_SCALES_PER_GROUP", valueCode.scalesPerGroup),
                 ("THREADS_PER_BLOCK", blockWidth),
                 ("BLOCK_TOKENS", blockWidth),
-                ("BLOCK_COUNT", activeBlockCount),
                 ("GQA_REPEATS", useGroupedQueryKernel ? queryHeadRepeats : 1),
                 ("LANES_PER_TOKEN", coopActive ? 4 : 1),
             ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
@@ -6907,6 +6988,7 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
                 Int32(keyCode.layout.ringOffset),
                 Int32(keyCode.layout.pinnedPrefixLength),
                 scale,
+                Int32(activeBlockCount),
             ],
             template: template,
             grid: (partialRows * activeBlockCount * blockWidth, 1, 1),
@@ -6929,11 +7011,10 @@ public func turboQuantMetalSegmentedScaledDotProductAttention(
         minimum: max(totalBlocks, queries.dim(3))
     )
     return TurboQuantMetalKernels.fusedAttentionBlockReduce(
-        [stats, values],
+        [stats, values, Int32(totalBlocks)],
         template: [
             ("ROW_COUNT", rowCount),
             ("HEAD_DIM", queries.dim(3)),
-            ("BLOCK_COUNT", totalBlocks),
             ("THREADS_PER_BLOCK", reduceWidth),
             ("OUTPUT_DTYPE", outputDType),
         ],
@@ -7116,10 +7197,10 @@ private func turboQuantMetalOnlineFusedAttention(
     stream: StreamOrDevice
 ) throws -> MLXArray {
     if !stateAlreadyValidated {
-        try validateAttentionPair(keyCode: keyCode, valueCode: valueCode)
+        try validateAttentionPair(keyCode: keyCode, valueCode: valueCode, allowTileTransposedV7: true)
         try validateAttentionQuery(queries, code: keyCode)
-        try validateAttentionCodeStorage(keyCode)
-        try validateAttentionCodeStorage(valueCode)
+        try validateAttentionCodeStorage(keyCode, allowTileTransposedV7: true)
+        try validateAttentionCodeStorage(valueCode, allowTileTransposedV7: true)
     }
     let outputShape = [queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)]
     let rowCount = queries.dim(0) * queries.dim(1) * queries.dim(2)
@@ -7138,13 +7219,21 @@ private func turboQuantMetalOnlineFusedAttention(
         )
     }
 
-    if turboQuantShouldUseBlockParallelFusedAttention(
+    let useBlockParallel = turboQuantShouldUseBlockParallelFusedAttention(
         queries: queries,
         keyCode: keyCode,
         valueCode: valueCode,
         kernelProfile: kernelProfile,
         blockParallelTokenBlockSize: blockParallelTokenBlockSize
-    ) {
+    )
+    if keyCode.layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion,
+        !useBlockParallel
+    {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "layout v7 is only ported to the block-parallel GQA partials kernel; the single-pass fused kernel is not ported"
+        )
+    }
+    if useBlockParallel {
         return try turboQuantMetalBlockParallelFusedAttention(
             queries: queries,
             keyCode: keyCode,
@@ -7158,6 +7247,7 @@ private func turboQuantMetalOnlineFusedAttention(
         )
     }
 
+    TurboQuantKernelDispatchTrace.shared.record("singlePass:turboquant_attention_fused_decode_runtime_layout_s2")
     return TurboQuantMetalKernels.fusedAttention(
         [
             queries,
@@ -7281,6 +7371,21 @@ private func turboQuantMetalBlockParallelFusedAttention(
         groupSize: keyCode.groupSize,
         logicalLength: keyCode.layout.logicalLength)
 
+    let isTileTransposedV7 =
+        keyCode.layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion
+    if isTileTransposedV7 {
+        guard useGroupedQueryKernel else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "layout v7 supports only the grouped-query block-partials kernel"
+            )
+        }
+        guard !coopActive else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "cooperative decode is not ported to layout v7"
+            )
+        }
+    }
+
     let template =
         runtimeLayoutAttentionTemplate(
             configuration: TurboQuantConfiguration(
@@ -7306,21 +7411,31 @@ private func turboQuantMetalBlockParallelFusedAttention(
             ("VALUE_SCALES_PER_GROUP", valueCode.scalesPerGroup),
             ("THREADS_PER_BLOCK", blockWidth),
             ("BLOCK_TOKENS", blockWidth),
-            ("BLOCK_COUNT", activeBlockCount),
             ("GQA_REPEATS", useGroupedQueryKernel ? queryHeadRepeats : 1),
-            ("LANES_PER_TOKEN", coopActive ? 4 : 1),
-        ] + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
+        ]
+        + (isTileTransposedV7 ? [] : [("LANES_PER_TOKEN", coopActive ? 4 : 1)])
+        + metalTemplateSeedWords(prefix: "VALUE_SEED", value: valueCode.seed)
 
     let partialRows =
         useGroupedQueryKernel
         ? queries.dim(0) * kvHeadCount * queries.dim(2)
         : rowCount
     let partialKernel =
-        coopActive
-        ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoop
-        : (useGroupedQueryKernel
-            ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
-            : TurboQuantMetalKernels.fusedAttentionBlockPartials)
+        isTileTransposedV7
+        ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsV7
+        : (coopActive
+            ? TurboQuantMetalKernels.fusedAttentionGQABlockPartialsCoop
+            : (useGroupedQueryKernel
+                ? TurboQuantMetalKernels.fusedAttentionGQABlockPartials
+                : TurboQuantMetalKernels.fusedAttentionBlockPartials))
+    TurboQuantKernelDispatchTrace.shared.record(
+        "blockParallel:" + (isTileTransposedV7
+            ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_v7"
+            : (coopActive
+                ? "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2"
+                : (useGroupedQueryKernel
+                    ? "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2"
+                    : "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2"))))
     let partialOutputDType = outputDType == .float32 ? DType.float32 : outputDType
     let partials = partialKernel(
         [
@@ -7339,6 +7454,7 @@ private func turboQuantMetalBlockParallelFusedAttention(
             Int32(keyCode.layout.ringOffset),
             Int32(keyCode.layout.pinnedPrefixLength),
             scale,
+            Int32(activeBlockCount),
         ],
         template: template,
         grid: (partialRows * activeBlockCount * blockWidth, 1, 1),
@@ -7354,12 +7470,13 @@ private func turboQuantMetalBlockParallelFusedAttention(
     let reduceWidth = turboQuantBlockParallelFusedThreadgroupWidth(
         minimum: max(activeBlockCount, queries.dim(3))
     )
+    let reduceInputs: [any ScalarOrArray] =
+        partials.map { $0 as any ScalarOrArray } + [Int32(activeBlockCount)]
     return TurboQuantMetalKernels.fusedAttentionBlockReduce(
-        partials,
+        reduceInputs,
         template: [
             ("ROW_COUNT", rowCount),
             ("HEAD_DIM", queries.dim(3)),
-            ("BLOCK_COUNT", activeBlockCount),
             ("THREADS_PER_BLOCK", reduceWidth),
             ("OUTPUT_DTYPE", outputDType),
         ],
@@ -8874,7 +8991,124 @@ private func metalTemplateSeedWords(
     ]
 }
 
+// TQ_T11: process-lifetime cache for the Metal-runtime probe. Device presence and
+// bundled-metallib presence cannot change within a process; the fs scan was measured
+// as a per-attention-call cost by TQ_HOST_PROBE. TURBOQUANT_DISABLE_HOST_CACHES=1
+// restores the uncached behavior for diagnostics.
+let turboQuantHostCachesDisabled: Bool =
+    ProcessInfo.processInfo.environment["TURBOQUANT_DISABLE_HOST_CACHES"] == "1"
+
+// TQ_T11: validateStorageArray's eval() only forced early materialization of metadata
+// (shape/dtype/nbytes/contiguousToDimension) that is readable on an unevaluated MLXArray.
+// Structural (no-eval) tier is now the default for every caller; TURBOQUANT_DEEP_VALIDATE=1
+// restores the eval for diagnostics.
+let turboQuantDeepValidationEnabled: Bool =
+    ProcessInfo.processInfo.environment["TURBOQUANT_DEEP_VALIDATE"] == "1"
+
+private final class TurboQuantMetalRuntimeAvailabilityCache: @unchecked Sendable {
+    static let shared = TurboQuantMetalRuntimeAvailabilityCache()
+    private let lock = NSLock()
+    private var cachedResult: Bool?
+    private init() {}
+    func result(_ compute: () -> Bool) -> Bool {
+        if turboQuantHostCachesDisabled { return compute() }
+        lock.lock()
+        if let cachedResult { lock.unlock(); return cachedResult }
+        lock.unlock()
+        let result = compute()
+        lock.lock(); cachedResult = result; lock.unlock()
+        return result
+    }
+    func resetForTesting() { lock.lock(); cachedResult = nil; lock.unlock() }
+}
+
+// TQ_HOST_PROBE_V1: env-gated host-overhead probe (TQ_HOST_PROBE=1).
+// Zero behavior change when the variable is unset.
+private final class TurboQuantHostProbe: @unchecked Sendable {
+    static let shared = TurboQuantHostProbe()
+    static let enabled: Bool = {
+        let on = ProcessInfo.processInfo.environment["TQ_HOST_PROBE"] == "1"
+        if on { atexit { TurboQuantHostProbe.shared.emit(reason: "atexit") } }
+        return on
+    }()
+    private let lock = NSLock()
+    private var attentionCalls = 0
+    private var metalRuntimeAvailableCalls = 0
+    private var metalRuntimeAvailableNanos: UInt64 = 0
+    private var availabilityRebuilds = 0
+    private var availabilityNanos: UInt64 = 0
+    private var validateEvalCalls = 0
+    private var validateEvalNanos: UInt64 = 0
+    func recordAttentionCall() {
+        guard Self.enabled else { return }
+        lock.lock()
+        attentionCalls += 1
+        let emitNow = attentionCalls % 1000 == 0
+        lock.unlock()
+        if emitNow { emit(reason: "periodic") }
+    }
+    func recordMetalRuntimeAvailable(nanos: UInt64) {
+        guard Self.enabled else { return }
+        lock.lock(); metalRuntimeAvailableCalls += 1; metalRuntimeAvailableNanos += nanos; lock.unlock()
+    }
+    func recordAvailabilityRebuild(nanos: UInt64) {
+        guard Self.enabled else { return }
+        lock.lock(); availabilityRebuilds += 1; availabilityNanos += nanos; lock.unlock()
+    }
+    func recordValidateEval(nanos: UInt64) {
+        guard Self.enabled else { return }
+        lock.lock(); validateEvalCalls += 1; validateEvalNanos += nanos; lock.unlock()
+    }
+    func emit(reason: String) {
+        guard Self.enabled else { return }
+        lock.lock()
+        let line = "TQ_HOST_PROBE_V1 swift reason=\(reason)"
+            + " attention_calls=\(attentionCalls)"
+            + " metal_runtime_available_calls=\(metalRuntimeAvailableCalls) metal_runtime_available_ns=\(metalRuntimeAvailableNanos)"
+            + " availability_rebuilds=\(availabilityRebuilds) availability_ns=\(availabilityNanos)"
+            + " validate_eval_calls=\(validateEvalCalls) validate_eval_ns=\(validateEvalNanos)\n"
+        lock.unlock()
+        FileHandle.standardError.write(Data(line.utf8))
+    }
+}
+
+// TQ_KERNEL_TRACE_V1: env-gated dispatched-fused-kernel trace (TQ_KERNEL_TRACE=1).
+// Zero behavior change when unset. Diagnostic observability only; not a kernel change.
+private final class TurboQuantKernelDispatchTrace: @unchecked Sendable {
+    static let shared = TurboQuantKernelDispatchTrace()
+    static let enabled: Bool = {
+        let on = ProcessInfo.processInfo.environment["TQ_KERNEL_TRACE"] == "1"
+        if on { atexit { TurboQuantKernelDispatchTrace.shared.emit() } }
+        return on
+    }()
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+    func record(_ name: String) {
+        guard Self.enabled else { return }
+        lock.lock(); counts[name, default: 0] += 1; lock.unlock()
+    }
+    func emit() {
+        guard Self.enabled else { return }
+        lock.lock()
+        let lines = counts.sorted { $0.key < $1.key }
+            .map { "TQ_KERNEL_TRACE_V1 kernel=\($0.key) count=\($0.value)\n" }.joined()
+        lock.unlock()
+        FileHandle.standardError.write(Data(lines.utf8))
+    }
+}
+
 private func metalRuntimeAvailable() -> Bool {
+    guard TurboQuantHostProbe.enabled else { return metalRuntimeAvailableUnprobed() }
+    let start = DispatchTime.now().uptimeNanoseconds
+    let result = metalRuntimeAvailableUnprobed()
+    TurboQuantHostProbe.shared.recordMetalRuntimeAvailable(
+        nanos: DispatchTime.now().uptimeNanoseconds - start)
+    return result
+}
+private func metalRuntimeAvailableUnprobed() -> Bool {
+    TurboQuantMetalRuntimeAvailabilityCache.shared.result { metalRuntimeAvailableComputed() }
+}
+private func metalRuntimeAvailableComputed() -> Bool {
     #if canImport(Metal)
         guard MTLCreateSystemDefaultDevice() != nil else { return false }
     #endif
@@ -9634,7 +9868,20 @@ private func validateStorageArray(
             "\(name) uses \(array.nbytes) storage bytes, expected \(expectedByteCount)"
         )
     }
-    array.eval()
+    // TQ_T11: shape/dtype/nbytes/contiguousToDimension are metadata reads on an
+    // unevaluated MLXArray (proven by the eval-free twin in TurboQuantValidation.swift);
+    // the eval here only forced early materialization. Deep tier restores it for
+    // diagnostics: TURBOQUANT_DEEP_VALIDATE=1.
+    if turboQuantDeepValidationEnabled {
+        if TurboQuantHostProbe.enabled {
+            let start = DispatchTime.now().uptimeNanoseconds
+            array.eval()
+            TurboQuantHostProbe.shared.recordValidateEval(
+                nanos: DispatchTime.now().uptimeNanoseconds - start)
+        } else {
+            array.eval()
+        }
+    }
     guard array.contiguousToDimension() == 0 else {
         throw TurboQuantError.invalidMetalConfiguration(
             "\(name) must be canonical row-contiguous storage"
@@ -9720,14 +9967,19 @@ private func turboQuantStoresHighPrecisionMask(
 }
 
 private func metalScalesPerGroup(role: TurboQuantTensorRole) -> Int {
-    role == .value ? 2 : 3
+    // K scale plane dieted to 2 (norm, residual_norm); the third slot was dead (written 0.0, never read).
+    return 2
 }
 
 private func validateRequestedAttentionLayoutVersion(
     _ layoutVersion: Int,
-    allowExperimentalLayoutV5: Bool
+    allowExperimentalLayoutV5: Bool,
+    allowExperimentalLayoutV7: Bool = false
 ) throws {
-    guard TurboQuantAttentionLayout.supportedVersions.contains(layoutVersion) else {
+    guard
+        TurboQuantAttentionLayout.supportedVersions.contains(layoutVersion)
+            || layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion
+    else {
         throw TurboQuantError.invalidMetalConfiguration(
             "unsupported compressed attention layout version \(layoutVersion)"
         )
@@ -9735,6 +9987,11 @@ private func validateRequestedAttentionLayoutVersion(
     if layoutVersion == 5 && !allowExperimentalLayoutV5 {
         throw TurboQuantError.invalidMetalConfiguration(
             "Layout V5 requires allowExperimentalLayoutV5"
+        )
+    }
+    if layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion && !allowExperimentalLayoutV7 {
+        throw TurboQuantError.invalidMetalConfiguration(
+            "Layout V7 requires allowExperimentalLayoutV7"
         )
     }
 }
@@ -9760,7 +10017,8 @@ private func validateAttentionScaleStorage(
 private func validateAttentionConfiguration(_ configuration: TurboQuantConfiguration) throws {
     try validateRequestedAttentionLayoutVersion(
         configuration.attentionLayoutVersion,
-        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5
+        allowExperimentalLayoutV5: configuration.allowExperimentalLayoutV5,
+        allowExperimentalLayoutV7: configuration.allowExperimentalLayoutV7
     )
     try validateAttentionScaleStorage(
         configuration.attentionScaleStorage,
@@ -9868,14 +10126,19 @@ private func validateAttentionShape(_ shape: [Int], dtype: DType, groupSize: Int
 private func validateAttentionLayout(
     _ layout: TurboQuantAttentionLayout,
     role: TurboQuantTensorRole,
-    groupSize: Int
+    groupSize: Int,
+    allowTileTransposedV7: Bool = false
 ) throws {
     guard role == .key || role == .value else {
         throw TurboQuantError.invalidMetalConfiguration(
             "compressed attention codes must be encoded as key or value"
         )
     }
-    guard TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion) else {
+    guard
+        TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion)
+            || (allowTileTransposedV7
+                && layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion)
+    else {
         throw TurboQuantError.invalidMetalConfiguration(
             "unsupported compressed attention layout version \(layout.layoutVersion)"
         )
@@ -9917,10 +10180,25 @@ private func validateAttentionLayout(
             "packed-word and bitset axes must be positive"
         )
     }
+    if layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion {
+        guard layout.capacity % 32 == 0 else {
+            throw TurboQuantError.invalidMetalConfiguration(
+                "layout v7 requires capacity to be a multiple of 32; got \(layout.capacity)"
+            )
+        }
+    }
 }
 
-private func validateAttentionCodeStorage(_ code: TurboQuantAttentionCode) throws {
-    try validateAttentionLayout(code.layout, role: code.role, groupSize: code.groupSize)
+private func validateAttentionCodeStorage(
+    _ code: TurboQuantAttentionCode,
+    allowTileTransposedV7: Bool = false
+) throws {
+    try validateAttentionLayout(
+        code.layout,
+        role: code.role,
+        groupSize: code.groupSize,
+        allowTileTransposedV7: allowTileTransposedV7
+    )
     if code.role == .value {
         try validateTurboQuantValueBits(code.valueBits)
     }
@@ -10021,11 +10299,15 @@ private func validateAttentionQuery(
 
 private func validateAttentionPair(
     keyCode: TurboQuantAttentionCode,
-    valueCode: TurboQuantAttentionCode
+    valueCode: TurboQuantAttentionCode,
+    allowTileTransposedV7: Bool = false
 ) throws {
-    try validateAttentionLayout(keyCode.layout, role: keyCode.role, groupSize: keyCode.groupSize)
     try validateAttentionLayout(
-        valueCode.layout, role: valueCode.role, groupSize: valueCode.groupSize)
+        keyCode.layout, role: keyCode.role, groupSize: keyCode.groupSize,
+        allowTileTransposedV7: allowTileTransposedV7)
+    try validateAttentionLayout(
+        valueCode.layout, role: valueCode.role, groupSize: valueCode.groupSize,
+        allowTileTransposedV7: allowTileTransposedV7)
     guard keyCode.role == .key, valueCode.role == .value else {
         throw TurboQuantError.invalidMetalConfiguration(
             "compressed attention requires key and value codes")
@@ -10269,7 +10551,7 @@ private func runtimeLayoutAttentionTemplate(
 
 private enum TurboQuantMetalKernels {
     static let encode = MLXFast.metalKernel(
-        name: "turboquant_polar_qjl_encode",
+        name: "turboquant_polar_qjl_encode_s2",
         inputNames: ["x"],
         outputNames: ["packed", "signs", "high_mask", "residual_signs", "scales"],
         source: encodeSource,
@@ -10293,7 +10575,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let encodeAttention = MLXFast.metalKernel(
-        name: "turboquant_attention_encode",
+        name: "turboquant_attention_encode_s2",
         inputNames: ["x"],
         outputNames: ["packed", "signs", "high_mask", "residual_signs", "scales"],
         source: encodeAttentionSource,
@@ -10301,8 +10583,20 @@ private enum TurboQuantMetalKernels {
         ensureRowContiguous: false
     )
 
+    // Layout v7 (tile-transposed): swizzles K packed/signs/scales writes onto the
+    // 32-token tile layout. V planes stay token-major (v6 format) even at v7; see
+    // SPEC 2 section 4.
+    static let encodeAttentionV7 = MLXFast.metalKernel(
+        name: "turboquant_attention_encode_s2_v7",
+        inputNames: ["x"],
+        outputNames: ["packed", "signs", "high_mask", "residual_signs", "scales"],
+        source: encodeAttentionV7Source,
+        header: attentionHeader + attentionHeaderV7Extension,
+        ensureRowContiguous: false
+    )
+
     static let decodeAttention = MLXFast.metalKernel(
-        name: "turboquant_attention_decode_runtime_layout",
+        name: "turboquant_attention_decode_runtime_layout_s2",
         inputNames: [
             "packed", "signs", "high_mask", "residual_signs", "scales",
             "runtime_logical_length",
@@ -10316,7 +10610,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let keyPageSummary = MLXFast.metalKernel(
-        name: "turboquant_attention_key_page_summary_runtime_layout",
+        name: "turboquant_attention_key_page_summary_runtime_layout_s2",
         inputNames: [
             "scales",
             "runtime_logical_length",
@@ -10330,7 +10624,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let qk = MLXFast.metalKernel(
-        name: "turboquant_attention_qk_runtime_layout",
+        name: "turboquant_attention_qk_runtime_layout_s2",
         inputNames: [
             "q", "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
             "runtime_logical_length",
@@ -10345,7 +10639,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let polarWHTEncodeAttention = MLXFast.metalKernel(
-        name: "turboquant_polar_wht_attention_encode",
+        name: "turboquant_polar_wht_attention_encode_s2",
         inputNames: ["x"],
         outputNames: ["packed_indices", "norms"],
         source: polarWHTEncodeAttentionSource,
@@ -10354,7 +10648,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let polarWHTEncodeAttentionBulk = MLXFast.metalKernel(
-        name: "turboquant_polar_wht_attention_encode_bulk",
+        name: "turboquant_polar_wht_attention_encode_bulk_s2",
         inputNames: ["x"],
         outputNames: ["packed_indices", "norms"],
         source: polarWHTEncodeAttentionBulkSource,
@@ -10363,7 +10657,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8PolarWHTValueEncode = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_polar_wht_value_encode",
+        name: "turboquant_hybrid_affine_k8_polar_wht_value_encode_s2",
         inputNames: ["keys", "values"],
         outputNames: [
             "key_packed", "key_scales", "key_biases",
@@ -10375,7 +10669,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8PolarWHTValueEncodeBulk = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_polar_wht_value_encode_bulk",
+        name: "turboquant_hybrid_affine_k8_polar_wht_value_encode_bulk_s2",
         inputNames: ["keys", "values"],
         outputNames: [
             "key_packed", "key_scales", "key_biases",
@@ -10387,7 +10681,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let polarWHTDecodeAttention = MLXFast.metalKernel(
-        name: "turboquant_polar_wht_attention_decode_runtime_layout",
+        name: "turboquant_polar_wht_attention_decode_runtime_layout_s2",
         inputNames: [
             "packed_indices", "norms",
             "runtime_logical_length",
@@ -10401,7 +10695,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let polarWHTQK = MLXFast.metalKernel(
-        name: "turboquant_polar_wht_attention_qk_runtime_layout",
+        name: "turboquant_polar_wht_attention_qk_runtime_layout_s2",
         inputNames: [
             "q", "k_packed_indices", "k_norms",
             "runtime_logical_length",
@@ -10416,7 +10710,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let av = MLXFast.metalKernel(
-        name: "turboquant_attention_av_runtime_layout",
+        name: "turboquant_attention_av_runtime_layout_s2",
         inputNames: [
             "weights", "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
             "runtime_logical_length",
@@ -10430,7 +10724,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let polarWHTAV = MLXFast.metalKernel(
-        name: "turboquant_polar_wht_attention_av_runtime_layout",
+        name: "turboquant_polar_wht_attention_av_runtime_layout_s2",
         inputNames: [
             "weights", "v_packed_indices", "v_norms",
             "runtime_logical_length",
@@ -10444,7 +10738,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridPolarWHTValueFusedAttention = MLXFast.metalKernel(
-        name: "turboquant_hybrid_polar_wht_value_fused_decode_runtime_layout",
+        name: "turboquant_hybrid_polar_wht_value_fused_decode_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10461,7 +10755,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridPolarWHTValueFusedBlockPartials = MLXFast.metalKernel(
-        name: "turboquant_hybrid_polar_wht_value_fused_block_partials_runtime_layout",
+        name: "turboquant_hybrid_polar_wht_value_fused_block_partials_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10478,7 +10772,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridPolarWHTValueGQAFusedBlockPartials = MLXFast.metalKernel(
-        name: "turboquant_hybrid_polar_wht_value_fused_gqa_block_partials_runtime_layout",
+        name: "turboquant_hybrid_polar_wht_value_fused_gqa_block_partials_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10495,7 +10789,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridPolarWHTValueFusedBlockReduce = MLXFast.metalKernel(
-        name: "turboquant_hybrid_polar_wht_value_fused_block_reduce",
+        name: "turboquant_hybrid_polar_wht_value_fused_block_reduce_s2",
         inputNames: ["partial_stats", "partial_out"],
         outputNames: ["out"],
         source: hybridPolarWHTValueFusedBlockReduceSource,
@@ -10504,7 +10798,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8PolarWHTValueFusedAttention = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_polar_wht_value_fused_decode_runtime_layout",
+        name: "turboquant_hybrid_affine_k8_polar_wht_value_fused_decode_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_scales", "k_biases",
@@ -10521,7 +10815,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let segmentedHybridAffineK8PolarWHTValueFusedAttention = MLXFast.metalKernel(
-        name: "turboquant_segmented_hybrid_affine_k8_polar_wht_value_fused_decode",
+        name: "turboquant_segmented_hybrid_affine_k8_polar_wht_value_fused_decode_s2",
         inputNames: [
             "q",
             "base_k_packed", "base_k_scales", "base_k_biases",
@@ -10543,7 +10837,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8DecodedValueFusedAttention = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_decoded_value_fused_decode",
+        name: "turboquant_hybrid_affine_k8_decoded_value_fused_decode_s2",
         inputNames: [
             "q",
             "k_packed", "k_scales", "k_biases",
@@ -10560,7 +10854,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8DecodedValueFusedBlockPartials = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_decoded_value_fused_block_partials",
+        name: "turboquant_hybrid_affine_k8_decoded_value_fused_block_partials_s2",
         inputNames: [
             "q",
             "k_packed", "k_scales", "k_biases",
@@ -10577,7 +10871,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridDecodedValueFusedBlockReduce = MLXFast.metalKernel(
-        name: "turboquant_hybrid_decoded_value_fused_block_reduce",
+        name: "turboquant_hybrid_decoded_value_fused_block_reduce_s2",
         inputNames: ["partial_stats", "partial_out"],
         outputNames: ["out"],
         source: hybridDecodedValueFusedBlockReduceSource,
@@ -10586,7 +10880,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8PolarWHTValueFusedBlockPartials = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_polar_wht_value_fused_block_partials_runtime_layout",
+        name: "turboquant_hybrid_affine_k8_polar_wht_value_fused_block_partials_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_scales", "k_biases",
@@ -10603,7 +10897,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let hybridAffineK8PolarWHTValueGQAFusedBlockPartials = MLXFast.metalKernel(
-        name: "turboquant_hybrid_affine_k8_polar_wht_value_fused_gqa_block_partials_runtime_layout",
+        name: "turboquant_hybrid_affine_k8_polar_wht_value_fused_gqa_block_partials_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_scales", "k_biases",
@@ -10620,7 +10914,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let fusedAttention = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_decode_runtime_layout",
+        name: "turboquant_attention_fused_decode_runtime_layout_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10637,7 +10931,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let fusedAttentionBlockPartials = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_block_partials_runtime_layout",
+        name: "turboquant_attention_fused_block_partials_runtime_layout_rtu1_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10646,6 +10940,7 @@ private enum TurboQuantMetalKernels {
             "runtime_ring_offset",
             "runtime_pinned_prefix_length",
             "runtime_attention_scale",
+            "runtime_block_count",
         ],
         outputNames: ["partial_stats", "partial_out"],
         source: fusedAttentionBlockPartialsSource,
@@ -10654,7 +10949,7 @@ private enum TurboQuantMetalKernels {
     )
 
     static let fusedAttentionGQABlockPartials = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_gqa_block_partials_runtime_layout",
+        name: "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10663,10 +10958,32 @@ private enum TurboQuantMetalKernels {
             "runtime_ring_offset",
             "runtime_pinned_prefix_length",
             "runtime_attention_scale",
+            "runtime_block_count",
         ],
         outputNames: ["partial_stats", "partial_out"],
         source: fusedAttentionGQABlockPartialsSource,
         header: attentionHeader,
+        ensureRowContiguous: false
+    )
+
+    // Layout v7 (tile-transposed): strided GQA block-partials kernel bound to the
+    // v7-swizzled K planes. No coop variant exists for v7 (coop is excluded, see
+    // turboQuantCooperativeQuadDecodeActive). See SPEC 2 section 3.
+    static let fusedAttentionGQABlockPartialsV7 = MLXFast.metalKernel(
+        name: "turboquant_attention_fused_gqa_block_partials_runtime_layout_rtu1_s2_v7",
+        inputNames: [
+            "q",
+            "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
+            "v_packed", "v_signs", "v_high_mask", "v_residual_signs", "v_scales",
+            "runtime_logical_length",
+            "runtime_ring_offset",
+            "runtime_pinned_prefix_length",
+            "runtime_attention_scale",
+            "runtime_block_count",
+        ],
+        outputNames: ["partial_stats", "partial_out"],
+        source: fusedAttentionGQABlockPartialsV7Source,
+        header: attentionHeader + attentionHeaderV7Extension,
         ensureRowContiguous: false
     )
 
@@ -10675,7 +10992,7 @@ private enum TurboQuantMetalKernels {
     // never shares a compiled-variant cache slot with the strided LANES_PER_TOKEN=1
     // kernel. Selected only when turboQuantCooperativeQuadDecodeActive() is true.
     static let fusedAttentionGQABlockPartialsCoop = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout",
+        name: "turboquant_attention_fused_gqa_block_partials_coop_runtime_layout_rtu1_s2",
         inputNames: [
             "q",
             "k_packed", "k_signs", "k_high_mask", "k_residual_signs", "k_scales",
@@ -10684,6 +11001,7 @@ private enum TurboQuantMetalKernels {
             "runtime_ring_offset",
             "runtime_pinned_prefix_length",
             "runtime_attention_scale",
+            "runtime_block_count",
         ],
         outputNames: ["partial_stats", "partial_out"],
         source: fusedAttentionGQABlockPartialsSource,
@@ -10692,8 +11010,8 @@ private enum TurboQuantMetalKernels {
     )
 
     static let fusedAttentionBlockReduce = MLXFast.metalKernel(
-        name: "turboquant_attention_fused_block_reduce",
-        inputNames: ["partial_stats", "partial_out"],
+        name: "turboquant_attention_fused_block_reduce_rtu1_s2",
+        inputNames: ["partial_stats", "partial_out", "runtime_block_count"],
         outputNames: ["out"],
         source: fusedAttentionBlockReduceSource,
         header: attentionHeader,
@@ -10701,8 +11019,8 @@ private enum TurboQuantMetalKernels {
     )
 
     static let segmentedRawAttentionStats = MLXFast.metalKernel(
-        name: "turboquant_segmented_raw_attention_stats",
-        inputNames: ["q", "k", "v", "runtime_attention_scale"],
+        name: "turboquant_segmented_raw_attention_stats_rtu1_s2",
+        inputNames: ["q", "k", "v", "runtime_attention_scale", "runtime_raw_length"],
         outputNames: ["partial_stats", "partial_out"],
         source: segmentedRawAttentionStatsSource,
         header: attentionHeader,
@@ -11317,7 +11635,6 @@ private enum TurboQuantMetalKernels {
         uint scale_base = group_id * uint(SCALES_PER_GROUP);
         scales[scale_base] = norm;
         scales[scale_base + 1] = 0.0f;
-        scales[scale_base + 2] = 0.0f;
 
         uint bitset_base = group_id * BITSET_WORDS_PER_GROUP;
         for (uint word = 0; word < BITSET_WORDS_PER_GROUP; word++) {
@@ -11957,7 +12274,7 @@ private enum TurboQuantMetalKernels {
             uint groups_per_vector
         ) {
             return ((((batch * kv_heads + head) * capacity + token)
-                * groups_per_vector + group) * 3u) + scale_index;
+                * groups_per_vector + group) * 2u) + scale_index;
         }
 
         inline uint tq_physical_token(
@@ -12683,6 +13000,457 @@ private enum TurboQuantMetalKernels {
         }
         """
 
+    private static let attentionHeaderV7Extension = """
+        inline uint tq_packed_offset_v7(
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint word,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint words_per_token = groups_per_vector * mag_words_per_group;
+            uint plane_base = (batch * kv_heads + head) * capacity * words_per_token;
+            uint tile_base = plane_base + (token & ~31u) * words_per_token;
+            return tile_base + ((group * mag_words_per_group + word) << 5) + (token & 31u);
+        }
+
+        inline uint tq_bitset_offset_v7(
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint word,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint bitset_words_per_group
+        ) {
+            uint words_per_token = groups_per_vector * bitset_words_per_group;
+            uint plane_base = (batch * kv_heads + head) * capacity * words_per_token;
+            uint tile_base = plane_base + (token & ~31u) * words_per_token;
+            return tile_base + ((group * bitset_words_per_group + word) << 5) + (token & 31u);
+        }
+
+        inline uint tq_scale_offset_v7(
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint scale_index,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector
+        ) {
+            uint scales_per_token = groups_per_vector * 2u;
+            uint plane_base = (batch * kv_heads + head) * capacity * scales_per_token;
+            uint tile_base = plane_base + (token & ~31u) * scales_per_token;
+            return tile_base + ((group * 2u + scale_index) << 5) + (token & 31u);
+        }
+
+        template <typename PackedPtr>
+        inline uint tq_read_packed_unsigned_v7(
+            PackedPtr packed,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint bit_offset,
+            uint bits,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint packed_word = bit_offset >> 5;
+            uint packed_bit = bit_offset & 31u;
+            uint first = packed[tq_packed_offset_v7(
+                batch, head, token, group, packed_word,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group)] >> packed_bit;
+            if (packed_bit + bits > 32u) {
+                uint next = packed[tq_packed_offset_v7(
+                    batch, head, token, group, packed_word + 1u,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group)];
+                first |= next << (32u - packed_bit);
+            }
+            return first & ((1u << bits) - 1u);
+        }
+
+        template <typename PackedPtr>
+        inline void tq_write_packed_unsigned_v7(
+            PackedPtr packed,
+            uint quantized,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            uint bit_offset,
+            uint bits,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group
+        ) {
+            uint packed_word = bit_offset >> 5;
+            uint packed_bit = bit_offset & 31u;
+            uint mask = ((1u << bits) - 1u);
+            uint value = quantized & mask;
+            packed[tq_packed_offset_v7(
+                batch, head, token, group, packed_word,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
+                value << packed_bit;
+            if (packed_bit + bits > 32u) {
+                packed[tq_packed_offset_v7(
+                    batch, head, token, group, packed_word + 1u,
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group)] |=
+                    value >> (32u - packed_bit);
+            }
+        }
+
+        template <
+            typename PackedPtr,
+            typename SignsPtr,
+            typename HighMaskPtr,
+            typename ResidualSignsPtr,
+            typename ScalesPtr
+        >
+        inline void tq_product_attention_inner_product_group_pair_v7(
+            PackedPtr packed,
+            SignsPtr signs,
+            HighMaskPtr high_mask,
+            ResidualSignsPtr residual_signs,
+            ScalesPtr scales,
+            thread float* query_values,
+            thread float* scores,
+            uint pair_repeats,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            ulong seed,
+            uint group_size,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group,
+            uint bitset_words_per_group,
+            uint key_base_bits,
+            uint key_high_bits,
+            uint layout_version,
+            uint head_dim,
+            uint high_count,
+            bool query_prerotated
+        ) {
+            uint group_start = group * group_size;
+            uint count = min(group_size, head_dim - group_start);
+            uint storage_group = tq_storage_group_index(
+                batch, head, token, group, kv_heads, capacity, groups_per_vector);
+            uint repeats = min(pair_repeats, 2u);
+
+            if (!query_prerotated) {
+                for (uint repeat = 0u; repeat < repeats; repeat++) {
+                    tq_apply_product_rotation(
+                        query_values + repeat * group_size, count, seed, storage_group, false);
+                }
+            }
+
+            float quantized_dot[2];
+            float sign_dot[2];
+            quantized_dot[0] = 0.0f;
+            quantized_dot[1] = 0.0f;
+            sign_dot[0] = 0.0f;
+            sign_dot[1] = 0.0f;
+            // TQPROF_OPT/OPT2/OPT3 packed-word caches (hoisted base + base-stream slot + extra-bit
+            // slot), mirroring the quad estimator so all three decode branches avoid per-element
+            // packed reloads.
+            uint tqopt_packed_base = tq_packed_offset_v7(
+                batch, head, token, group, 0u,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
+            uint tqopt_cached_idx = 0xffffffffu;
+            uint tqopt_cached_val = 0u;
+            uint tqopt_extra_idx = 0xffffffffu;
+            uint tqopt_extra_val = 0u;
+            uint cached_bitset_word = 0xffffffffu;
+            uint cached_sign_bits = 0u;
+            uint cached_high_word = 0xffffffffu;
+            uint cached_high_bits = 0u;
+            uint bit_offset = 0u;
+            bool split_magnitude =
+                layout_version >= 6u
+                && key_high_bits == key_base_bits + 1u
+                && key_high_bits > key_base_bits;
+            float inv_sqrt_count = rsqrt(float(max(count, 1u)));
+
+            for (uint local = 0u; local < count; local++) {
+                uint bitset_word = local >> 5;
+                uint bitset_bit = local & 31u;
+                uint bit_mask = 1u << bitset_bit;
+                if (bitset_word != cached_bitset_word) {
+                    cached_bitset_word = bitset_word;
+                    cached_sign_bits = signs[tq_bitset_offset_v7(
+                        batch, head, token, group, bitset_word,
+                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                }
+                uint bits = key_base_bits;
+                uint code = 0u;
+                if (split_magnitude) {
+                    bool high_precision = tq_split_high_precision(local, high_count);
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    // TQPROF_OPT3 split-magnitude fast path: cache the base-bits stream (offset
+                    // local*key_base_bits, uniform stride) and the high-precision extra-bit stream
+                    // (offset group_size*key_base_bits+local, stride 1) in two slots, instead of the
+                    // two per-element tq_read_packed_unsigned reloads. Bit-exact. This is the live
+                    // turbo3_5 path (verified by negation litmus).
+                    uint base_bo = local * key_base_bits;
+                    uint base_pw = base_bo >> 5;
+                    uint base_pbit = base_bo & 31u;
+                    if (base_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = base_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (base_pw << 5)];
+                    }
+                    uint base_asm = tqopt_cached_val >> base_pbit;
+                    if (base_pbit + key_base_bits > 32u) {
+                        base_asm |= packed[tqopt_packed_base + ((base_pw + 1u) << 5)] << (32u - base_pbit);
+                    }
+                    code = base_asm & ((1u << key_base_bits) - 1u);
+                    if (high_precision) {
+                        uint extra_bits = key_high_bits - key_base_bits;
+                        uint extra_bo = group_size * key_base_bits + local;
+                        uint extra_pw = extra_bo >> 5;
+                        uint extra_pbit = extra_bo & 31u;
+                        if (extra_pw != tqopt_extra_idx) {
+                            tqopt_extra_idx = extra_pw;
+                            tqopt_extra_val = packed[tqopt_packed_base + (extra_pw << 5)];
+                        }
+                        uint extra_asm = tqopt_extra_val >> extra_pbit;
+                        if (extra_pbit + extra_bits > 32u) {
+                            extra_asm |= packed[tqopt_packed_base + ((extra_pw + 1u) << 5)] << (32u - extra_pbit);
+                        }
+                        uint extra_code = extra_asm & ((1u << extra_bits) - 1u);
+                        code |= extra_code << key_base_bits;
+                    }
+                } else if (key_high_bits > key_base_bits) {
+                    if (bitset_word != cached_high_word) {
+                        cached_high_word = bitset_word;
+                        cached_high_bits = high_mask[tq_bitset_offset_v7(
+                            batch, head, token, group, bitset_word,
+                            kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                    }
+                    bool high_precision = (cached_high_bits & bit_mask) != 0u;
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    code = tq_read_packed_unsigned_v7(
+                        packed, batch, head, token, group, bit_offset, bits,
+                        kv_heads, capacity, groups_per_vector, mag_words_per_group);
+                    bit_offset += bits;
+                } else {
+                    code = tq_read_packed_unsigned_v7(
+                        packed, batch, head, token, group, bit_offset, bits,
+                        kv_heads, capacity, groups_per_vector, mag_words_per_group);
+                    bit_offset += bits;
+                }
+                float level = tq_codebook_unit(bits, code) * inv_sqrt_count;
+                float qjl_sign = (cached_sign_bits & bit_mask) != 0u ? -1.0f : 1.0f;
+                for (uint repeat = 0u; repeat < repeats; repeat++) {
+                    float query_value = query_values[repeat * group_size + local];
+                    quantized_dot[repeat] += query_value * level;
+                    sign_dot[repeat] += qjl_sign * query_value;
+                }
+            }
+
+            float norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)];
+            float residual_norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)];
+            float residual_scale = residual_norm * sqrt(3.14159265358979323846f / (2.0f * float(count)));
+            for (uint repeat = 0u; repeat < repeats; repeat++) {
+                scores[repeat] += norm * quantized_dot[repeat] + residual_scale * sign_dot[repeat];
+            }
+        }
+
+        template <
+            typename PackedPtr,
+            typename SignsPtr,
+            typename HighMaskPtr,
+            typename ResidualSignsPtr,
+            typename ScalesPtr
+        >
+        inline void tq_product_attention_inner_product_group_quad_v7(
+            PackedPtr packed,
+            SignsPtr signs,
+            HighMaskPtr high_mask,
+            ResidualSignsPtr residual_signs,
+            ScalesPtr scales,
+            thread float* query_values,
+            thread float* scores,
+            uint batch,
+            uint head,
+            uint token,
+            uint group,
+            ulong seed,
+            uint group_size,
+            uint kv_heads,
+            uint capacity,
+            uint groups_per_vector,
+            uint mag_words_per_group,
+            uint bitset_words_per_group,
+            uint key_base_bits,
+            uint key_high_bits,
+            uint layout_version,
+            uint head_dim,
+            uint high_count,
+            bool query_prerotated
+        ) {
+            uint group_start = group * group_size;
+            uint count = min(group_size, head_dim - group_start);
+            uint storage_group = tq_storage_group_index(
+                batch, head, token, group, kv_heads, capacity, groups_per_vector);
+
+            if (!query_prerotated) {
+                for (uint repeat = 0u; repeat < 4u; repeat++) {
+                    tq_apply_product_rotation(
+                        query_values + repeat * group_size, count, seed, storage_group, false);
+                }
+            }
+
+            float quantized_dot[4];
+            float sign_dot[4];
+            for (uint repeat = 0u; repeat < 4u; repeat++) {
+                quantized_dot[repeat] = 0.0f;
+                sign_dot[repeat] = 0.0f;
+            }
+            // TQPROF_OPT hoist invariant packed base + cache packed word across uniform codes
+            uint tqopt_packed_base = tq_packed_offset_v7(
+                batch, head, token, group, 0u,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
+            uint tqopt_cached_idx = 0xffffffffu;
+            uint tqopt_cached_val = 0u;
+            // Second cache slot for the split-magnitude high-precision (extra-bit) stream, which
+            // lives in a separate region of the packed buffer from the base-bits stream.
+            uint tqopt_extra_idx = 0xffffffffu;
+            uint tqopt_extra_val = 0u;
+            uint cached_bitset_word = 0xffffffffu;
+            uint cached_sign_bits = 0u;
+            uint cached_high_word = 0xffffffffu;
+            uint cached_high_bits = 0u;
+            uint bit_offset = 0u;
+            bool split_magnitude =
+                layout_version >= 6u
+                && key_high_bits == key_base_bits + 1u
+                && key_high_bits > key_base_bits;
+            float inv_sqrt_count = rsqrt(float(max(count, 1u)));
+
+            for (uint local = 0u; local < count; local++) {
+                uint bitset_word = local >> 5;
+                uint bitset_bit = local & 31u;
+                uint bit_mask = 1u << bitset_bit;
+                if (bitset_word != cached_bitset_word) {
+                    cached_bitset_word = bitset_word;
+                    cached_sign_bits = signs[tq_bitset_offset_v7(
+                        batch, head, token, group, bitset_word,
+                        kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                }
+                uint bits = key_base_bits;
+                uint code = 0u;
+                if (split_magnitude) {
+                    bool high_precision = tq_split_high_precision(local, high_count);
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    // TQPROF_OPT3 split-magnitude fast path: cache the base-bits stream (offset
+                    // local*key_base_bits, uniform stride) and the high-precision extra-bit stream
+                    // (offset group_size*key_base_bits+local, stride 1) in two slots, instead of the
+                    // two per-element tq_read_packed_unsigned reloads. Bit-exact. This is the live
+                    // turbo3_5 path (verified by negation litmus).
+                    uint base_bo = local * key_base_bits;
+                    uint base_pw = base_bo >> 5;
+                    uint base_pbit = base_bo & 31u;
+                    if (base_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = base_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (base_pw << 5)];
+                    }
+                    uint base_asm = tqopt_cached_val >> base_pbit;
+                    if (base_pbit + key_base_bits > 32u) {
+                        base_asm |= packed[tqopt_packed_base + ((base_pw + 1u) << 5)] << (32u - base_pbit);
+                    }
+                    code = base_asm & ((1u << key_base_bits) - 1u);
+                    if (high_precision) {
+                        uint extra_bits = key_high_bits - key_base_bits;
+                        uint extra_bo = group_size * key_base_bits + local;
+                        uint extra_pw = extra_bo >> 5;
+                        uint extra_pbit = extra_bo & 31u;
+                        if (extra_pw != tqopt_extra_idx) {
+                            tqopt_extra_idx = extra_pw;
+                            tqopt_extra_val = packed[tqopt_packed_base + (extra_pw << 5)];
+                        }
+                        uint extra_asm = tqopt_extra_val >> extra_pbit;
+                        if (extra_pbit + extra_bits > 32u) {
+                            extra_asm |= packed[tqopt_packed_base + ((extra_pw + 1u) << 5)] << (32u - extra_pbit);
+                        }
+                        uint extra_code = extra_asm & ((1u << extra_bits) - 1u);
+                        code |= extra_code << key_base_bits;
+                    }
+                } else if (key_high_bits > key_base_bits) {
+                    if (bitset_word != cached_high_word) {
+                        cached_high_word = bitset_word;
+                        cached_high_bits = high_mask[tq_bitset_offset_v7(
+                            batch, head, token, group, bitset_word,
+                            kv_heads, capacity, groups_per_vector, bitset_words_per_group)];
+                    }
+                    bool high_precision = (cached_high_bits & bit_mask) != 0u;
+                    bits = high_precision ? key_high_bits : key_base_bits;
+                    // TQPROF_OPT2 variable-bit fast path: reuse the same packed-word cache as the
+                    // uniform branch. Valid because bit_offset advances monotonically over a single
+                    // contiguous magnitude bitstream even though `bits` varies per element, so
+                    // consecutive variable-width codes still share 32-bit words. Removes the
+                    // per-element packed reload that tq_read_packed_unsigned did (turbo3_5 path).
+                    uint tqopt_pw = bit_offset >> 5;
+                    uint tqopt_pbit = bit_offset & 31u;
+                    if (tqopt_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = tqopt_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (tqopt_pw << 5)];
+                    }
+                    uint tqopt_asm = tqopt_cached_val >> tqopt_pbit;
+                    if (tqopt_pbit + bits > 32u) {
+                        tqopt_asm |= packed[tqopt_packed_base + ((tqopt_pw + 1u) << 5)] << (32u - tqopt_pbit);
+                    }
+                    code = tqopt_asm & ((1u << bits) - 1u);
+                    bit_offset += bits;
+                } else {
+                    // TQPROF_OPT cached uniform-width packed read (1 load per 32/bits codes)
+                    uint tqopt_pw = bit_offset >> 5;
+                    uint tqopt_pbit = bit_offset & 31u;
+                    if (tqopt_pw != tqopt_cached_idx) {
+                        tqopt_cached_idx = tqopt_pw;
+                        tqopt_cached_val = packed[tqopt_packed_base + (tqopt_pw << 5)];
+                    }
+                    uint tqopt_asm = tqopt_cached_val >> tqopt_pbit;
+                    if (tqopt_pbit + bits > 32u) {
+                        tqopt_asm |= packed[tqopt_packed_base + ((tqopt_pw + 1u) << 5)] << (32u - tqopt_pbit);
+                    }
+                    code = tqopt_asm & ((1u << bits) - 1u);
+                    bit_offset += bits;
+                }
+                float level = tq_codebook_unit(bits, code) * inv_sqrt_count;
+                float qjl_sign = (cached_sign_bits & bit_mask) != 0u ? -1.0f : 1.0f;
+                for (uint repeat = 0u; repeat < 4u; repeat++) {
+                    float query_value = query_values[repeat * group_size + local];
+                    quantized_dot[repeat] += query_value * level;
+                    sign_dot[repeat] += qjl_sign * query_value;
+                }
+            }
+
+            float norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)];
+            float residual_norm = scales[tq_scale_offset_v7(
+                batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)];
+            float residual_scale = residual_norm * sqrt(3.14159265358979323846f / (2.0f * float(count)));
+            for (uint repeat = 0u; repeat < 4u; repeat++) {
+                scores[repeat] += norm * quantized_dot[repeat] + residual_scale * sign_dot[repeat];
+            }
+        }
+        """
+
     private static let polarWHTAttentionHeader = attentionHeader + """
 
         inline float tq_polar_wht_centroid(uint bits, uint code) {
@@ -12927,7 +13695,6 @@ private enum TurboQuantMetalKernels {
 
         scales[tq_scale_offset(batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)] = norm;
         scales[tq_scale_offset(batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)] = 0.0f;
-        scales[tq_scale_offset(batch, head, token, group, 2u, kv_heads, capacity, groups_per_vector)] = 0.0f;
 
         bool split_magnitude =
             uint(LAYOUT_VERSION) >= 6u
@@ -12990,6 +13757,165 @@ private enum TurboQuantMetalKernels {
             bit_offset += storage_bits;
         }
         scales[tq_scale_offset(batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)] =
+            norm * sqrt(residual_squared);
+        """
+
+    private static let encodeAttentionV7Source = """
+        uint row_group_id = thread_position_in_grid.x;
+        uint kv_heads = uint(KV_HEADS);
+        uint capacity = uint(CAPACITY);
+        uint groups_per_vector = uint(GROUPS_PER_VECTOR);
+        uint mag_words_per_group = uint(MAG_WORDS_PER_GROUP);
+        uint bitset_words_per_group = uint(BITSET_WORDS_PER_GROUP);
+        uint total = uint(BATCH_SIZE) * kv_heads * uint(INPUT_LENGTH) * groups_per_vector;
+        if (row_group_id >= total) {
+            return;
+        }
+
+        uint group = row_group_id % groups_per_vector;
+        uint token = (row_group_id / groups_per_vector) % uint(INPUT_LENGTH);
+        uint head = (row_group_id / (groups_per_vector * uint(INPUT_LENGTH))) % kv_heads;
+        uint batch = row_group_id / (groups_per_vector * uint(INPUT_LENGTH) * kv_heads);
+        if (token >= capacity) {
+            return;
+        }
+
+        uint group_start = group * uint(GROUP_SIZE);
+        uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
+        if (ROLE == 1) {
+            float minimum = INFINITY;
+            float maximum = -INFINITY;
+            for (uint local = 0; local < count; local++) {
+                uint dimension = group_start + local;
+                long input_index =
+                    long(batch) * x_strides[0]
+                    + long(head) * x_strides[1]
+                    + long(token) * x_strides[2]
+                    + long(dimension) * x_strides[3];
+                float value = float(x[input_index]);
+                minimum = min(minimum, value);
+                maximum = max(maximum, value);
+            }
+
+            float value_max = float((1 << VALUE_BITS) - 1);
+            float range = maximum - minimum;
+            float value_scale = range > 1.17549435e-38f ? range / value_max : 0.0f;
+            uint scale_base = ((((batch * kv_heads + head) * capacity + token)
+                * groups_per_vector + group) * 2u);
+            scales[scale_base] = value_scale;
+            scales[scale_base + 1u] = minimum;
+
+            for (uint word = 0; word < mag_words_per_group; word++) {
+                packed[tq_packed_offset(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, mag_words_per_group)] = 0u;
+            }
+            for (uint local = 0; local < count; local++) {
+                uint dimension = group_start + local;
+                long input_index =
+                    long(batch) * x_strides[0]
+                    + long(head) * x_strides[1]
+                    + long(token) * x_strides[2]
+                    + long(dimension) * x_strides[3];
+                float value = float(x[input_index]);
+                uint quantized = value_scale == 0.0f
+                    ? 0u
+                    : uint(clamp(round((value - minimum) / value_scale), 0.0f, value_max));
+                uint bit_offset = local * uint(VALUE_BITS);
+                tq_write_packed_unsigned(
+                    packed, quantized, batch, head, token, group, bit_offset, uint(VALUE_BITS),
+                    kv_heads, capacity, groups_per_vector, mag_words_per_group);
+            }
+            return;
+        }
+
+        thread float values[GROUP_SIZE];
+        ulong seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
+        uint storage_group = tq_storage_group_index(
+            batch, head, token, group, kv_heads, capacity, groups_per_vector);
+        float norm_squared = 0.0f;
+
+        for (uint local = 0; local < count; local++) {
+            uint dimension = group_start + local;
+            long input_index =
+                long(batch) * x_strides[0]
+                + long(head) * x_strides[1]
+                + long(token) * x_strides[2]
+                + long(dimension) * x_strides[3];
+            float value = float(x[input_index]);
+            values[local] = value;
+            norm_squared += value * value;
+        }
+
+        float norm = sqrt(norm_squared);
+        float inv_norm = norm > 1.17549435e-38f ? 1.0f / norm : 0.0f;
+        for (uint local = 0; local < count; local++) {
+            values[local] *= inv_norm;
+        }
+        tq_apply_product_rotation(values, count, seed, storage_group, false);
+
+        scales[tq_scale_offset_v7(batch, head, token, group, 0u, kv_heads, capacity, groups_per_vector)] = norm;
+        scales[tq_scale_offset_v7(batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)] = 0.0f;
+
+        bool split_magnitude =
+            uint(LAYOUT_VERSION) >= 6u
+            && uint(KEY_HIGH_BITS) == uint(KEY_BASE_BITS) + 1u
+            && uint(KEY_HIGH_BITS) > uint(KEY_BASE_BITS);
+        for (uint word = 0; word < bitset_words_per_group; word++) {
+            signs[tq_bitset_offset_v7(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, bitset_words_per_group)] = 0u;
+            if (!split_magnitude && uint(KEY_HIGH_BITS) > uint(KEY_BASE_BITS)) {
+                high_mask[tq_bitset_offset_v7(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, bitset_words_per_group)] = 0u;
+            }
+        }
+        for (uint word = 0; word < mag_words_per_group; word++) {
+            packed[tq_packed_offset_v7(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, mag_words_per_group)] = 0u;
+        }
+
+        uint high_count = uint(round(float(count * uint(HIGH_NUMERATOR)) / float(uint(HIGH_DENOMINATOR))));
+        float residual_squared = 0.0f;
+        uint bit_offset = 0u;
+        for (uint local = 0; local < count; local++) {
+            bool high_precision = false;
+            if (uint(KEY_HIGH_BITS) > uint(KEY_BASE_BITS) && high_count > 0u) {
+                high_precision = split_magnitude
+                    ? tq_split_high_precision(local, high_count)
+                    : bool(DETERMINISTIC_HIGH_MASK)
+                    ? tq_product_high_precision(seed, storage_group, local, count, high_count)
+                    : local < high_count;
+            }
+            uint bits = high_precision ? uint(KEY_HIGH_BITS) : uint(KEY_BASE_BITS);
+            uint quantized = tq_nearest_codebook_index(values[local], bits, count);
+            float reconstructed = tq_codebook_level(bits, quantized, count);
+
+            uint word = local >> 5;
+            uint bit = local & 31u;
+            uint mask = 1u << bit;
+            if (high_precision && !split_magnitude) {
+                high_mask[tq_bitset_offset_v7(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, bitset_words_per_group)] |= mask;
+            }
+            float residual = values[local] - reconstructed;
+            residual_squared += residual * residual;
+            if (residual < 0.0f) {
+                signs[tq_bitset_offset_v7(batch, head, token, group, word, kv_heads, capacity, groups_per_vector, bitset_words_per_group)] |= mask;
+            }
+
+            uint storage_bits = bits;
+            uint storage_code = quantized;
+            if (split_magnitude) {
+                storage_bits = uint(KEY_BASE_BITS);
+                storage_code = quantized & ((1u << uint(KEY_BASE_BITS)) - 1u);
+                if (high_precision && ((quantized >> uint(KEY_BASE_BITS)) & 1u) != 0u) {
+                    tq_write_packed_unsigned_v7(
+                        packed, 1u, batch, head, token, group,
+                        uint(GROUP_SIZE) * uint(KEY_BASE_BITS) + local,
+                        uint(KEY_HIGH_BITS) - uint(KEY_BASE_BITS),
+                        kv_heads, capacity, groups_per_vector, mag_words_per_group);
+                }
+            }
+            tq_write_packed_unsigned_v7(
+                packed, storage_code, batch, head, token, group, bit_offset, storage_bits,
+                kv_heads, capacity, groups_per_vector, mag_words_per_group);
+            bit_offset += storage_bits;
+        }
+        scales[tq_scale_offset_v7(batch, head, token, group, 1u, kv_heads, capacity, groups_per_vector)] =
             norm * sqrt(residual_squared);
         """
 
@@ -15066,10 +15992,11 @@ private enum TurboQuantMetalKernels {
 
     private static let fusedAttentionBlockPartialsSource = """
         constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
         uint lane = thread_position_in_threadgroup.x;
         uint group_index = threadgroup_position_in_grid.x;
-        uint block_index = group_index % uint(BLOCK_COUNT);
-        uint row = group_index / uint(BLOCK_COUNT);
+        uint block_index = group_index % block_count;
+        uint row = group_index / block_count;
         uint total_rows = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH);
         if (row >= total_rows) {
             return;
@@ -15093,12 +16020,12 @@ private enum TurboQuantMetalKernels {
         uint block_start = block_index * uint(BLOCK_TOKENS);
         if (DO_CAUSAL && block_start > causal_limit) {
             if (lane == 0u) {
-                uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+                uint stat_index = ((row * block_count + block_index) * 2u);
                 partial_stats[stat_index] = -INFINITY;
                 partial_stats[stat_index + 1u] = 0.0f;
             }
             if (lane < uint(HEAD_DIM)) {
-                uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
                 partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
             }
             return;
@@ -15172,7 +16099,7 @@ private enum TurboQuantMetalKernels {
         }
 
         if (lane == 0u) {
-            uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+            uint stat_index = ((row * block_count + block_index) * 2u);
             partial_stats[stat_index] = tile_max;
             partial_stats[stat_index + 1u] = partial[0];
         }
@@ -15195,18 +16122,19 @@ private enum TurboQuantMetalKernels {
                     dimension_accum += weight * value;
                 }
             }
-            uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+            uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
             partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum);
         }
         """
 
     private static let fusedAttentionGQABlockPartialsSource = """
         constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
         constexpr uint gqa_repeats = uint(GQA_REPEATS);
         uint lane = thread_position_in_threadgroup.x;
         uint group_index = threadgroup_position_in_grid.x;
-        uint block_index = group_index % uint(BLOCK_COUNT);
-        uint gqa_row = group_index / uint(BLOCK_COUNT);
+        uint block_index = group_index % block_count;
+        uint gqa_row = group_index / block_count;
         uint total_gqa_rows = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(QUERY_LENGTH);
         if (gqa_row >= total_gqa_rows) {
             return;
@@ -15236,7 +16164,7 @@ private enum TurboQuantMetalKernels {
                 for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                     uint q_head = kv_head * gqa_repeats + repeat;
                     uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                    uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+                    uint stat_index = ((row * block_count + block_index) * 2u);
                     partial_stats[stat_index] = -INFINITY;
                     partial_stats[stat_index + 1u] = 0.0f;
                 }
@@ -15245,7 +16173,7 @@ private enum TurboQuantMetalKernels {
                 for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                     uint q_head = kv_head * gqa_repeats + repeat;
                     uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                    uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+                    uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
                     partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
                 }
             }
@@ -15577,7 +16505,7 @@ private enum TurboQuantMetalKernels {
             for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                 uint q_head = kv_head * gqa_repeats + repeat;
                 uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                uint stat_index = ((row * uint(BLOCK_COUNT) + block_index) * 2u);
+                uint stat_index = ((row * block_count + block_index) * 2u);
                 uint score_base = repeat * threads_per_block;
                 partial_stats[stat_index] = tile_maxes[repeat];
                 partial_stats[stat_index + 1u] = partial[score_base];
@@ -15613,7 +16541,288 @@ private enum TurboQuantMetalKernels {
             for (uint repeat = 0u; repeat < repeat_count; repeat++) {
                 uint q_head = kv_head * gqa_repeats + repeat;
                 uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
-                uint out_index = ((row * uint(BLOCK_COUNT) + block_index) * uint(HEAD_DIM)) + lane;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum[repeat]);
+            }
+        }
+        """
+
+    private static let fusedAttentionGQABlockPartialsV7Source = """
+        constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
+        constexpr uint gqa_repeats = uint(GQA_REPEATS);
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint block_index = group_index % block_count;
+        uint gqa_row = group_index / block_count;
+        uint total_gqa_rows = uint(BATCH_SIZE) * uint(KV_HEADS) * uint(QUERY_LENGTH);
+        if (gqa_row >= total_gqa_rows) {
+            return;
+        }
+
+        // Sized to the actual threadgroup width (was a fixed 4*512 / 512) so threadgroup
+        // memory tracks the real block size — at blocks < 512 this frees enough threadgroup
+        // memory for multiple threadgroups to be resident per core, raising occupancy.
+        threadgroup float partial[4 * THREADS_PER_BLOCK];
+        threadgroup float tile_scores[4 * THREADS_PER_BLOCK];
+        threadgroup uint tile_has_weight[THREADS_PER_BLOCK];
+        threadgroup uint tile_physical_tokens[THREADS_PER_BLOCK];
+        threadgroup float query_cache[4 * HEAD_DIM];
+
+        uint logical_length = uint(runtime_logical_length);
+        uint ring_offset = uint(runtime_ring_offset);
+        uint pinned_prefix_length = uint(runtime_pinned_prefix_length);
+        float attention_scale = float(runtime_attention_scale);
+        uint q_token = gqa_row % uint(QUERY_LENGTH);
+        uint kv_head = (gqa_row / uint(QUERY_LENGTH)) % uint(KV_HEADS);
+        uint batch = gqa_row / (uint(QUERY_LENGTH) * uint(KV_HEADS));
+        uint causal_limit = logical_length - uint(QUERY_LENGTH) + q_token;
+        uint block_start = block_index * uint(BLOCK_TOKENS);
+        constexpr uint repeat_count = uint(GQA_REPEATS) < 4u ? uint(GQA_REPEATS) : 4u;
+        if (DO_CAUSAL && block_start > causal_limit) {
+            if (lane == 0u) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint stat_index = ((row * block_count + block_index) * 2u);
+                    partial_stats[stat_index] = -INFINITY;
+                    partial_stats[stat_index + 1u] = 0.0f;
+                }
+            }
+            if (lane < uint(HEAD_DIM)) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint q_head = kv_head * gqa_repeats + repeat;
+                    uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                    uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
+                    partial_out[out_index] = static_cast<OUTPUT_DTYPE>(0.0f);
+                }
+            }
+            return;
+        }
+        ulong key_seed = tq_make_seed(uint(SEED_3), uint(SEED_2), uint(SEED_1), uint(SEED_0));
+        ulong value_seed = tq_make_seed(
+            uint(VALUE_SEED_3), uint(VALUE_SEED_2),
+            uint(VALUE_SEED_1), uint(VALUE_SEED_0));
+
+        if (lane < uint(HEAD_DIM)) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                long q_index =
+                    long(batch) * q_strides[0]
+                    + long(q_head) * q_strides[1]
+                    + long(q_token) * q_strides[2]
+                    + long(lane) * q_strides[3];
+                query_cache[repeat * uint(HEAD_DIM) + lane] = float(q[q_index]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Part B: rotate the query ONCE per (repeat, group) and reuse it across every key
+        // token. Because the rotation seed is token-independent (see tq_storage_group_index),
+        // the rotation is identical for all keys, so hoisting it here turns the prior O(N)
+        // per-key query rotations into O(repeat_count * groups_per_vector) per attention step.
+        {
+            uint rg_total = repeat_count * uint(GROUPS_PER_VECTOR);
+            if (lane < rg_total) {
+                uint r = lane / uint(GROUPS_PER_VECTOR);
+                uint g = lane % uint(GROUPS_PER_VECTOR);
+                uint gs = g * uint(GROUP_SIZE);
+                uint cnt = min(uint(GROUP_SIZE), uint(HEAD_DIM) - gs);
+                uint rot_seed_index = tq_storage_group_index(
+                    batch, kv_head, 0u, g, uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR));
+                thread float tmp[GROUP_SIZE];
+                for (uint i = 0u; i < cnt; i++) {
+                    tmp[i] = query_cache[r * uint(HEAD_DIM) + gs + i];
+                }
+                tq_apply_product_rotation(tmp, cnt, key_seed, rot_seed_index, false);
+                for (uint i = 0u; i < cnt; i++) {
+                    query_cache[r * uint(HEAD_DIM) + gs + i] = tmp[i];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint physical_token = 0u;
+        bool active = false;
+        thread float scaled_scores[4];
+        scaled_scores[0] = -INFINITY;
+        scaled_scores[1] = -INFINITY;
+        scaled_scores[2] = -INFINITY;
+        scaled_scores[3] = -INFINITY;
+
+        uint logical_token = block_start + lane;
+        active = lane < uint(BLOCK_TOKENS)
+            && logical_token < logical_length
+            && (!DO_CAUSAL || logical_token <= causal_limit);
+
+        if (active) {
+            physical_token = tq_physical_token(
+                logical_token, uint(CAPACITY), ring_offset, pinned_prefix_length);
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] = 0.0f;
+            }
+            for (uint group = 0u; group < uint(GROUPS_PER_VECTOR); group++) {
+                uint group_start = group * uint(GROUP_SIZE);
+                uint count = min(uint(GROUP_SIZE), uint(HEAD_DIM) - group_start);
+                if (repeat_count == 4u) {
+                    thread float query_values[4 * GROUP_SIZE];
+                    thread float quad_scores[4];
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        quad_scores[repeat] = 0.0f;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[repeat * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_quad_v7(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        quad_scores,
+                        batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint repeat = 0u; repeat < 4u; repeat++) {
+                        scaled_scores[repeat] += quad_scores[repeat];
+                    }
+                    continue;
+                }
+                for (uint pair_start = 0u; pair_start < repeat_count; pair_start += 2u) {
+                    uint pair_repeats = min(2u, repeat_count - pair_start);
+                    thread float query_values[2 * GROUP_SIZE];
+                    thread float pair_scores[2];
+                    pair_scores[0] = 0.0f;
+                    pair_scores[1] = 0.0f;
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        uint repeat = pair_start + pair;
+                        for (uint local = 0u; local < count; local++) {
+                            query_values[pair * uint(GROUP_SIZE) + local] =
+                                query_cache[repeat * uint(HEAD_DIM) + group_start + local];
+                        }
+                    }
+                    tq_product_attention_inner_product_group_pair_v7(
+                        k_packed, k_signs, k_high_mask, k_residual_signs, k_scales, query_values,
+                        pair_scores,
+                        pair_repeats, batch, kv_head, physical_token, group, key_seed,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP),
+                        uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS), uint(LAYOUT_VERSION),
+                        uint(HEAD_DIM),
+                        tq_high_precision_count(count, uint(HIGH_NUMERATOR), uint(HIGH_DENOMINATOR)),
+                        true);
+                    for (uint pair = 0u; pair < pair_repeats; pair++) {
+                        scaled_scores[pair_start + pair] += pair_scores[pair];
+                    }
+                }
+            }
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                scaled_scores[repeat] *= attention_scale;
+            }
+        }
+        tile_physical_tokens[lane] = physical_token;
+
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            tile_scores[score_base + lane] = scaled_scores[repeat];
+            partial[score_base + lane] = scaled_scores[repeat];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    partial[score_base + lane] =
+                        max(partial[score_base + lane], partial[score_base + lane + stride]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        thread float tile_maxes[4];
+        tile_maxes[0] = -INFINITY;
+        tile_maxes[1] = -INFINITY;
+        tile_maxes[2] = -INFINITY;
+        tile_maxes[3] = -INFINITY;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            tile_maxes[repeat] = partial[repeat * threads_per_block];
+        }
+        // Every lane must finish reading the reduced maxes above BEFORE any lane
+        // overwrites partial[] with exp-weights below. Without this barrier, a lagging
+        // simdgroup can read lane 0's already-written weight as the "max" for a later
+        // repeat (the drift across the barrier-free repeat loop is widest at the last
+        // repeat), which intermittently corrupted the whole output row of the last GQA
+        // repeat (q_head = kv_head*4+3) at a 5-25% per-dispatch rate. Root-caused
+        // 2026-07-03; see artifacts/turboquant-v7-20260703/quad-nondeterminism.md.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint has_weight = 0u;
+        for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+            uint score_base = repeat * threads_per_block;
+            float tile_weight = active
+                ? exp(tile_scores[score_base + lane] - tile_maxes[repeat])
+                : 0.0f;
+            tile_scores[score_base + lane] = tile_weight;
+            partial[score_base + lane] = tile_weight;
+            if (tile_weight > 0.0f) {
+                has_weight = 1u;
+            }
+        }
+        tile_has_weight[lane] = has_weight;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = threads_per_block >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) {
+                for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                    uint score_base = repeat * threads_per_block;
+                    partial[score_base + lane] += partial[score_base + lane + stride];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0u) {
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint stat_index = ((row * block_count + block_index) * 2u);
+                uint score_base = repeat * threads_per_block;
+                partial_stats[stat_index] = tile_maxes[repeat];
+                partial_stats[stat_index + 1u] = partial[score_base];
+            }
+        }
+
+        if (lane < uint(HEAD_DIM)) {
+            thread float decode_scratch[GROUP_SIZE];
+            thread float dimension_accum[4];
+            dimension_accum[0] = 0.0f;
+            dimension_accum[1] = 0.0f;
+            dimension_accum[2] = 0.0f;
+            dimension_accum[3] = 0.0f;
+
+            for (uint tile_lane = 0u; tile_lane < threads_per_block; tile_lane++) {
+                if (tile_has_weight[tile_lane] != 0u) {
+                    float value = tq_decode_attention_value(
+                        v_packed, v_signs, v_high_mask, v_residual_signs, v_scales,
+                        batch, kv_head, tile_physical_tokens[tile_lane], lane,
+                        value_seed, 1u,
+                        uint(GROUP_SIZE), uint(KV_HEADS), uint(CAPACITY), uint(GROUPS_PER_VECTOR),
+                        uint(VALUE_MAG_WORDS_PER_GROUP), uint(BITSET_WORDS_PER_GROUP), uint(BASE_BITS), uint(HIGH_BITS),
+                        uint(VALUE_BITS), uint(KEY_BASE_BITS), uint(KEY_HIGH_BITS),
+                        uint(LAYOUT_VERSION), uint(HEAD_DIM), 0u,
+                        decode_scratch);
+                    for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                        dimension_accum[repeat] +=
+                            tile_scores[repeat * threads_per_block + tile_lane] * value;
+                    }
+                }
+            }
+
+            for (uint repeat = 0u; repeat < repeat_count; repeat++) {
+                uint q_head = kv_head * gqa_repeats + repeat;
+                uint row = ((batch * uint(QUERY_HEADS) + q_head) * uint(QUERY_LENGTH)) + q_token;
+                uint out_index = ((row * block_count + block_index) * uint(HEAD_DIM)) + lane;
                 partial_out[out_index] = static_cast<OUTPUT_DTYPE>(dimension_accum[repeat]);
             }
         }
@@ -15621,6 +16830,7 @@ private enum TurboQuantMetalKernels {
 
     private static let fusedAttentionBlockReduceSource = """
         constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint block_count = uint(runtime_block_count);
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
         if (row >= uint(ROW_COUNT)) {
@@ -15630,8 +16840,8 @@ private enum TurboQuantMetalKernels {
         threadgroup float partial[512];
         threadgroup float tile_scales[512];
 
-        if (lane < uint(BLOCK_COUNT)) {
-            partial[lane] = partial_stats[(row * uint(BLOCK_COUNT) + lane) * 2u];
+        if (lane < block_count) {
+            partial[lane] = partial_stats[(row * block_count + lane) * 2u];
         } else {
             partial[lane] = -INFINITY;
         }
@@ -15645,8 +16855,8 @@ private enum TurboQuantMetalKernels {
         }
 
         float row_max = partial[0];
-        if (lane < uint(BLOCK_COUNT)) {
-            uint stat_index = (row * uint(BLOCK_COUNT) + lane) * 2u;
+        if (lane < block_count) {
+            uint stat_index = (row * block_count + lane) * 2u;
             float tile_sum = partial_stats[stat_index + 1u];
             float tile_scale = tile_sum > 0.0f ? exp(partial_stats[stat_index] - row_max) : 0.0f;
             tile_scales[lane] = tile_scale;
@@ -15667,10 +16877,10 @@ private enum TurboQuantMetalKernels {
         float row_sum = partial[0];
         if (lane < uint(HEAD_DIM)) {
             float accum = 0.0f;
-            for (uint block = 0u; block < uint(BLOCK_COUNT); block++) {
+            for (uint block = 0u; block < block_count; block++) {
                 float tile_scale = tile_scales[block];
                 if (tile_scale > 0.0f) {
-                    uint partial_index = ((row * uint(BLOCK_COUNT) + block) * uint(HEAD_DIM)) + lane;
+                    uint partial_index = ((row * block_count + block) * uint(HEAD_DIM)) + lane;
                     accum += tile_scale * partial_out[partial_index];
                 }
             }
@@ -15681,6 +16891,7 @@ private enum TurboQuantMetalKernels {
 
     private static let segmentedRawAttentionStatsSource = """
         constexpr uint threads_per_block = uint(THREADS_PER_BLOCK);
+        uint raw_length = uint(runtime_raw_length);
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
         uint row_count = uint(BATCH_SIZE) * uint(QUERY_HEADS) * uint(QUERY_LENGTH);
@@ -15713,9 +16924,9 @@ private enum TurboQuantMetalKernels {
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint tile_start = 0u; tile_start < uint(RAW_LENGTH); tile_start += threads_per_block) {
+        for (uint tile_start = 0u; tile_start < raw_length; tile_start += threads_per_block) {
             uint token = tile_start + lane;
-            bool active = token < uint(RAW_LENGTH);
+            bool active = token < raw_length;
             float scaled_score = -INFINITY;
             if (active) {
                 float score = 0.0f;

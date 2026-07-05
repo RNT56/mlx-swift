@@ -66,7 +66,8 @@ public func estimateTurboQuantStorage(
         valueBits: valueBits
     )
     let bitsetWords = ceilDivide(clampedGroupSize, by: 32)
-    let scalesPerGroup = role == .value ? 2 : 3
+    // K scale plane dieted to 2 (norm, residual_norm); the third slot was dead (written 0.0, never read).
+    let scalesPerGroup = 2
     let packedBytes = groupCount * magnitudeWords * MemoryLayout<UInt32>.size
     let bitsetPlaneCount: Int
     if role == .value {
