@@ -13,6 +13,12 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
     public var pathMeasurements: [TurboQuantCoreBenchmarkPathMeasurement]
     public var metrics: TurboQuantCoreBenchmarkMetrics
     public var hiddenCopyAudit: TurboQuantHiddenCopyAudit
+    // Provenance guardrails: this report comes from a synthetic sinusoid-input
+    // kernel microbench with no checkpoint loaded, so it is not real-model and
+    // not promotable. Emitted so downstream consumers cannot mistake it for a
+    // real-model measurement.
+    public var synthetic: Bool
+    public var realModel: Bool
 
     public init(
         schemaVersion: Int = TurboQuantCoreBenchmarkReport.currentSchemaVersion,
@@ -22,7 +28,9 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
         pathDecision: TurboQuantAttentionDecision?,
         pathMeasurements: [TurboQuantCoreBenchmarkPathMeasurement] = [],
         metrics: TurboQuantCoreBenchmarkMetrics,
-        hiddenCopyAudit: TurboQuantHiddenCopyAudit
+        hiddenCopyAudit: TurboQuantHiddenCopyAudit,
+        synthetic: Bool = true,
+        realModel: Bool = false
     ) {
         self.schemaVersion = schemaVersion
         self.mlxSwiftCommit = mlxSwiftCommit
@@ -32,6 +40,8 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
         self.pathMeasurements = pathMeasurements
         self.metrics = metrics
         self.hiddenCopyAudit = hiddenCopyAudit
+        self.synthetic = synthetic
+        self.realModel = realModel
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -43,6 +53,8 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
         case pathMeasurements
         case metrics
         case hiddenCopyAudit
+        case synthetic
+        case realModel
     }
 
     public init(from decoder: Decoder) throws {
@@ -57,7 +69,9 @@ public struct TurboQuantCoreBenchmarkReport: Codable, Sendable {
             pathMeasurements: try container.decodeIfPresent(
                 [TurboQuantCoreBenchmarkPathMeasurement].self, forKey: .pathMeasurements) ?? [],
             metrics: try container.decode(TurboQuantCoreBenchmarkMetrics.self, forKey: .metrics),
-            hiddenCopyAudit: try container.decode(TurboQuantHiddenCopyAudit.self, forKey: .hiddenCopyAudit)
+            hiddenCopyAudit: try container.decode(TurboQuantHiddenCopyAudit.self, forKey: .hiddenCopyAudit),
+            synthetic: try container.decodeIfPresent(Bool.self, forKey: .synthetic) ?? true,
+            realModel: try container.decodeIfPresent(Bool.self, forKey: .realModel) ?? false
         )
     }
 }

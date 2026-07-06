@@ -2326,6 +2326,8 @@ if CommandLine.arguments.contains("--selftest-qappend") {
 } else if CommandLine.arguments.contains("--h16-parity-dump") {
     try runH16ParityDump(arguments: CommandLine.arguments)
 } else {
+    FileHandle.standardError.write(Data(
+        "SYNTHETIC KERNEL MICROBENCH — NOT real-model, NOT promotable (sinusoid K/V/Q, no checkpoint loaded)\n".utf8))
     let options = try BenchmarkOptions.parse()
     if options.emitCoreJSON {
         try runCoreBenchmarkJSON(options: options)

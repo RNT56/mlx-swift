@@ -9305,9 +9305,17 @@ private final class TurboQuantKernelDispatchTrace: @unchecked Sendable {
     }()
     private let lock = NSLock()
     private var counts: [String: Int] = [:]
+    // Counting is ALWAYS-ON (unconditional) so engagement telemetry accumulates
+    // without TQ_KERNEL_TRACE. Only the atexit/stderr emit path stays env-gated.
     func record(_ name: String) {
-        guard Self.enabled else { return }
         lock.lock(); counts[name, default: 0] += 1; lock.unlock()
+    }
+    func snapshot() -> [String: Int] {
+        lock.lock(); defer { lock.unlock() }
+        return counts
+    }
+    func reset() {
+        lock.lock(); counts.removeAll(); lock.unlock()
     }
     func emit() {
         guard Self.enabled else { return }
@@ -9317,6 +9325,14 @@ private final class TurboQuantKernelDispatchTrace: @unchecked Sendable {
         lock.unlock()
         FileHandle.standardError.write(Data(lines.utf8))
     }
+}
+
+/// Public façade over the always-on dispatched-kernel counters. Benchmarks call
+/// `reset()` before a timed decode loop and `snapshot()` after to prove which
+/// native TurboQuant kernel family actually dispatched (engagement verification).
+public enum TurboQuantKernelDispatchTelemetry {
+    public static func snapshot() -> [String: Int] { TurboQuantKernelDispatchTrace.shared.snapshot() }
+    public static func reset() { TurboQuantKernelDispatchTrace.shared.reset() }
 }
 
 private func metalRuntimeAvailable() -> Bool {
