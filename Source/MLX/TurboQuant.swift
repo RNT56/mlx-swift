@@ -164,7 +164,15 @@ func turboQuantCooperativeQuadDecodeActive(
     guard layoutVersion == TurboQuantAttentionLayout.splitMagnitudeVersion else { return false }
     // Coop only pays off once memory traffic dominates the decode; keep the strided path at
     // short context where it is neutral/negative (see turboQuantCooperativeDecodeMinContext).
-    guard logicalLength >= turboQuantCooperativeDecodeMinContext else { return false }
+    // TEST-ONLY OVERRIDE: TQ_COOP_MIN_CONTEXT lets a benchmark engage coop below the 32768
+    // production floor so its real-model decode speed can be A/B'd at tractable prefill
+    // contexts (32K compressed prefill is ~60-90 min on M2 Pro). Default is the unchanged
+    // 32768 constant, so production behavior is identical unless this env var is set. Not
+    // for shipping — measurement scaffold only.
+    let coopMinContext =
+        ProcessInfo.processInfo.environment["TQ_COOP_MIN_CONTEXT"].flatMap { Int($0) }
+        ?? turboQuantCooperativeDecodeMinContext
+    guard logicalLength >= coopMinContext else { return false }
     let base = Swift.max(1, preset.baseMagnitudeBits - 1)
     let high = Swift.max(base, preset.highMagnitudeBits - 1)
     // uniform = turbo8/turbo4v2 (base==high); split = turbo3_5 (high==base+1 at layout v6).
