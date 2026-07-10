@@ -91,6 +91,28 @@ When a feature crosses repos, update from the bottom up:
 3. Route model/cache policy, diagnostics, and benchmarks in `mlx-swift-lm`.
 4. Update downstream app pins only after the fork stack is validated.
 
+## Architecture Ruling (2026-07-10, binding)
+
+Full ADR: `mlx-swift-lm/docs/turboquant-implementation/architecture-ruling-2026-07-10.md`.
+
+- **Kernel home = mlx core (C++/MSL).** Every kernel of record lives once in
+  `mlx/backend/metal/kernels/*`, consumed by both the AOT metallib and the JIT
+  path, dispatched by C++ `fast::` primitives. Metal optimizations land there.
+- **mlx-c / mlx-swift are thin bindings** (ABI, capability probes, engagement
+  telemetry). No kernels of record in Swift. **mlx-swift-lm is policy only.**
+- **Prototyping is allowed anywhere** (`MLXFast.metalKernel` is a lab tool),
+  but a Swift-path win is a research note, never a result.
+- **Promotion rule:** a kernel optimization is "done" only when measured on the
+  NATIVE path, on a REAL model, through the engagement-verified harness
+  (`TurboQuantInferenceParity` + `swiftDispatchedKernels`/native kernel kinds),
+  on an awake AC-powered machine (`mlx-swift-lm/scripts/bench-caffeinated.sh`),
+  with `--generate-tokens >= 32`.
+- The Swift tiled path survives ONLY as the qLen>8 prefill fallback until
+  native prefill coverage lands; then the `TurboQuant.swift` kernel copies are
+  deleted, `jit.h` becomes the single JIT source, `mlx-generated` is
+  regenerated (never hand-mirrored), and the dead diagnostic kernel families
+  (PolarWHT hybrid, Sparse-V) are deleted.
+
 ## Current TurboQuant State
 
 Start with the current handoff before changing code:
