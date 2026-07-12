@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3;(experimentalCGen)
+// swift-tools-version: 6.2
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 // Copyright © 2024 Apple Inc.
 
