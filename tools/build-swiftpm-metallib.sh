@@ -13,16 +13,73 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
 ROOT_DIR=$(realpath "${SCRIPT_DIR}/..")
 KERNELS_DIR="${ROOT_DIR}/Source/Cmlx/mlx/mlx/backend/metal/kernels"
 
-METAL=$(xcrun -sdk macosx -find metal)
-METALLIB=$(xcrun -sdk macosx -find metallib)
+platform_name=${PLATFORM_NAME:-}
+if [[ -z "${platform_name}" ]]; then
+  platform_name=${EFFECTIVE_PLATFORM_NAME:-}
+  platform_name=${platform_name#-}
+fi
+if [[ -z "${platform_name}" && -n "${SDKROOT:-}" ]]; then
+  sdk_basename=$(basename "${SDKROOT}")
+  sdk_basename=$(printf '%s' "${sdk_basename}" | tr '[:upper:]' '[:lower:]')
+  case "${sdk_basename}" in
+    iphonesimulator*) platform_name=iphonesimulator ;;
+    iphoneos*) platform_name=iphoneos ;;
+    appletvsimulator*) platform_name=appletvsimulator ;;
+    appletvos*) platform_name=appletvos ;;
+    xrsimulator*) platform_name=xrsimulator ;;
+    xros*) platform_name=xros ;;
+    macosx*) platform_name=macosx ;;
+  esac
+fi
+platform_name=${platform_name:-macosx}
+
+case "${platform_name}" in
+  macosx)
+    sdk=macosx
+    target_os="macos${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+    ;;
+  iphoneos)
+    sdk=iphoneos
+    target_os="ios${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
+    ;;
+  iphonesimulator)
+    sdk=iphonesimulator
+    target_os="ios${IPHONEOS_DEPLOYMENT_TARGET:-17.0}-simulator"
+    ;;
+  appletvos)
+    sdk=appletvos
+    target_os="tvos${TVOS_DEPLOYMENT_TARGET:-17.0}"
+    ;;
+  appletvsimulator)
+    sdk=appletvsimulator
+    target_os="tvos${TVOS_DEPLOYMENT_TARGET:-17.0}-simulator"
+    ;;
+  xros)
+    sdk=xros
+    target_os="xros${XROS_DEPLOYMENT_TARGET:-1.0}"
+    ;;
+  xrsimulator)
+    sdk=xrsimulator
+    target_os="xros${XROS_DEPLOYMENT_TARGET:-1.0}-simulator"
+    ;;
+  *)
+    echo "unsupported Apple platform for Metal library: ${platform_name}" >&2
+    exit 65
+    ;;
+esac
+
+SDK_PATH=$(xcrun -sdk "${sdk}" -show-sdk-path)
+METAL=$(xcrun -sdk "${sdk}" -find metal)
+METALLIB=$(xcrun -sdk "${sdk}" -find metallib)
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
-DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+target_flag="-mtargetos=${target_os}"
+echo "Building SwiftPM default.metallib for ${platform_name} (${target_os}; SDK ${sdk})"
 
 metal_version=$(
   printf '%s\n' '__METAL_VERSION__' |
-    "${METAL}" "-mmacosx-version-min=${DEPLOYMENT_TARGET}" -E -x metal -P - |
+    SDKROOT="${SDK_PATH}" "${METAL}" "${target_flag}" -E -x metal -P - |
     tail -1 |
     tr -d '[:space:]'
 )
@@ -50,7 +107,7 @@ metal_flags=(
   -fno-fast-math
   -Wno-c++17-extensions
   -Wno-c++20-extensions
-  -mmacosx-version-min="${DEPLOYMENT_TARGET}"
+  "${target_flag}"
 )
 
 if (( metal_version >= 400 )); then
@@ -67,10 +124,10 @@ air_files=()
 for kernel in "${kernels[@]}"; do
   source="${KERNELS_DIR}/${kernel}.metal"
   air="${TMP_DIR}/${kernel}.air"
-  "${METAL}" "${metal_flags[@]}" -c "${source}" -I"${ROOT_DIR}/Source/Cmlx/mlx" -o "${air}"
+  SDKROOT="${SDK_PATH}" "${METAL}" "${metal_flags[@]}" -c "${source}" -I"${ROOT_DIR}/Source/Cmlx/mlx" -o "${air}"
   air_files+=("${air}")
 done
 
 mkdir -p "$(dirname "${OUTPUT}")"
-"${METALLIB}" "${air_files[@]}" -o "${TMP_DIR}/default.metallib"
+SDKROOT="${SDK_PATH}" "${METALLIB}" "${air_files[@]}" -o "${TMP_DIR}/default.metallib"
 mv "${TMP_DIR}/default.metallib" "${OUTPUT}"
