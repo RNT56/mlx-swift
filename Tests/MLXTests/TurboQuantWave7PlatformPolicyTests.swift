@@ -23,6 +23,7 @@ final class TurboQuantWave7PlatformPolicyTests: XCTestCase {
         XCTAssertEqual(decoded.report, report)
         XCTAssertEqual(decoded.policy, policy)
         XCTAssertEqual(decoded.descriptor, descriptor)
+        XCTAssertEqual(decoded.report.supportedAttentionLayoutVersions, [4, 5, 6])
         XCTAssertFalse(decoded.policy.enabled)
         XCTAssertFalse(decoded.descriptor.readEnabled)
         XCTAssertFalse(decoded.descriptor.writeEnabled)
@@ -200,7 +201,7 @@ final class TurboQuantWave7PlatformPolicyTests: XCTestCase {
                     evidenceID: evidenceID
                 )
             ],
-            supportedAttentionLayoutVersions: [TurboQuantAttentionLayout.currentVersion],
+            supportedAttentionLayoutVersions: TurboQuantAttentionLayout.supportedVersions,
             evidenceIDs: [evidenceID]
         )
     }

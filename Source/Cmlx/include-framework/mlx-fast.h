@@ -3,8 +3,12 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <variant>
+#include <vector>
 
 #include <Cmlx/mlx-api.h>
 #include <Cmlx/mlx-utils.h>
@@ -55,7 +59,306 @@ MLX_API array scaled_dot_product_attention(
     const std::optional<array>& sinks = {},
     StreamOrDevice s = {});
 
-using TemplateArg = std::variant<int, bool, Dtype>;
+/** Computes: `O = softmax(Q @ K.T) @ V` where K and V are quantized. **/
+MLX_API array quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const std::optional<array>& key_biases,
+    const array& values,
+    const array& value_scales,
+    const std::optional<array>& value_biases,
+    const float scale,
+    const std::optional<array>& mask = std::nullopt,
+    const std::optional<array>& sinks = std::nullopt,
+    std::optional<int> group_size = std::nullopt,
+    std::optional<int> bits = std::nullopt,
+    const std::string& mode = "mxfp4",
+    bool causal = false,
+    StreamOrDevice s = {});
+
+/** Computes: `O = softmax(Q @ K.T) @ V` where K and V use affine quantization
+ * with independent bit widths and group sizes. **/
+MLX_API array mixed_quantized_scaled_dot_product_attention(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const std::optional<array>& key_biases,
+    const array& values,
+    const array& value_scales,
+    const std::optional<array>& value_biases,
+    const float scale,
+    const std::optional<array>& mask = std::nullopt,
+    const std::optional<array>& sinks = std::nullopt,
+    int key_group_size = 64,
+    int key_bits = 8,
+    int value_group_size = 32,
+    int value_bits = 4,
+    bool causal = false,
+    StreamOrDevice s = {});
+
+/** Returns `[output, diagnostics]` for mixed affine K8/Vx attention.
+ *
+ * `sparse_v_threshold > 0` enables decode-only Sparse-V skipping and reports
+ * diagnostics as uint32 `[rows, 2]` with `[skipped, considered]` counts.
+ **/
+MLX_API std::vector<array>
+mixed_quantized_scaled_dot_product_attention_with_diagnostics(
+    const array& queries,
+    const array& keys,
+    const array& key_scales,
+    const std::optional<array>& key_biases,
+    const array& values,
+    const array& value_scales,
+    const std::optional<array>& value_biases,
+    const float scale,
+    const std::optional<array>& mask = std::nullopt,
+    const std::optional<array>& sinks = std::nullopt,
+    int key_group_size = 64,
+    int key_bits = 8,
+    int value_group_size = 32,
+    int value_bits = 4,
+    bool causal = false,
+    float sparse_v_threshold = 0.0f,
+    StreamOrDevice s = {});
+
+struct TurboQuantAttentionLayoutDescriptor {
+  int layout_version;
+  int batch_size;
+  int kv_head_count;
+  int capacity;
+  int logical_length;
+  int ring_offset;
+  int pinned_prefix_length;
+  int head_dimension;
+  int groups_per_vector;
+  int magnitude_words_per_group;
+  int bitset_words_per_group;
+};
+
+struct TurboQuantPrecisionPolicyDescriptor {
+  int preset;
+  int group_size;
+  int key_base_bits;
+  int key_high_bits;
+  int high_precision_numerator;
+  int high_precision_denominator;
+  int value_bits;
+  int key_scales_per_group;
+  int value_scales_per_group;
+  int value_magnitude_words_per_group;
+  uint64_t key_seed;
+  uint64_t value_seed;
+};
+
+struct TurboQuantAttentionOptions {
+  float scale;
+  bool causal;
+  int split_k_blocks;
+  float sparse_v_threshold;
+  // Sparse-V mode: 0 off, 1 token threshold, 2 top-k,
+  // 3 cumulative mass, 4 cumulative mass plus max top-k,
+  // 5 block threshold, 6 page top-k, 7 candidate sparse.
+  int sparse_v_selection_mode;
+  int sparse_v_top_k;
+  float sparse_v_cumulative_mass;
+  int sparse_v_max_top_k;
+  int sparse_v_recent_tokens;
+  int sparse_v_candidate_pages;
+  bool diagnostics;
+  int backend_version;
+};
+
+class MLX_API TurboQuantNativeAttentionUnavailable : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
+enum class TurboQuantSegmentedAttentionBackend : int {
+  Unavailable = 0,
+  ExperimentalJit = 1,
+  NativeFused = 2,
+};
+
+enum class TurboQuantSegmentedAttentionCodec : int {
+  PolarQJL = 0,
+  PolarWHT = 1,
+  HybridK8PolarWHTValue = 2,
+};
+
+MLX_API TurboQuantSegmentedAttentionBackend
+turbo_quant_segmented_attention_backend(
+    bool allow_experimental_jit = false,
+    StreamOrDevice s = {});
+
+MLX_API bool turbo_quant_segmented_attention_is_available(
+    bool allow_experimental_jit = false,
+    StreamOrDevice s = {});
+
+MLX_API TurboQuantSegmentedAttentionBackend
+turbo_quant_segmented_attention_backend_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
+    bool allow_experimental_jit = false,
+    StreamOrDevice s = {});
+
+MLX_API bool turbo_quant_segmented_attention_is_available_for_codec(
+    TurboQuantSegmentedAttentionCodec codec,
+    bool allow_experimental_jit = false,
+    StreamOrDevice s = {});
+
+/** Computes: `O = softmax(Q @ K.T) @ V` from TurboQuant compressed K/V planes. **/
+MLX_API array turbo_quant_segmented_attention(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Returns `[output, diagnostics]` for TurboQuant compressed segmented attention. **/
+MLX_API std::vector<array> turbo_quant_segmented_attention_with_diagnostics(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Computes TurboQuant compressed attention with optional cached page summaries
+ *  for explicit pageTopK Sparse-V selection. **/
+MLX_API array turbo_quant_segmented_attention_with_page_summaries(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const array& key_page_summary,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Returns `[output, diagnostics]` for cached-summary TurboQuant attention. **/
+MLX_API std::vector<array>
+turbo_quant_segmented_attention_with_page_summaries_and_diagnostics(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const array& key_page_summary,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Computes TurboQuant compressed attention with cached key sketches for
+ *  explicit candidateSparse Sparse-V selection. **/
+MLX_API array turbo_quant_segmented_attention_with_candidate_sketches(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const array& key_candidate_sketch,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Returns `[output, diagnostics]` for sketch-backed candidateSparse attention. **/
+MLX_API std::vector<array>
+turbo_quant_segmented_attention_with_candidate_sketches_and_diagnostics(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const array& key_candidate_sketch,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Compatibility name for `turbo_quant_segmented_attention`. **/
+MLX_API array turbo_quant_scaled_dot_product_attention(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+/** Compatibility name for `turbo_quant_segmented_attention_with_diagnostics`. **/
+MLX_API std::vector<array> turbo_quant_scaled_dot_product_attention_with_diagnostics(
+    const array& queries,
+    const array& key_packed,
+    const array& key_signs,
+    const array& key_high_precision_mask,
+    const array& key_residual_signs,
+    const array& key_scales,
+    const array& value_packed,
+    const array& value_signs,
+    const array& value_high_precision_mask,
+    const array& value_residual_signs,
+    const array& value_scales,
+    const TurboQuantAttentionLayoutDescriptor& layout,
+    const TurboQuantPrecisionPolicyDescriptor& precision,
+    const TurboQuantAttentionOptions& options,
+    StreamOrDevice s = {});
+
+using TemplateArg = std::variant<int, uint32_t, bool, Dtype>;
 using ScalarArg = std::variant<bool, int, float>;
 
 using CustomKernelFunction = std::function<std::vector<array>(

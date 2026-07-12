@@ -493,9 +493,10 @@ qouter(const thread uint8_t* w, U x, U scale, U bias, thread U* result) {
   }
 }
 
-template <typename U, int N, int bits>
-inline void
-dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+// Decode one quantized block (scale * q + bias) into w_local. W (the output
+// pointer type) serves the threadgroup block loader or a thread-local decode.
+template <typename U, int N, int bits, typename W>
+inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
           bits == 8,
@@ -987,6 +988,103 @@ METAL_FUNC void qmv_impl(
   }
 }
 
+// Affine analog of fp_qmv_wide. Weights carry a scale and bias per group, so
+// each group is decoded in 8-value sub-chunks (scale * q + bias, registers
+// bounded for any group_size) and reused across the vecs_per_tg vectors.
+template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+METAL_FUNC void qmv_wide_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
+  constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
+
+  typedef float U;
+
+  const short k_lane = simd_lid % k_lanes;
+  const short sg_row = simd_lid / k_lanes;
+
+  const int out_row = tid.y * (results_per_simdgroup * num_simdgroups) +
+      results_per_simdgroup * simd_gid + sg_row;
+  const int vec0 = tid.x * vecs_per_tg;
+
+  const int row = min(out_row, out_vec_size - 1);
+
+  const int in_vec_size_w = in_vec_size * bits / 8; // bytes per weight row
+  const int in_vec_size_g = in_vec_size / group_size;
+  const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
+  const device T* srow = scales + row * in_vec_size_g;
+  const device T* brow = biases + row * in_vec_size_g;
+
+  const device T* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) {
+    xv[v] = x + min(vec0 + v, M - 1) * in_vec_size;
+  }
+
+  U result[vecs_per_tg] = {0};
+
+  // Each lane reduces a strided subset of the row's groups: decode the group in
+  // 8-value sub-chunks and reuse each chunk across the streamed vectors.
+  for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
+    U scale = srow[g];
+    U bias = brow[g];
+#pragma unroll
+    for (int sc = 0; sc < group_size / sub; sc++) {
+      const int k0 = g * group_size + sc * sub;
+      const device uint8_t* wc = wrow + k0 * bits / 8;
+      U w_dq[sub];
+      dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        const device T* xc = xv[v] + k0;
+        U acc = 0;
+#pragma unroll
+        for (int i = 0; i < sub; i++) {
+          acc += static_cast<U>(xc[i]) * w_dq[i];
+        }
+        result[v] += acc;
+      }
+    }
+  }
+
+  // Reduce each vector's partial over its k_lanes with a shuffle ladder:
+  // simd_sum would mix the results_per_simdgroup rows a simdgroup spans.
+  for (int v = 0; v < vecs_per_tg; v++) {
+    if constexpr (k_lanes >= 32) {
+      result[v] += simd_shuffle_down(result[v], 16);
+    }
+    if constexpr (k_lanes >= 16) {
+      result[v] += simd_shuffle_down(result[v], 8);
+    }
+    if constexpr (k_lanes >= 8) {
+      result[v] += simd_shuffle_down(result[v], 4);
+    }
+    if constexpr (k_lanes >= 4) {
+      result[v] += simd_shuffle_down(result[v], 2);
+    }
+    if constexpr (k_lanes >= 2) {
+      result[v] += simd_shuffle_down(result[v], 1);
+    }
+  }
+
+  if (k_lane == 0 && out_row < out_vec_size) {
+    for (int v = 0; v < vecs_per_tg; v++) {
+      if (vec0 + v < M) {
+        y[(vec0 + v) * out_vec_size + out_row] = static_cast<T>(result[v]);
+      }
+    }
+  }
+}
+
 template <typename T, const int group_size, const int bits>
 METAL_FUNC void qvm_impl(
     const device uint32_t* w,
@@ -996,6 +1094,7 @@ METAL_FUNC void qvm_impl(
     device T* y,
     const int in_vec_size,
     const int out_vec_size,
+    const int in_vec_stride,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1029,7 +1128,7 @@ METAL_FUNC void qvm_impl(
   ws += out_col * bytes_per_pack / pack_factor + simd_lid * out_vec_size_w;
   scales += out_col / group_size + simd_lid * out_vec_size_g;
   biases += out_col / group_size + simd_lid * out_vec_size_g;
-  x += tid.x * in_vec_size + simd_lid;
+  x += tid.x * in_vec_stride + simd_lid;
   y += tid.x * out_vec_size + out_col;
 
   if (out_col >= out_vec_size) {
@@ -1609,6 +1708,65 @@ template <typename T, const int group_size, const int bits, bool batched>
       simd_lid);
 }
 
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int vecs_per_tg,
+    int k_lanes,
+    bool batched>
+[[kernel]] void affine_qmv_wide(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    const constant int& in_vec_size,
+    const constant int& out_vec_size,
+    const constant int& M,
+    const constant int& x_batch_ndims,
+    const constant int* x_shape,
+    const constant int64_t* x_strides,
+    const constant int& w_batch_ndims,
+    const constant int* w_shape,
+    const constant int64_t* w_strides,
+    const constant int64_t* s_strides,
+    const constant int64_t* b_strides,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  if (batched) {
+    adjust_matrix_offsets<T>(
+        x,
+        w,
+        scales,
+        biases,
+        y,
+        out_vec_size * M,
+        x_batch_ndims,
+        x_shape,
+        x_strides,
+        w_batch_ndims,
+        w_shape,
+        w_strides,
+        s_strides,
+        b_strides,
+        tid);
+  }
+  qmv_wide_impl<T, group_size, bits, vecs_per_tg, k_lanes>(
+      w,
+      scales,
+      biases,
+      x,
+      y,
+      in_vec_size,
+      out_vec_size,
+      M,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
 template <typename T, const int group_size, const int bits, bool batched>
 [[kernel]] void affine_qvm(
     const device uint32_t* w [[buffer(0)]],
@@ -1656,6 +1814,7 @@ template <typename T, const int group_size, const int bits, bool batched>
       y,
       in_vec_size,
       out_vec_size,
+      in_vec_size,
       tid,
       simd_gid,
       simd_lid);
@@ -1704,6 +1863,9 @@ template <typename T, const int group_size, const int bits, int split_k = 32>
   int in_vec_size_adj =
       tid.z % split_k == split_k - 1 ? final_block_size : in_vec_size;
 
+  // The in_vec_stride is the full K dimension, not the partition size
+  int in_vec_stride = (split_k - 1) * in_vec_size + final_block_size;
+
   qvm_impl<T, group_size, bits>(
       w,
       scales,
@@ -1712,6 +1874,7 @@ template <typename T, const int group_size, const int bits, int split_k = 32>
       y,
       in_vec_size_adj,
       out_vec_size,
+      in_vec_stride,
       tid,
       simd_gid,
       simd_lid);
@@ -2090,6 +2253,7 @@ template <typename T, int group_size, int bits>
       y,
       in_vec_size,
       out_vec_size,
+      in_vec_size,
       tid,
       simd_gid,
       simd_lid);
@@ -2543,6 +2707,125 @@ template <typename T, const int group_size, const int bits>
     if (writes_per_reduce > 0 && out_index % writes_per_reduce == 0) {
       out[out_index / writes_per_reduce] = output;
     }
+  }
+}
+
+// Fused quantize-and-append (TurboQuant P1-1). Byte-for-byte the same affine
+// quantize math as affine_quantize above, but reads compact incoming rows
+// (`w` = [B, n_kv_heads, steps, head_dim]) and writes codes/scales/biases into
+// rows [seq_offset, seq_offset + n_steps) of the FULL destination planes
+// (capacity_seq rows per batch*head). Power-of-two `bits` only; the 3/5/6-bit
+// byte-splitting store branches are omitted since they are never instantiated
+// here. NEW kernel name (never mutate affine_quantize -- the compiled-variant
+// cache keys on the name).
+template <typename T, const int group_size, const int bits>
+[[kernel]] void affine_quantize_append(
+    const device T* w [[buffer(0)]],
+    device uint8_t* out [[buffer(1)]],
+    device T* scales [[buffer(2)]],
+    device T* biases [[buffer(3)]],
+    const constant uint& seq_offset [[buffer(4)]],
+    const constant uint& n_steps [[buffer(5)]],
+    const constant uint& capacity_seq [[buffer(6)]],
+    const constant uint& elems_per_row [[buffer(7)]],
+    uint2 index [[thread_position_in_grid]],
+    uint2 grid_dim [[threads_per_grid]]) {
+  constexpr float eps = 1e-7;
+  constexpr int simd_size = 32;
+  constexpr float n_bins = (1 << bits) - 1;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int values_per_reduce = group_size / simd_size;
+  constexpr int writes_per_reduce = pack_factor / values_per_reduce;
+  constexpr int writes_per_pack =
+      writes_per_reduce > 1 ? 1 : values_per_reduce / pack_factor;
+
+  static_assert(
+      group_size % simd_size == 0,
+      "Group size must be divisible by simd size.");
+  static_assert(
+      (bits & (bits - 1)) == 0,
+      "affine_quantize_append supports power-of-two bits only.");
+
+  size_t offset = index.x + grid_dim.x * size_t(index.y);
+  size_t in_index = offset * values_per_reduce;
+  // Compact output index (relative to the compact input's own layout), matching
+  // affine_quantize exactly for power-of-two bits.
+  size_t out_index = offset * writes_per_pack;
+
+  // Decompose the compact flat position into (batch*head, row within the
+  // incoming block) so the destination row lands inside the full plane.
+  size_t flat_row = in_index / elems_per_row;
+  size_t bh = flat_row / n_steps;
+  size_t row_in_new = flat_row - bh * n_steps;
+  size_t dst_row = bh * capacity_seq + seq_offset + row_in_new;
+
+  // Per-row destination strides. affine_quantize indexes `out` (uint8_t*) in
+  // byte units for every power-of-two bit width (8-bit stores 1 byte per code;
+  // the 2/4-bit packed path indexes out[out_index/writes_per_reduce] in the
+  // same byte space), so the code shift is the row byte stride. Scales/biases
+  // advance by the number of groups per row.
+  size_t code_bytes_per_row = (size_t(elems_per_row) * bits) / 8;
+  size_t groups_per_row = size_t(elems_per_row) / group_size;
+  size_t code_shift = (dst_row - flat_row) * code_bytes_per_row;
+  size_t group_shift = (dst_row - flat_row) * groups_per_row;
+
+  float w_thread[values_per_reduce];
+  float w_min = Limits<T>::max;
+  float w_max = 0;
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < values_per_reduce; i++) {
+    float val = w[in_index + i];
+    w_thread[i] = val;
+    w_min = min(w_min, val);
+    w_max = max(w_max, val);
+  }
+
+  w_min = simd_min(w_min);
+  w_max = simd_max(w_max);
+
+  float scale = max((w_max - w_min) / n_bins, eps);
+  bool side = abs(w_min) > abs(w_max);
+  scale = side ? scale : -scale;
+  float edge = side ? w_min : w_max;
+  float q0 = round(edge / scale);
+  bool at_zero = q0 == 0.0f;
+  scale = at_zero ? scale : edge / q0;
+  float bias = at_zero ? 0 : edge;
+
+  // Write out the scales and biases (shifted to the destination row).
+  size_t gindex = in_index / group_size;
+  if (in_index % group_size == 0) {
+    scales[gindex + group_shift] = static_cast<T>(scale);
+    biases[gindex + group_shift] = static_cast<T>(bias);
+  }
+
+  using OutType = uint32_t;
+  OutType output = 0;
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < values_per_reduce; i++) {
+    uint8_t val = min(round((w_thread[i] - bias) / scale), n_bins);
+    if (bits == 8) {
+      output = val;
+    } else {
+      output |= val << (bits * (i % pack_factor));
+    }
+
+    if (pack_factor < values_per_reduce && i % pack_factor == pack_factor - 1) {
+      out[out_index + code_shift + i / pack_factor] = output;
+      output = 0;
+    } else {
+#pragma clang loop unroll(full)
+      for (int j = 1; j < writes_per_reduce; j++) {
+        uint8_t sval = simd_shuffle_down(val, j);
+        output |= static_cast<OutType>(sval)
+            << (bits * (j * values_per_reduce + i));
+      }
+    }
+  }
+  if (writes_per_reduce > 0 && out_index % writes_per_reduce == 0) {
+    out[out_index / writes_per_reduce + code_shift] = output;
   }
 }
 

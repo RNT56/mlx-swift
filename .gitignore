@@ -92,3 +92,6 @@ iOSInjectionProject/
 
 # VS Code
 .vscode/
+
+# Local benchmark outputs
+artifacts/

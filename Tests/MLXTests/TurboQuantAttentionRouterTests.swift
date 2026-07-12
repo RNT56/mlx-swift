@@ -4,6 +4,78 @@ import MLX
 import XCTest
 
 final class TurboQuantAttentionRouterTests: XCTestCase {
+    func testNativeCompressedSelectedWhenCapabilityPasses() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: true,
+                nativeDiagnosticsSupport: true,
+                nativeBackendVersion: TurboQuantNativeAttentionOptions.backendVersion
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .nativeMLXCompressed)
+        XCTAssertTrue(decision.rejectedPaths.isEmpty)
+    }
+
+    func testSparseVNativeCompressedSelectedWhenCapabilityPasses() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(sparseVThreshold: 1e-5),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: true,
+                nativeDiagnosticsSupport: true,
+                nativeBackendVersion: TurboQuantNativeAttentionOptions.backendVersion
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .nativeMLXCompressed)
+        XCTAssertTrue(decision.rejectedPaths.isEmpty)
+    }
+
+    func testSparseVRejectsNativeWhenSparseCapabilityMissing() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(
+                preferOnlineFused: false,
+                sparseVThreshold: 1e-5
+            ),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                nativeSparseVSupport: false,
+                attentionQK: true,
+                attentionAV: true,
+                bfloatOutput: true
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .twoStageCompressed)
+        XCTAssertTrue(
+            decision.rejectedPaths.contains {
+                $0.path == .nativeMLXCompressed && $0.reason.contains("Sparse V")
+            }
+        )
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .onlineFused })
+    }
+
+    func testNativeCompressedRejectsUnsupportedMaskAndFallsBack() {
+        let decision = selectTurboQuantAttentionPath(
+            request: Self.request(maskKind: .materializedArray),
+            capabilities: TurboQuantKernelCapabilities(
+                nativeCompressedAttention: true,
+                attentionEncode: true,
+                attentionDecode: true,
+                attentionQK: true,
+                attentionAV: true,
+                attentionFusedDecode: true,
+                bfloatOutput: true
+            )
+        )
+
+        XCTAssertEqual(decision.selectedPath, .twoStageCompressed)
+        XCTAssertTrue(decision.rejectedPaths.contains { $0.path == .nativeMLXCompressed })
+    }
+
     func testFusedUnavailableSelectsTwoStageWhenQKAndAVAreAvailable() {
         let decision = selectTurboQuantAttentionPath(
             request: Self.request(),
@@ -56,8 +128,11 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
     }
 
     private static func request(
+        queryLength: Int = 1,
         maskKind: TurboQuantAttentionMaskKind = .causal,
-        fallbackState: TurboQuantAttentionFallbackState = .none
+        preferOnlineFused: Bool = true,
+        fallbackState: TurboQuantAttentionFallbackState = .none,
+        sparseVThreshold: Float? = nil
     ) -> TurboQuantAttentionRequest {
         let layout = TurboQuantAttentionLayout(
             batchSize: 1,
@@ -70,13 +145,15 @@ final class TurboQuantAttentionRouterTests: XCTestCase {
             bitsetWordsPerGroup: 2
         )
         return TurboQuantAttentionRequest(
-            queryShape: [1, 1, 1, 64],
+            queryShape: [1, 1, queryLength, 64],
             keyLayout: layout,
             valueLayout: layout,
             queryDType: .float16,
             outputDType: .float16,
             maskKind: maskKind,
-            fallbackState: fallbackState
+            preferOnlineFused: preferOnlineFused,
+            fallbackState: fallbackState,
+            sparseVThreshold: sparseVThreshold
         )
     }
 }

@@ -3,6 +3,16 @@
 import Foundation
 
 public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
+    public var nativeCompressedAttention: Bool?
+    public var nativeSparseVSupport: Bool?
+    public var nativeDiagnosticsSupport: Bool?
+    public var nativeBackendVersion: Int?
+    public var nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
+    public var nativePolarWHTSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend?
+    public var nativeFallbackReason: String?
+    /// Fused quantize-and-append (P1-1) native kernel availability. `nil` when
+    /// the probe was not run; fails closed to `false` on any error/mismatch.
+    public var nativeQuantizeAppendKV: Bool?
     public var flatEncodeDecode: Bool
     public var linearMatmul: Bool
     public var attentionEncode: Bool
@@ -11,12 +21,23 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
     public var attentionAV: Bool
     public var attentionFusedDecode: Bool
     public var attentionTiledFusedDecode: Bool
+    public var polarWHTCodec: Bool
+    public var polarWHTAttention: Bool
+    public var hybridK8PolarWHTValueAttention: Bool
     public var bfloatOutput: Bool
     public var supportedHeadDimensions: [Int]
     public var selectedKernelProfile: TurboQuantKernelProfile
     public var failureReasons: [String]
 
     public init(
+        nativeCompressedAttention: Bool? = nil,
+        nativeSparseVSupport: Bool? = nil,
+        nativeDiagnosticsSupport: Bool? = nil,
+        nativeBackendVersion: Int? = nil,
+        nativeSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
+        nativePolarWHTSegmentedAttentionBackend: TurboQuantNativeSegmentedAttentionBackend? = nil,
+        nativeFallbackReason: String? = nil,
+        nativeQuantizeAppendKV: Bool? = nil,
         flatEncodeDecode: Bool = false,
         linearMatmul: Bool = false,
         attentionEncode: Bool = false,
@@ -25,12 +46,23 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         attentionAV: Bool = false,
         attentionFusedDecode: Bool = false,
         attentionTiledFusedDecode: Bool? = nil,
+        polarWHTCodec: Bool = false,
+        polarWHTAttention: Bool = false,
+        hybridK8PolarWHTValueAttention: Bool = false,
         bfloatOutput: Bool = false,
         supportedHeadDimensions: [Int] = TurboQuantRuntimeProbeResult
             .throughputOptimizedOnlineFusedHeadDimensions,
         selectedKernelProfile: TurboQuantKernelProfile = .mlxPackedFallback,
         failureReasons: [String] = []
     ) {
+        self.nativeCompressedAttention = nativeCompressedAttention
+        self.nativeSparseVSupport = nativeSparseVSupport
+        self.nativeDiagnosticsSupport = nativeDiagnosticsSupport
+        self.nativeBackendVersion = nativeBackendVersion
+        self.nativeSegmentedAttentionBackend = nativeSegmentedAttentionBackend
+        self.nativePolarWHTSegmentedAttentionBackend = nativePolarWHTSegmentedAttentionBackend
+        self.nativeFallbackReason = nativeFallbackReason
+        self.nativeQuantizeAppendKV = nativeQuantizeAppendKV
         self.flatEncodeDecode = flatEncodeDecode
         self.linearMatmul = linearMatmul
         self.attentionEncode = attentionEncode
@@ -39,6 +71,9 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         self.attentionAV = attentionAV
         self.attentionFusedDecode = attentionFusedDecode
         self.attentionTiledFusedDecode = attentionTiledFusedDecode ?? attentionFusedDecode
+        self.polarWHTCodec = polarWHTCodec
+        self.polarWHTAttention = polarWHTAttention
+        self.hybridK8PolarWHTValueAttention = hybridK8PolarWHTValueAttention
         self.bfloatOutput = bfloatOutput
         self.supportedHeadDimensions = supportedHeadDimensions
         self.selectedKernelProfile = selectedKernelProfile
@@ -52,18 +87,35 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
 
     public var attentionCapabilities: TurboQuantAttentionCapabilities {
         TurboQuantAttentionCapabilities(
+            nativeCompressedAttention: nativeCompressedAttention,
+            nativeSparseVSupport: nativeSparseVSupport,
+            nativeDiagnosticsSupport: nativeDiagnosticsSupport,
+            nativeBackendVersion: nativeBackendVersion,
+            nativeSegmentedAttentionBackend: nativeSegmentedAttentionBackend,
+            nativePolarWHTSegmentedAttentionBackend: nativePolarWHTSegmentedAttentionBackend,
+            nativeFallbackReason: nativeFallbackReason,
             encode: attentionEncode,
             decode: attentionDecode,
             qk: attentionQK,
             av: attentionAV,
             onlineFused: attentionFusedDecode,
             tiledOnlineFused: attentionTiledFusedDecode,
+            polarWHTCodec: polarWHTCodec,
+            polarWHTAttention: polarWHTAttention,
+            hybridK8PolarWHTValueAttention: hybridK8PolarWHTValueAttention,
             bfloatOutput: bfloatOutput,
             supportedOnlineFusedHeadDimensions: supportedHeadDimensions
         )
     }
 
     private enum CodingKeys: String, CodingKey {
+        case nativeCompressedAttention
+        case nativeSparseVSupport
+        case nativeDiagnosticsSupport
+        case nativeBackendVersion
+        case nativeSegmentedAttentionBackend
+        case nativePolarWHTSegmentedAttentionBackend
+        case nativeFallbackReason
         case flatEncodeDecode
         case linearMatmul
         case attentionEncode
@@ -72,6 +124,9 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         case attentionAV
         case attentionFusedDecode
         case attentionTiledFusedDecode
+        case polarWHTCodec
+        case polarWHTAttention
+        case hybridK8PolarWHTValueAttention
         case bfloatOutput
         case supportedHeadDimensions
         case selectedKernelProfile
@@ -83,6 +138,24 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         let attentionFusedDecode =
             try container.decodeIfPresent(Bool.self, forKey: .attentionFusedDecode) ?? false
         self.init(
+            nativeCompressedAttention: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeCompressedAttention),
+            nativeSparseVSupport: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeSparseVSupport),
+            nativeDiagnosticsSupport: try container.decodeIfPresent(
+                Bool.self, forKey: .nativeDiagnosticsSupport),
+            nativeBackendVersion: try container.decodeIfPresent(
+                Int.self, forKey: .nativeBackendVersion),
+            nativeSegmentedAttentionBackend: try container.decodeIfPresent(
+                TurboQuantNativeSegmentedAttentionBackend.self,
+                forKey: .nativeSegmentedAttentionBackend
+            ),
+            nativePolarWHTSegmentedAttentionBackend: try container.decodeIfPresent(
+                TurboQuantNativeSegmentedAttentionBackend.self,
+                forKey: .nativePolarWHTSegmentedAttentionBackend
+            ),
+            nativeFallbackReason: try container.decodeIfPresent(
+                String.self, forKey: .nativeFallbackReason),
             flatEncodeDecode: try container.decodeIfPresent(Bool.self, forKey: .flatEncodeDecode) ?? false,
             linearMatmul: try container.decodeIfPresent(Bool.self, forKey: .linearMatmul) ?? false,
             attentionEncode: try container.decodeIfPresent(Bool.self, forKey: .attentionEncode) ?? false,
@@ -94,6 +167,12 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
                 Bool.self,
                 forKey: .attentionTiledFusedDecode
             ) ?? attentionFusedDecode,
+            polarWHTCodec: try container.decodeIfPresent(Bool.self, forKey: .polarWHTCodec) ?? false,
+            polarWHTAttention: try container.decodeIfPresent(Bool.self, forKey: .polarWHTAttention) ?? false,
+            hybridK8PolarWHTValueAttention: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .hybridK8PolarWHTValueAttention
+            ) ?? false,
             bfloatOutput: try container.decodeIfPresent(Bool.self, forKey: .bfloatOutput) ?? false,
             supportedHeadDimensions: try container.decodeIfPresent(
                 [Int].self,
@@ -109,6 +188,19 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(nativeCompressedAttention, forKey: .nativeCompressedAttention)
+        try container.encodeIfPresent(nativeSparseVSupport, forKey: .nativeSparseVSupport)
+        try container.encodeIfPresent(nativeDiagnosticsSupport, forKey: .nativeDiagnosticsSupport)
+        try container.encodeIfPresent(nativeBackendVersion, forKey: .nativeBackendVersion)
+        try container.encodeIfPresent(
+            nativeSegmentedAttentionBackend,
+            forKey: .nativeSegmentedAttentionBackend
+        )
+        try container.encodeIfPresent(
+            nativePolarWHTSegmentedAttentionBackend,
+            forKey: .nativePolarWHTSegmentedAttentionBackend
+        )
+        try container.encodeIfPresent(nativeFallbackReason, forKey: .nativeFallbackReason)
         try container.encode(flatEncodeDecode, forKey: .flatEncodeDecode)
         try container.encode(linearMatmul, forKey: .linearMatmul)
         try container.encode(attentionEncode, forKey: .attentionEncode)
@@ -117,6 +209,12 @@ public struct TurboQuantKernelCapabilities: Hashable, Codable, Sendable {
         try container.encode(attentionAV, forKey: .attentionAV)
         try container.encode(attentionFusedDecode, forKey: .attentionFusedDecode)
         try container.encode(attentionTiledFusedDecode, forKey: .attentionTiledFusedDecode)
+        try container.encode(polarWHTCodec, forKey: .polarWHTCodec)
+        try container.encode(polarWHTAttention, forKey: .polarWHTAttention)
+        try container.encode(
+            hybridK8PolarWHTValueAttention,
+            forKey: .hybridK8PolarWHTValueAttention
+        )
         try container.encode(bfloatOutput, forKey: .bfloatOutput)
         try container.encode(supportedHeadDimensions, forKey: .supportedHeadDimensions)
         try container.encode(selectedKernelProfile, forKey: .selectedKernelProfile)

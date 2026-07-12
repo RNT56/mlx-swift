@@ -77,6 +77,7 @@ private func turboQuantRejectedPathsForUnavailableDecision(_ error: Error) -> [R
     let reason = String(describing: error)
     let message = reason.isEmpty ? "path unavailable" : reason
     return [
+        RejectedPath(path: .nativeMLXCompressed, reason: message),
         RejectedPath(path: .onlineFused, reason: message),
         RejectedPath(path: .tiledOnlineFused, reason: message),
         RejectedPath(path: .twoStageCompressed, reason: message),

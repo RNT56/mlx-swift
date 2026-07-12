@@ -4,8 +4,10 @@
 #pragma once
 
 #include <atomic>
+#include <exception>
 #include <future>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -51,28 +53,23 @@ struct StreamThread {
     }
   }
 
-  template <typename F>
-  void enqueue(F&& f) {
+  void enqueue(std::function<void()> f) {
     {
       std::lock_guard<std::mutex> lk(mtx);
       if (stop) {
         throw std::runtime_error(
             "Cannot enqueue work after stream is stopped.");
       }
-      q.emplace(std::forward<F>(f));
+      q.emplace(std::move(f));
     }
     cond.notify_one();
   }
 };
 
-class Scheduler {
+class MLX_API Scheduler {
  public:
-  Scheduler() : n_active_tasks_(0) {
-    if (is_available(Device::gpu)) {
-      default_streams_.insert({Device::gpu, new_stream(Device::gpu)});
-    }
-    default_streams_.insert({Device::cpu, new_stream(Device::cpu)});
-  }
+  Scheduler();
+  ~Scheduler();
 
   // Not copyable or moveable
   Scheduler(const Scheduler&) = delete;
@@ -80,33 +77,7 @@ class Scheduler {
   Scheduler& operator=(const Scheduler&) = delete;
   Scheduler& operator=(Scheduler&&) = delete;
 
-  Stream new_stream(const Device& d) {
-    streams_.emplace_back(streams_.size(), d);
-    if (d == Device::gpu) {
-      threads_.push_back(nullptr);
-      gpu::new_stream(streams_.back());
-    } else {
-      threads_.push_back(new StreamThread{});
-    }
-    return streams_.back();
-  }
-
-  template <typename F>
-  void enqueue(const Stream& stream, F&& f);
-
-  Stream get_default_stream(const Device& d) const {
-    return default_streams_.at(d.type);
-  }
-  Stream get_stream(int index) const {
-    return streams_.at(index);
-  }
-  std::vector<Stream> get_streams() const {
-    return streams_;
-  }
-
-  void set_default_stream(const Stream& s) {
-    default_streams_.at(s.device.type) = s;
-  }
+  void enqueue(Stream s, std::function<void()> task);
 
   void notify_new_task(const Stream& stream) {
     {
@@ -124,6 +95,25 @@ class Scheduler {
     completion_cv.notify_all();
   }
 
+  void record_exception(const Stream& stream, std::exception_ptr exception) {
+    {
+      std::lock_guard<std::mutex> lk(mtx);
+      stream_exceptions_.try_emplace(stream.index, std::move(exception));
+    }
+    completion_cv.notify_all();
+  }
+
+  std::exception_ptr take_exception(const Stream& stream) {
+    std::lock_guard<std::mutex> lk(mtx);
+    auto it = stream_exceptions_.find(stream.index);
+    if (it == stream_exceptions_.end()) {
+      return nullptr;
+    }
+    auto exception = std::move(it->second);
+    stream_exceptions_.erase(it);
+    return exception;
+  }
+
   int n_active_tasks() const {
     return n_active_tasks_;
   }
@@ -138,34 +128,16 @@ class Scheduler {
     }
   }
 
-  ~Scheduler() {
-    for (auto s : streams_) {
-      try {
-        synchronize(s);
-      } catch (const std::runtime_error&) {
-        // ignore errors if synch fails
-      }
-    }
-    for (auto t : threads_) {
-      if (t != nullptr) {
-        delete t;
-      }
-    }
-  }
-
  private:
-  int n_active_tasks_;
-  std::vector<StreamThread*> threads_;
-  std::vector<Stream> streams_;
-  std::unordered_map<Device::DeviceType, Stream> default_streams_;
+  friend Stream mlx::core::new_stream(Device d);
+
+  int n_active_tasks_{0};
+  std::unordered_map<int, std::exception_ptr> stream_exceptions_;
+  std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
+  std::shared_mutex threads_mtx_;
   std::condition_variable completion_cv;
   std::mutex mtx;
 };
-
-template <typename F>
-void Scheduler::enqueue(const Stream& stream, F&& f) {
-  threads_[stream.index]->enqueue(std::forward<F>(f));
-}
 
 MLX_API Scheduler& scheduler();
 
@@ -184,6 +156,16 @@ inline void notify_new_task(const Stream& stream) {
 
 inline void notify_task_completion(const Stream& stream) {
   scheduler().notify_task_completion(stream);
+}
+
+inline void record_exception(
+    const Stream& stream,
+    std::exception_ptr exception) {
+  scheduler().record_exception(stream, std::move(exception));
+}
+
+inline std::exception_ptr take_exception(const Stream& stream) {
+  return scheduler().take_exception(stream);
 }
 
 inline void wait_for_one() {

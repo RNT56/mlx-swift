@@ -45,7 +45,7 @@ final class TurboQuantValidationTests: XCTestCase {
         }
     }
 
-    func testKeyResidualSignsUseCompactUnusedStorage() {
+    func testLayoutV6KeyResidualSignsUseSplitMagnitudePlane() {
         var code = Self.makeCode(role: .key)
         code.residualSigns = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
 
@@ -58,15 +58,99 @@ final class TurboQuantValidationTests: XCTestCase {
 
     func testLayoutV5AcceptsFp16ScaleStorage() throws {
         var code = Self.makeCode(role: .key)
-        code.layout.layoutVersion = TurboQuantAttentionLayout.nextVersion
-        code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
+        code.layout.layoutVersion = TurboQuantAttentionLayout.currentVersion
+        // K scale plane dieted to 2 scales/group (T1.4 stage 1); was 3.
+        code.scales = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .float16)
 
         try validateTurboQuantAttentionCode(code, expectedRole: .key)
     }
 
+    func testDefaultAttentionLayoutUsesProductionVersion() throws {
+        let layout = try turboQuantAttentionLayout(
+            shape: [1, 1, 2, 64],
+            dtype: .float16
+        )
+
+        XCTAssertEqual(layout.layoutVersion, TurboQuantAttentionLayout.productionDefaultVersion)
+        XCTAssertEqual(layout.layoutVersion, TurboQuantAttentionLayout.currentVersion)
+    }
+
+    func testPolarWHTBackendsArePublicAndFailClosedByDefault() throws {
+        let decodedBackend = try JSONDecoder().decode(
+            TurboQuantBackend.self,
+            from: Data(#""metalPolarWHT""#.utf8)
+        )
+        let defaultAvailability = TurboQuantKernelAvailability()
+        let availablePolarWHT = TurboQuantKernelAvailability(
+            supportsPolarWHTReference: true,
+            supportsMetalPolarWHTCodec: true,
+            supportsMetalPolarWHTAttention: true,
+            supportsMetalPolarWHT: true
+        )
+
+        XCTAssertEqual(decodedBackend, .metalPolarWHT)
+        XCTAssertTrue(availablePolarWHT.supports(.polarWHTReference))
+        XCTAssertTrue(availablePolarWHT.supports(.metalPolarWHT))
+        XCTAssertFalse(defaultAvailability.supports(.polarWHTReference))
+        XCTAssertFalse(defaultAvailability.supports(.metalPolarWHT))
+        XCTAssertEqual(defaultAvailability.runtimeBackend(for: .metalPolarWHT), .mlxPacked)
+        XCTAssertTrue(
+            defaultAvailability.fallbackReason(for: .metalPolarWHT)?
+                .contains("PolarWHT Metal kernels unavailable") == true
+        )
+    }
+
+    func testPolarWHTBackendRequiresCodecAndAttentionCapabilities() throws {
+        let attentionOnly = TurboQuantKernelAvailability(
+            supportsPolarWHTReference: true,
+            supportsMetalPolarWHTCodec: false,
+            supportsMetalPolarWHTAttention: true,
+            supportsMetalPolarWHT: false
+        )
+
+        XCTAssertTrue(attentionOnly.supports(.polarWHTReference))
+        XCTAssertTrue(attentionOnly.supportsMetalPolarWHTAttention)
+        XCTAssertFalse(attentionOnly.supportsMetalPolarWHTCodec)
+        XCTAssertFalse(attentionOnly.supports(.metalPolarWHT))
+        XCTAssertEqual(attentionOnly.runtimeBackend(for: .metalPolarWHT), .mlxPacked)
+    }
+
+    func testLayoutV5RequiresExplicitOptInWhileV6IsDefault() throws {
+        XCTAssertThrowsError(
+            try turboQuantAttentionLayout(
+                shape: [1, 1, 2, 64],
+                dtype: .float16,
+                layoutVersion: 5
+            )
+        ) { error in
+            XCTAssertTrue(String(describing: error).contains("allowExperimentalLayoutV5"))
+        }
+
+        let v5Layout = try turboQuantAttentionLayout(
+            shape: [1, 1, 2, 64],
+            dtype: .float16,
+            layoutVersion: 5,
+            allowExperimentalLayoutV5: true
+        )
+        XCTAssertEqual(v5Layout.layoutVersion, 5)
+
+        let currentLayout = try turboQuantAttentionLayout(
+            shape: [1, 1, 2, 64],
+            dtype: .float16,
+            layoutVersion: TurboQuantAttentionLayout.currentVersion
+        )
+        XCTAssertEqual(currentLayout.layoutVersion, TurboQuantAttentionLayout.currentVersion)
+    }
+
     func testLayoutV4RejectsFp16ScaleStorage() {
         var code = Self.makeCode(role: .key)
-        code.scales = MLXArray.zeros([1, 1, 2, 1, 3], dtype: .float16)
+        code.layout.layoutVersion = TurboQuantAttentionLayout.legacyVersion
+        code.layout.magnitudeWordsPerGroup = 5
+        code.packedMagnitudes = MLXArray.zeros([1, 1, 2, 1, 5], dtype: .uint32)
+        code.highPrecisionMask = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
+        code.residualSigns = MLXArray.zeros([1], dtype: .uint32)
+        // K scale plane dieted to 2 scales/group (T1.4 stage 1); was 3.
+        code.scales = MLXArray.zeros([1, 1, 2, 1, 2], dtype: .float16)
 
         XCTAssertThrowsError(try validateTurboQuantAttentionCode(code, expectedRole: .key)) {
             error in
@@ -78,6 +162,7 @@ final class TurboQuantValidationTests: XCTestCase {
 
     private static func makeCode(role: TurboQuantTensorRole) -> TurboQuantAttentionCode {
         let layout = TurboQuantAttentionLayout(
+            layoutVersion: TurboQuantAttentionLayout.currentVersion,
             batchSize: 1,
             kvHeadCount: 1,
             capacity: 2,
@@ -87,10 +172,10 @@ final class TurboQuantValidationTests: XCTestCase {
             magnitudeWordsPerGroup: role == .value ? 8 : 5,
             bitsetWordsPerGroup: 2
         )
-        let bitset = role == .value
+        let signs = role == .value
             ? MLXArray.zeros([1], dtype: .uint32)
             : MLXArray.zeros([1, 1, 2, 1, 2], dtype: .uint32)
-        let compactUnusedBitset = MLXArray.zeros([1], dtype: .uint32)
+        let compact = MLXArray.zeros([1], dtype: .uint32)
         return TurboQuantAttentionCode(
             layout: layout,
             preset: role == .value ? .turbo4v2 : .turbo3_5,
@@ -102,10 +187,10 @@ final class TurboQuantValidationTests: XCTestCase {
                 [1, 1, 2, 1, role == .value ? 8 : 5],
                 dtype: .uint32
             ),
-            signs: bitset,
-            highPrecisionMask: bitset,
-            residualSigns: compactUnusedBitset,
-            scales: MLXArray.zeros([1, 1, 2, 1, role == .value ? 2 : 3], dtype: .float32)
+            signs: signs,
+            highPrecisionMask: compact,
+            residualSigns: compact,
+            scales: MLXArray.zeros([1, 1, 2, 1, 2], dtype: .float32)
         )
     }
 }

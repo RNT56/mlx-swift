@@ -216,7 +216,7 @@ private func printUsage() {
           swift run TurboQuantConverter --input <model-dir|weights.safetensors> --output <output-dir|out.safetensors> [options]
 
         Options:
-          --preset <turbo4v2|turbo4|turbo3_5|turbo2_5>   Default: turbo4v2
+          --preset <turbo8|turbo4v2|turbo4|turbo3_5|turbo2_5>   Default: turbo4v2
           --group-size <int>                              Default: 64
           --mode <affine|mxfp4|mxfp8|nvfp4>               Default: affine
           --seed <uint64|0xhex>                            Default: 0x9E3779B97F4A7C15

@@ -5,7 +5,8 @@ import Foundation
 public func validateTurboQuantAttentionCode(
     _ code: TurboQuantAttentionCode,
     expectedRole: TurboQuantTensorRole?,
-    requireWritableCapacity: Bool = false
+    requireWritableCapacity: Bool = false,
+    allowTileTransposedV7: Bool = false
 ) throws {
     if let expectedRole {
         guard code.role == expectedRole else {
@@ -18,7 +19,8 @@ public func validateTurboQuantAttentionCode(
     try turboQuantValidateAttentionLayoutDescriptor(
         code.layout,
         role: code.role,
-        groupSize: code.groupSize
+        groupSize: code.groupSize,
+        allowTileTransposedV7: allowTileTransposedV7
     )
 
     if requireWritableCapacity {
@@ -39,7 +41,8 @@ public func validateTurboQuantAttentionCode(
         groupSize: code.groupSize,
         preset: code.preset,
         role: code.role,
-        valueBits: code.valueBits
+        valueBits: code.valueBits,
+        layoutVersion: code.layout.layoutVersion
     )
     guard code.layout.magnitudeWordsPerGroup == expectedMagnitudeWords else {
         throw turboQuantAttentionValidationError(
@@ -76,6 +79,13 @@ public func validateTurboQuantAttentionCode(
         code.layout.groupsPerVector, code.scalesPerGroup,
     ]
     let compactUnusedBitsetShape = [1]
+    let storesHighPrecisionMask = turboQuantAttentionStoresHighPrecisionMask(
+        preset: code.preset,
+        role: code.role,
+        layoutVersion: code.layout.layoutVersion
+    )
+    let highPrecisionMaskShapes =
+        storesHighPrecisionMask ? [bitsetShape] : [compactUnusedBitsetShape, bitsetShape]
 
     try turboQuantValidateAttentionStorageArray(
         code.packedMagnitudes,
@@ -92,7 +102,7 @@ public func validateTurboQuantAttentionCode(
     try turboQuantValidateAttentionStorageArray(
         code.highPrecisionMask,
         name: "compressed attention high precision mask",
-        expectedShapes: code.role == .value ? [compactUnusedBitsetShape] : [bitsetShape],
+        expectedShapes: highPrecisionMaskShapes,
         expectedDType: .uint32
     )
     try turboQuantValidateAttentionStorageArray(
@@ -113,13 +123,26 @@ public func validateTurboQuantAttentionCode(
 
 func turboQuantValidateAttentionLayoutBasics(
     _ layout: TurboQuantAttentionLayout,
-    context: String
+    context: String,
+    allowTileTransposedV7: Bool = false
 ) throws {
-    guard TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion) else {
+    guard
+        TurboQuantAttentionLayout.supportedVersions.contains(layout.layoutVersion)
+            || (allowTileTransposedV7
+                && layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion)
+    else {
         throw turboQuantAttentionValidationError(
             "\(context) layout version actual \(layout.layoutVersion), "
                 + "expected one of \(TurboQuantAttentionLayout.supportedVersions)"
         )
+    }
+    if layout.layoutVersion == TurboQuantAttentionLayout.tileTransposedVersion {
+        guard layout.capacity % 32 == 0 else {
+            throw turboQuantAttentionValidationError(
+                "\(context) layout v7 requires capacity to be a multiple of 32; "
+                    + "got \(layout.capacity)"
+            )
+        }
     }
     guard layout.batchSize > 0 else {
         throw turboQuantAttentionValidationError(
@@ -206,7 +229,8 @@ func turboQuantValidateAttentionLayoutBasics(
 func turboQuantValidateAttentionLayoutDescriptor(
     _ layout: TurboQuantAttentionLayout,
     role: TurboQuantTensorRole,
-    groupSize: Int
+    groupSize: Int,
+    allowTileTransposedV7: Bool = false
 ) throws {
     guard role == .key || role == .value else {
         throw turboQuantAttentionValidationError(
@@ -214,7 +238,11 @@ func turboQuantValidateAttentionLayoutDescriptor(
         )
     }
 
-    try turboQuantValidateAttentionLayoutBasics(layout, context: "compressed attention")
+    try turboQuantValidateAttentionLayoutBasics(
+        layout,
+        context: "compressed attention",
+        allowTileTransposedV7: allowTileTransposedV7
+    )
 
     guard groupSize > 0 else {
         throw turboQuantAttentionValidationError(
@@ -334,7 +362,7 @@ private func turboQuantValidateAttentionStorageArray(
 }
 
 private func turboQuantAttentionSupportedScaleDTypes(layoutVersion: Int) -> [DType] {
-    layoutVersion == TurboQuantAttentionLayout.nextVersion
+    layoutVersion >= 5
         ? [.float32, .float16]
         : [.float32]
 }
@@ -343,7 +371,8 @@ private func turboQuantAttentionMagnitudeWordsPerGroup(
     groupSize: Int,
     preset: TurboQuantPreset,
     role: TurboQuantTensorRole,
-    valueBits: Int
+    valueBits: Int,
+    layoutVersion: Int
 ) -> Int {
     if role == .value {
         return turboQuantAttentionCeilDivide(groupSize * Swift.max(1, valueBits), by: 32)
@@ -351,6 +380,24 @@ private func turboQuantAttentionMagnitudeWordsPerGroup(
 
     let baseBits = Swift.max(1, preset.baseMagnitudeBits - 1)
     let highBits = Swift.max(baseBits, preset.highMagnitudeBits - 1)
+    if turboQuantAttentionUsesSplitMagnitudePlane(
+        preset: preset,
+        role: role,
+        layoutVersion: layoutVersion,
+        baseBits: baseBits,
+        highBits: highBits
+    ) {
+        let highCount = turboQuantAttentionHighCount(
+            valueCount: groupSize,
+            baseBits: baseBits,
+            highBits: highBits,
+            targetBits: Swift.max(1, preset.targetMagnitudeBits - 1)
+        )
+        return turboQuantAttentionCeilDivide(
+            groupSize * baseBits + highCount * (highBits - baseBits),
+            by: 32
+        )
+    }
     let highCount = turboQuantAttentionHighCount(
         valueCount: groupSize,
         baseBits: baseBits,
@@ -359,6 +406,40 @@ private func turboQuantAttentionMagnitudeWordsPerGroup(
     )
     let bitCount = groupSize * baseBits + highCount * (highBits - baseBits)
     return turboQuantAttentionCeilDivide(bitCount, by: 32)
+}
+
+private func turboQuantAttentionUsesSplitMagnitudePlane(
+    preset: TurboQuantPreset,
+    role: TurboQuantTensorRole,
+    layoutVersion: Int,
+    baseBits: Int? = nil,
+    highBits: Int? = nil
+) -> Bool {
+    guard role == .key, layoutVersion >= TurboQuantAttentionLayout.splitMagnitudeVersion else {
+        return false
+    }
+    let resolvedBaseBits = baseBits ?? Swift.max(1, preset.baseMagnitudeBits - 1)
+    let resolvedHighBits =
+        highBits ?? Swift.max(resolvedBaseBits, preset.highMagnitudeBits - 1)
+    return resolvedHighBits == resolvedBaseBits + 1
+}
+
+private func turboQuantAttentionStoresHighPrecisionMask(
+    preset: TurboQuantPreset,
+    role: TurboQuantTensorRole,
+    layoutVersion: Int
+) -> Bool {
+    guard role == .key else { return false }
+    let baseBits = Swift.max(1, preset.baseMagnitudeBits - 1)
+    let highBits = Swift.max(baseBits, preset.highMagnitudeBits - 1)
+    guard highBits > baseBits else { return false }
+    return !turboQuantAttentionUsesSplitMagnitudePlane(
+        preset: preset,
+        role: role,
+        layoutVersion: layoutVersion,
+        baseBits: baseBits,
+        highBits: highBits
+    )
 }
 
 private func turboQuantAttentionHighCount(
@@ -374,7 +455,8 @@ private func turboQuantAttentionHighCount(
 }
 
 private func turboQuantAttentionScalesPerGroup(role: TurboQuantTensorRole) -> Int {
-    role == .value ? 2 : 3
+    // K scale plane dieted to 2 (norm, residual_norm); the third slot was dead (written 0.0, never read).
+    return 2
 }
 
 private func turboQuantAttentionCeilDivide(_ value: Int, by divisor: Int) -> Int {

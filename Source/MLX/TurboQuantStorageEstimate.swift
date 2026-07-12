@@ -66,9 +66,20 @@ public func estimateTurboQuantStorage(
         valueBits: valueBits
     )
     let bitsetWords = ceilDivide(clampedGroupSize, by: 32)
-    let scalesPerGroup = role == .value ? 2 : 3
+    // K scale plane dieted to 2 (norm, residual_norm); the third slot was dead (written 0.0, never read).
+    let scalesPerGroup = 2
     let packedBytes = groupCount * magnitudeWords * MemoryLayout<UInt32>.size
-    let bitsetBytes = role == .value ? 0 : groupCount * bitsetWords * 3 * MemoryLayout<UInt32>.size
+    let bitsetPlaneCount: Int
+    if role == .value {
+        bitsetPlaneCount = 0
+    } else {
+        let baseBits = Swift.max(1, preset.baseMagnitudeBits - 1)
+        let highBits = Swift.max(baseBits, preset.highMagnitudeBits - 1)
+        let usesSplitMagnitude = highBits == baseBits + 1
+        bitsetPlaneCount =
+            1 + (highBits > baseBits && !usesSplitMagnitude ? 1 : 0)
+    }
+    let bitsetBytes = groupCount * bitsetWords * bitsetPlaneCount * MemoryLayout<UInt32>.size
     let scaleBytes = groupCount * scalesPerGroup * scaleStorage.dtype.size
 
     return TurboQuantStorageEstimate(
@@ -99,6 +110,20 @@ public func estimateTurboQuantStorage(
         packedBytes: packedBytes,
         bitsetBytes: bitsetBytes,
         scaleBytes: scaleBytes,
+        totalBytes: code.storageByteCount,
+        actualBitsPerValue: code.approximateBitsPerValue
+    )
+}
+
+public func estimateTurboQuantStorage(
+    code: TurboQuantPolarWHTAttentionValueCode
+) -> TurboQuantStorageEstimate {
+    TurboQuantStorageEstimate(
+        role: .value,
+        logicalValues: code.logicalValueCount,
+        packedBytes: code.packedIndices.nbytes,
+        bitsetBytes: 0,
+        scaleBytes: code.norms.nbytes,
         totalBytes: code.storageByteCount,
         actualBitsPerValue: code.approximateBitsPerValue
     )
