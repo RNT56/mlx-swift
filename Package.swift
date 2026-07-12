@@ -421,24 +421,28 @@ let package = Package(
             name: "Example1",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExample.swift", "CustomFunctionExampleSimple.swift", "Tutorial.swift"],
             sources: ["Example1.swift"]
         ),
         .executableTarget(
             name: "Tutorial",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExample.swift", "CustomFunctionExampleSimple.swift", "Example1.swift"],
             sources: ["Tutorial.swift"]
         ),
         .executableTarget(
             name: "CustomFunctionExample",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExampleSimple.swift", "Example1.swift", "Tutorial.swift"],
             sources: ["CustomFunctionExample.swift"]
         ),
         .executableTarget(
             name: "CustomFunctionExampleSimple",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExample.swift", "Example1.swift", "Tutorial.swift"],
             sources: ["CustomFunctionExampleSimple.swift"]
         ),
         .executableTarget(
