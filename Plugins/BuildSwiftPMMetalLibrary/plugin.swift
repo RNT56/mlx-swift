@@ -7,6 +7,15 @@ struct BuildSwiftPMMetalLibrary: BuildToolPlugin {
         #if os(Linux)
             return []
         #else
+            // Xcode already compiles the target's Metal sources into the resource
+            // bundle. Declaring another default.metallib produces a duplicate-output
+            // build error, so this command is only needed by SwiftPM's native build.
+            if context.pluginWorkDirectoryURL.pathComponents.contains(
+                "BuildToolPluginIntermediates")
+            {
+                return []
+            }
+
             let packageRoot = context.package.directoryURL
             let script = packageRoot.appendingPathComponent("tools/build-swiftpm-metallib.sh")
             let output = context.pluginWorkDirectoryURL.appendingPathComponent("default.metallib")

@@ -14,19 +14,13 @@ import Foundation
         private static let metallibName = "default.metallib"
 
         static func configureIfNeeded() {
-            let shouldConfigure = lock.withLock {
-                if didConfigure {
-                    return false
-                }
-                didConfigure = true
-                return true
-            }
+            lock.withLock {
+                guard !didConfigure else { return }
+                defer { didConfigure = true }
 
-            guard shouldConfigure, let url = findMetallibURL() else {
-                return
+                guard let url = findMetallibURL() else { return }
+                GPU.setMetallibPath(url.path())
             }
-
-            GPU.setMetallibPath(url.path())
         }
 
         static func findMetallibURL() -> URL? {
@@ -92,6 +86,12 @@ import Foundation
                 add(bundle.resourceURL)
                 add(bundle.bundleURL)
                 add(bundle.executableURL?.deletingLastPathComponent())
+            }
+
+            for framework in Bundle.allFrameworks {
+                add(framework.resourceURL)
+                add(framework.bundleURL)
+                add(framework.executableURL?.deletingLastPathComponent())
             }
 
             if let executablePath = CommandLine.arguments.first, !executablePath.isEmpty {

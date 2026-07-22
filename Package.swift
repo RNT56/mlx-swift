@@ -286,6 +286,9 @@ let cmlx = Target.target(
         "mlx/mlx/distributed/nccl/nccl.cpp",
         "mlx/mlx/distributed/nccl/nccl_stub",
         "mlx/mlx/distributed/jaccl/jaccl.cpp",
+        "mlx/mlx/distributed/jaccl/mesh.cpp",
+        "mlx/mlx/distributed/jaccl/ring.cpp",
+        "mlx/mlx/distributed/jaccl/utils.cpp",
     ],
     cSettings: [
         .headerSearchPath("mlx"),
@@ -407,24 +410,28 @@ let package = Package(
             name: "Example1",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExample.swift", "CustomFunctionExampleSimple.swift", "Tutorial.swift"],
             sources: ["Example1.swift"]
         ),
         .executableTarget(
             name: "Tutorial",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExample.swift", "CustomFunctionExampleSimple.swift", "Example1.swift"],
             sources: ["Tutorial.swift"]
         ),
         .executableTarget(
             name: "CustomFunctionExample",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExampleSimple.swift", "Example1.swift", "Tutorial.swift"],
             sources: ["CustomFunctionExample.swift"]
         ),
         .executableTarget(
             name: "CustomFunctionExampleSimple",
             dependencies: ["MLX"],
             path: "Source/Examples",
+            exclude: ["CustomFunctionExample.swift", "Example1.swift", "Tutorial.swift"],
             sources: ["CustomFunctionExampleSimple.swift"]
         ),
         .executableTarget(
